@@ -2,97 +2,110 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
-	"syscall"
+	"sync/atomic"
+	"time"
+
+	"github.com/getlantern/systray"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 
 	"awguard/capture"
 	"awguard/detect"
+)
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+var (
+	packetCount  atomic.Int64
+	lastDetected atomic.Value // stores string
 )
 
 func main() {
-	iface := flag.String("i", "", "network interface to monitor (default: auto-detect)")
-	flag.StringVar(iface, "interface", "", "network interface to monitor (default: auto-detect)")
-	verbose := flag.Bool("v", false, "log every inspected packet")
-	flag.BoolVar(verbose, "verbose", false, "log every inspected packet")
-	dryRun := flag.Bool("n", false, "detect and log but don't kill")
-	flag.BoolVar(dryRun, "dry-run", false, "detect and log but don't kill")
-
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: sudo awguard [flags]\n\n")
-		fmt.Fprintf(os.Stderr, "Passively monitors network traffic for plaintext BitTorrent signatures.\n")
-		fmt.Fprintf(os.Stderr, "If detected, kills the anywatch process immediately.\n\n")
-		fmt.Fprintf(os.Stderr, "Flags:\n")
-		fmt.Fprintf(os.Stderr, "  -i, --interface string   Network interface to monitor (default: auto-detect)\n")
-		fmt.Fprintf(os.Stderr, "  -v, --verbose            Log every inspected packet\n")
-		fmt.Fprintf(os.Stderr, "  -n, --dry-run            Detect and log but don't kill\n")
-	}
-
-	flag.Parse()
-
 	if os.Geteuid() != 0 {
 		log.Fatal("awguard requires root privileges for packet capture. Run with sudo.")
 	}
+	systray.Run(onReady, onExit)
+}
 
-	ifaceName := *iface
-	if ifaceName == "" {
-		var err error
-		ifaceName, err = capture.DetectPrimaryInterface()
-		if err != nil {
-			log.Fatalf("Failed to auto-detect network interface: %v", err)
-		}
+func onReady() {
+	systray.SetTemplateIcon(iconPNG, iconPNG)
+	systray.SetTitle("")
+	systray.SetTooltip("AWGuard — BitTorrent killswitch")
+
+	mStatus := systray.AddMenuItem("Monitoring...", "")
+	mStatus.Disable()
+	mPackets := systray.AddMenuItem("Packets: 0", "")
+	mPackets.Disable()
+	systray.AddSeparator()
+	mLastEvent := systray.AddMenuItem("No violations", "")
+	mLastEvent.Disable()
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("Quit AWGuard", "")
+
+	// Auto-detect interface
+	ifaceName, err := capture.DetectPrimaryInterface()
+	if err != nil {
+		mStatus.SetTitle("Error: no interface found")
+		log.Printf("awguard: failed to detect interface: %v", err)
+		return
 	}
 
+	mStatus.SetTitle(fmt.Sprintf("Monitoring %s", ifaceName))
 	log.Printf("awguard: monitoring interface %s", ifaceName)
-	if *dryRun {
-		log.Printf("awguard: dry-run mode — will detect but not kill")
-	}
 
+	// Start capture
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	cap, err := capture.NewCapture(ifaceName, capture.DefaultSnapLen)
 	if err != nil {
-		log.Fatalf("Failed to start capture: %v", err)
+		mStatus.SetTitle(fmt.Sprintf("Error: %v", err))
+		log.Printf("awguard: capture failed: %v", err)
+		return
 	}
-	defer cap.Close()
-
-	// Graceful shutdown on SIGINT/SIGTERM
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigs
-		log.Printf("awguard: shutting down")
-		cancel()
-		cap.Close()
-	}()
 
 	packets := cap.Packets(ctx)
-	log.Printf("awguard: watching for plaintext BitTorrent traffic...")
 
-	for pkt := range packets {
-		d := inspect(pkt, *verbose)
-		if d == nil {
-			continue
-		}
-		log.Printf("awguard: *** BT TRAFFIC DETECTED *** %s", d)
-		notify(d)
-		if *dryRun {
-			continue
-		}
-		killAnyWatch()
-	}
+	// Packet inspection goroutine
+	go func() {
+		for pkt := range packets {
+			d := inspect(pkt)
+			if d == nil {
+				continue
+			}
+			log.Printf("awguard: *** BT TRAFFIC DETECTED *** %s", d)
+			notify(d)
+			killAnyWatch()
 
-	log.Printf("awguard: stopped")
+			ts := time.Now().Format("15:04:05")
+			lastDetected.Store(fmt.Sprintf("VIOLATION %s: %s", ts, d.Type))
+		}
+	}()
+
+	// UI update ticker
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			mPackets.SetTitle(fmt.Sprintf("Packets: %d", packetCount.Load()))
+			if v := lastDetected.Load(); v != nil {
+				mLastEvent.SetTitle(v.(string))
+			}
+		}
+	}()
+
+	// Quit handler
+	go func() {
+		<-mQuit.ClickedCh
+		cancel()
+		cap.Close()
+		systray.Quit()
+	}()
 }
+
+func onExit() {}
 
 func killAnyWatch() {
 	out, err := exec.Command("pkill", "-9", "-f", "anywatch").CombinedOutput()
@@ -111,7 +124,7 @@ func notify(d *detect.Detection) {
 	_ = exec.Command("osascript", "-e", script).Run()
 }
 
-func inspect(pkt gopacket.Packet, verbose bool) *detect.Detection {
+func inspect(pkt gopacket.Packet) *detect.Detection {
 	netLayer := pkt.NetworkLayer()
 	if netLayer == nil {
 		return nil
@@ -134,10 +147,7 @@ func inspect(pkt gopacket.Packet, verbose bool) *detect.Detection {
 		if len(payload) == 0 {
 			return nil
 		}
-		if verbose {
-			log.Printf("awguard: TCP %s:%d → %s:%d (%d bytes payload)",
-				srcIP, tcp.SrcPort, dstIP, tcp.DstPort, len(payload))
-		}
+		packetCount.Add(1)
 		return detect.CheckTCPPayload(payload, srcIP, dstIP, uint16(tcp.SrcPort), uint16(tcp.DstPort))
 	}
 
@@ -147,10 +157,7 @@ func inspect(pkt gopacket.Packet, verbose bool) *detect.Detection {
 		if len(payload) == 0 {
 			return nil
 		}
-		if verbose {
-			log.Printf("awguard: UDP %s:%d → %s:%d (%d bytes payload)",
-				srcIP, udp.SrcPort, dstIP, udp.DstPort, len(payload))
-		}
+		packetCount.Add(1)
 		return detect.CheckUDPPayload(payload, srcIP, dstIP, uint16(udp.SrcPort), uint16(udp.DstPort))
 	}
 
