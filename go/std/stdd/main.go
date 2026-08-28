@@ -6,7 +6,12 @@
 //	stdd run -dir DIR [-interval D]   run all services in the foreground (what launchd executes)
 //	stdd insert -dir DIR FILE...      move files into a managed artifact dir, print its id
 //	stdd ls -dir DIR                  list managed dirs with their state-machine stage
+//	stdd cat -dir DIR ID NAME         stream one managed file (local or Drive fallback)
 //	stdd drive auth ...               one-time Google Drive authorization
+//
+// insert, ls and cat route through the installed mac service when it is
+// running (via the unix socket in the root dir), so the service stays the
+// store's single writer; without a running service they operate directly.
 //	stdd verify                       fast self-check of every service, then exit
 //	stdd install -dir DIR             install + start the macOS LaunchAgent
 //	stdd uninstall                    stop + remove the LaunchAgent
@@ -19,9 +24,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -41,6 +49,7 @@ Commands:
   run -dir DIR [-interval D]   run all services in the foreground
   insert -dir DIR FILE...      move files into a managed artifact dir, print its id
   ls -dir DIR                  list managed dirs with their state-machine stage
+  cat -dir DIR ID NAME         stream one managed file (local or Drive fallback)
   drive auth -credentials F    one-time Google Drive authorization (or -client-id/-client-secret)
   verify                       fast self-check of every service
   install -dir DIR             install + start the macOS LaunchAgent
@@ -97,6 +106,8 @@ func main() {
 		err = cmdInsert(args)
 	case "ls":
 		err = cmdLs(args)
+	case "cat":
+		err = cmdCat(args)
 	case "drive":
 		err = cmdDrive(args)
 	case "verify":
@@ -198,7 +209,9 @@ func cmdVerify(args []string) error {
 }
 
 // cmdInsert moves the given files into a fresh managed dir and prints the
-// managed dir id the files are now referenced by.
+// managed dir id the files are now referenced by. It routes through the
+// running mac service when there is one, keeping it the store's single
+// writer; otherwise it runs the state machine directly.
 func cmdInsert(args []string) error {
 	fs, dir, interval := runFlags("insert")
 	fs.Parse(args)
@@ -208,19 +221,40 @@ func cmdInsert(args []string) error {
 	if fs.NArg() == 0 {
 		return errors.New("insert needs at least one file")
 	}
+	root, err := filepath.Abs(*dir)
+	if err != nil {
+		return err
+	}
+	paths := make([]string, fs.NArg())
+	for i, p := range fs.Args() {
+		if paths[i], err = filepath.Abs(p); err != nil {
+			return err
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	if client, err := artifacts.Dial(ctx, root); err == nil {
+		defer client.Close()
+		log.Print("stdd: inserting via the running service")
+		id, err := client.Insert(ctx, paths...)
+		if err != nil {
+			return err
+		}
+		fmt.Println(id)
+		return nil
+	}
 
 	syncer, err := loadSyncer()
 	if err != nil {
 		return err
 	}
-	svc, err := artifacts.New(artifacts.Config{Root: *dir, Interval: *interval, Syncer: syncer})
+	svc, err := artifacts.New(artifacts.Config{Root: root, Interval: *interval, Syncer: syncer})
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	id, err := svc.Insert(ctx, fs.Args()...)
+	id, err := svc.Insert(ctx, paths...)
 	if err != nil {
 		return err
 	}
@@ -237,21 +271,36 @@ func cmdInstall(args []string) error {
 	return installService(*dir, *interval)
 }
 
-// cmdLs lists every managed dir with its state-machine stage.
+// cmdLs lists every managed dir with its state-machine stage, through the
+// running service when there is one.
 func cmdLs(args []string) error {
 	fs, dir, _ := runFlags("ls")
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("-dir is required")
 	}
-
-	svc, err := artifacts.New(artifacts.Config{Root: *dir})
+	root, err := filepath.Abs(*dir)
 	if err != nil {
 		return err
 	}
-	statuses, err := svc.Store().List()
-	if err != nil {
-		return err
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	var statuses []artifacts.Status
+	if client, err := artifacts.Dial(ctx, root); err == nil {
+		defer client.Close()
+		statuses, err = client.List(ctx)
+		if err != nil {
+			return err
+		}
+	} else {
+		svc, err := artifacts.New(artifacts.Config{Root: root})
+		if err != nil {
+			return err
+		}
+		if statuses, err = svc.Store().List(); err != nil {
+			return err
+		}
 	}
 	if len(statuses) == 0 {
 		fmt.Println("no managed dirs")
@@ -268,6 +317,54 @@ func cmdLs(args []string) error {
 		fmt.Println(line)
 	}
 	return nil
+}
+
+// cmdCat streams one managed file to stdout — from local storage or the
+// Drive fallback — through the running service when there is one.
+func cmdCat(args []string) error {
+	fs, dir, _ := runFlags("cat")
+	fs.Parse(args)
+	if *dir == "" {
+		return errors.New("-dir is required")
+	}
+	if fs.NArg() != 2 {
+		return errors.New("usage: stdd cat -dir DIR ID NAME")
+	}
+	rawID, name := fs.Arg(0), fs.Arg(1)
+	v, err := strconv.ParseUint(rawID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid id %q", rawID)
+	}
+	id := artifacts.ID(v)
+	root, err := filepath.Abs(*dir)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var r io.ReadCloser
+	if client, err := artifacts.Dial(ctx, root); err == nil {
+		defer client.Close()
+		if r, err = client.Open(ctx, id, name); err != nil {
+			return err
+		}
+	} else {
+		syncer, err := loadSyncer()
+		if err != nil {
+			return err
+		}
+		svc, err := artifacts.New(artifacts.Config{Root: root, Syncer: syncer})
+		if err != nil {
+			return err
+		}
+		if r, err = svc.Open(ctx, id, name); err != nil {
+			return err
+		}
+	}
+	defer r.Close()
+	_, err = io.Copy(os.Stdout, r)
+	return err
 }
 
 // cmdDrive handles `stdd drive auth`: the one-time OAuth flow whose refresh

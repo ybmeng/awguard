@@ -115,10 +115,27 @@ func (s *Service) Open(ctx context.Context, id ID, name string) (io.ReadCloser, 
 	return s.store.Open(ctx, id, name)
 }
 
-// Run polls the inbox until ctx is canceled, inserting every file that
-// appears there. Per-file errors are logged and do not stop the loop; Run
-// only returns when ctx ends.
+// Run operates the service until ctx is canceled: it polls the inbox,
+// inserting every file that appears there, and serves the store's API on the
+// root's unix socket so other processes (stdd insert/ls/cat) route through
+// this single writer instead of racing it.
 func (s *Service) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- s.serve(ctx) }()
+	go func() { errCh <- s.watchInbox(ctx) }()
+
+	err := <-errCh
+	cancel()
+	<-errCh
+	return err
+}
+
+// watchInbox polls the inbox until ctx is canceled. Per-file errors are
+// logged and do not stop the loop.
+func (s *Service) watchInbox(ctx context.Context) error {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 

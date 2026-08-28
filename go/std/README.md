@@ -101,10 +101,22 @@ storage when present, and otherwise fetches from Drive by the static
 ./stdd ls -dir ~/artifacts
 # 7        complete      2026-08-28T10:41:00Z
 # 8        err           2026-08-28T10:44:12Z  stage remote_dir: drive: ...
+
+# Stream a managed file (local storage, or Drive fallback)
+./stdd cat -dir ~/artifacts 7 report.pdf > report.pdf
 ```
 
 The background service also watches `<dir>/inbox`: every file dropped there
 is auto-inserted (one managed dir per file).
+
+### One writer: the mac service owns the store
+
+While the installed service is running it serves a local API on a unix
+socket inside the root dir (`<dir>/.artifacts.sock`). `stdd insert`, `ls`
+and `cat` detect it and route through it, so all id allocation and machine
+runs happen in the one service process — no cross-process races. Without a
+running service the same commands operate on the store directly. A second
+service pointed at a busy root refuses to start.
 
 The remote stages are a pluggable `Syncer` interface — `CreateDir` (stage 2),
 `SyncFile` (stage 3), `Fetch` (serving fallback) — so the whole machine stays

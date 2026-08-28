@@ -118,7 +118,7 @@ func TestVerify(t *testing.T) {
 
 func TestRunInsertsInBackground(t *testing.T) {
 	s, err := New(Config{
-		Root:     t.TempDir(),
+		Root:     shortRoot(t), // Run binds the API socket; see server_test.go
 		Interval: 10 * time.Millisecond,
 		Logger:   log.New(io.Discard, "", 0),
 	})
