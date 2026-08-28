@@ -5,6 +5,7 @@
 //
 //	stdd run -dir DIR [-interval D]   run all services in the foreground (what launchd executes)
 //	stdd insert -dir DIR FILE...      move files into a managed artifact dir, print its id
+//	stdd drive auth ...               one-time Google Drive authorization
 //	stdd verify                       fast self-check of every service, then exit
 //	stdd install -dir DIR             install + start the macOS LaunchAgent
 //	stdd uninstall                    stop + remove the LaunchAgent
@@ -26,7 +27,11 @@ import (
 
 	bgservices "awguard/go/std/bg_services"
 	"awguard/go/std/bg_services/artifacts"
+	"awguard/go/std/drive"
 )
+
+// driveRootFolder is the top-level Drive folder managed dirs mirror into.
+const driveRootFolder = "std_artifacts"
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `stdd — std background services supervisor
@@ -34,6 +39,7 @@ func usage() {
 Commands:
   run -dir DIR [-interval D]   run all services in the foreground
   insert -dir DIR FILE...      move files into a managed artifact dir, print its id
+  drive auth -credentials F    one-time Google Drive authorization (or -client-id/-client-secret)
   verify                       fast self-check of every service
   install -dir DIR             install + start the macOS LaunchAgent
   uninstall                    stop + remove the LaunchAgent
@@ -43,12 +49,35 @@ Commands:
 }
 
 // services builds the full roster of std background services.
-func services(root string, interval time.Duration) ([]bgservices.Service, error) {
-	art, err := artifacts.New(artifacts.Config{Root: root, Interval: interval})
+func services(root string, interval time.Duration, syncer artifacts.Syncer) ([]bgservices.Service, error) {
+	art, err := artifacts.New(artifacts.Config{Root: root, Interval: interval, Syncer: syncer})
 	if err != nil {
 		return nil, err
 	}
 	return []bgservices.Service{art}, nil
+}
+
+// loadSyncer builds the Google Drive syncer from the persisted auth config,
+// or falls back to local-only mode when Drive was never authorized.
+func loadSyncer() (artifacts.Syncer, error) {
+	path, err := drive.DefaultConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := drive.LoadConfig(path)
+	if os.IsNotExist(err) {
+		log.Printf("stdd: Google Drive not configured (run: stdd drive auth) — artifacts are local-only")
+		return artifacts.NopSyncer{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	client, err := drive.NewClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("stdd: artifacts force-sync to Google Drive folder %q", driveRootFolder)
+	return drive.NewArtifactsSyncer(client, driveRootFolder), nil
 }
 
 func main() {
@@ -64,6 +93,8 @@ func main() {
 		err = cmdRun(args)
 	case "insert":
 		err = cmdInsert(args)
+	case "drive":
+		err = cmdDrive(args)
 	case "verify":
 		err = cmdVerify(args)
 	case "install":
@@ -100,7 +131,11 @@ func cmdRun(args []string) error {
 		return errors.New("-dir is required")
 	}
 
-	svcs, err := services(*dir, *interval)
+	syncer, err := loadSyncer()
+	if err != nil {
+		return err
+	}
+	svcs, err := services(*dir, *interval, syncer)
 	if err != nil {
 		return err
 	}
@@ -134,7 +169,7 @@ func cmdVerify(args []string) error {
 	}
 	defer os.RemoveAll(tmp)
 
-	svcs, err := services(tmp, artifacts.DefaultInterval)
+	svcs, err := services(tmp, artifacts.DefaultInterval, artifacts.NopSyncer{})
 	if err != nil {
 		return err
 	}
@@ -170,7 +205,11 @@ func cmdInsert(args []string) error {
 		return errors.New("insert needs at least one file")
 	}
 
-	svc, err := artifacts.New(artifacts.Config{Root: *dir, Interval: *interval})
+	syncer, err := loadSyncer()
+	if err != nil {
+		return err
+	}
+	svc, err := artifacts.New(artifacts.Config{Root: *dir, Interval: *interval, Syncer: syncer})
 	if err != nil {
 		return err
 	}
@@ -192,4 +231,45 @@ func cmdInstall(args []string) error {
 		return errors.New("-dir is required")
 	}
 	return installService(*dir, *interval)
+}
+
+// cmdDrive handles `stdd drive auth`: the one-time OAuth flow whose refresh
+// token every later force sync uses.
+func cmdDrive(args []string) error {
+	if len(args) < 1 || args[0] != "auth" {
+		return errors.New("usage: stdd drive auth [-credentials FILE | -client-id ID -client-secret SECRET]")
+	}
+	fs := flag.NewFlagSet("drive auth", flag.ExitOnError)
+	creds := fs.String("credentials", "", "path to a Desktop app OAuth client JSON from the Google Cloud console")
+	clientID := fs.String("client-id", "", "OAuth client id (alternative to -credentials)")
+	clientSecret := fs.String("client-secret", "", "OAuth client secret (alternative to -credentials)")
+	fs.Parse(args[1:])
+
+	id, secret := *clientID, *clientSecret
+	if *creds != "" {
+		var err error
+		id, secret, err = drive.ParseInstalledCredentials(*creds)
+		if err != nil {
+			return err
+		}
+	}
+	if id == "" || secret == "" {
+		return errors.New("provide -credentials FILE, or -client-id and -client-secret")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cfg, err := drive.Authorize(ctx, id, secret, os.Stdout)
+	if err != nil {
+		return err
+	}
+	path, err := drive.DefaultConfigPath()
+	if err != nil {
+		return err
+	}
+	if err := drive.SaveConfig(path, cfg); err != nil {
+		return err
+	}
+	fmt.Printf("stdd: Drive authorized, credentials saved to %s\n", path)
+	return nil
 }

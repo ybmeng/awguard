@@ -9,7 +9,8 @@ verifiable.
 ```
 go/std/
   bg_services/            Service contract + supervisor loop
-    artifacts/            std_artifacts: inbox -> synced file sync
+    artifacts/            std_artifacts: the managed artifact store
+  drive/                  minimal stdlib-only Google Drive v3 client + syncer
   stdd/                   the service binary launchd runs, plus its control CLI
 ```
 
@@ -83,9 +84,31 @@ A managed artifact store. The insert pipeline:
 The background service also watches `<dir>/inbox`: every file dropped there
 is auto-inserted (one managed dir per file).
 
-The remote side is a pluggable `Syncer` interface (`ForceSync`, `Fetch`), so
-the whole pipeline is testable in milliseconds with a fake; `NopSyncer` gives
-local-only operation until the Google Drive syncer is wired in.
+The remote side is a pluggable `Syncer` interface (`ForceSync`, `Fetch`); the
+real implementation is Google Drive (below), and the whole pipeline stays
+testable in milliseconds with fakes. Without Drive configured, `stdd` runs
+local-only via `NopSyncer` and says so at startup.
+
+### Google Drive setup (one time)
+
+`go/std/drive` talks to the Drive v3 API directly — no SDK dependencies, no
+desktop app. Managed dirs mirror to a `std_artifacts/<id>/` folder tree in
+your Drive, uploads are acknowledged before Insert returns, and re-syncs
+replace content instead of duplicating it.
+
+1. In the Google Cloud console, create an OAuth client of type **Desktop
+   app** (with the Drive API enabled) and download its JSON. The token scope
+   is `drive.file` — the app can only touch files it created.
+2. Authorize once; the refresh token lands in `~/.config/stdd/drive.json`
+   (mode 0600):
+
+```bash
+./stdd drive auth -credentials ~/Downloads/client_secret.json
+# opens a consent URL; approve in the browser
+```
+
+From then on `stdd run` and `stdd insert` force-sync through Drive
+automatically.
 
 As a library:
 
