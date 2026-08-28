@@ -24,25 +24,17 @@ func newTestService(t *testing.T, root string) *Service {
 	return s
 }
 
-func writeInbox(t *testing.T, s *Service, name, content string) {
+func writeFile(t *testing.T, path, content string) string {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(s.root, InboxDir, name), []byte(content), 0o644); err != nil {
-		t.Fatalf("write %s: %v", name, err)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
 	}
-}
-
-func readSynced(t *testing.T, s *Service, name string) string {
-	t.Helper()
-	b, err := os.ReadFile(filepath.Join(s.root, SyncedDir, name))
-	if err != nil {
-		t.Fatalf("read synced/%s: %v", name, err)
-	}
-	return string(b)
+	return path
 }
 
 func TestNewCreatesDirs(t *testing.T) {
 	s := newTestService(t, t.TempDir())
-	for _, dir := range []string{InboxDir, SyncedDir} {
+	for _, dir := range []string{InboxDir, ManagedDir} {
 		info, err := os.Stat(filepath.Join(s.root, dir))
 		if err != nil || !info.IsDir() {
 			t.Fatalf("expected directory %s: err=%v", dir, err)
@@ -56,73 +48,61 @@ func TestNewRequiresRoot(t *testing.T) {
 	}
 }
 
-func TestSyncOnceMovesFiles(t *testing.T) {
+func TestDrainInboxInsertsFiles(t *testing.T) {
 	s := newTestService(t, t.TempDir())
-	writeInbox(t, s, "a.txt", "alpha")
-	writeInbox(t, s, "b.txt", "bravo")
+	ctx := context.Background()
+	writeFile(t, filepath.Join(s.inbox, "a.txt"), "alpha")
+	writeFile(t, filepath.Join(s.inbox, "b.txt"), "bravo")
 
-	moved, err := s.SyncOnce()
+	inserted, err := s.DrainInbox(ctx)
 	if err != nil {
-		t.Fatalf("SyncOnce: %v", err)
+		t.Fatalf("DrainInbox: %v", err)
 	}
-	if moved != 2 {
-		t.Fatalf("moved = %d, want 2", moved)
-	}
-	if got := readSynced(t, s, "a.txt"); got != "alpha" {
-		t.Errorf("a.txt content = %q, want %q", got, "alpha")
-	}
-	if got := readSynced(t, s, "b.txt"); got != "bravo" {
-		t.Errorf("b.txt content = %q, want %q", got, "bravo")
+	if inserted != 2 {
+		t.Fatalf("inserted = %d, want 2", inserted)
 	}
 
-	entries, err := os.ReadDir(filepath.Join(s.root, InboxDir))
+	entries, err := os.ReadDir(s.inbox)
 	if err != nil {
 		t.Fatalf("read inbox: %v", err)
 	}
 	if len(entries) != 0 {
-		t.Errorf("inbox not empty after sync: %d entries", len(entries))
+		t.Errorf("inbox not empty after drain: %d entries", len(entries))
+	}
+
+	// Each file got its own managed dir with a monotonic id.
+	seen := map[string]bool{}
+	for id := ID(1); id <= 2; id++ {
+		dir := filepath.Join(s.store.Dir(), id.String())
+		files, err := os.ReadDir(dir)
+		if err != nil || len(files) != 1 {
+			t.Fatalf("managed/%s: err=%v files=%d, want 1 file", id, err, len(files))
+		}
+		seen[files[0].Name()] = true
+	}
+	if !seen["a.txt"] || !seen["b.txt"] {
+		t.Errorf("managed dirs hold %v, want a.txt and b.txt", seen)
 	}
 }
 
-func TestSyncOnceSkipsDirsAndDotfiles(t *testing.T) {
+func TestDrainInboxSkipsDirsAndDotfiles(t *testing.T) {
 	s := newTestService(t, t.TempDir())
-	if err := os.Mkdir(filepath.Join(s.root, InboxDir, "subdir"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(s.inbox, "subdir"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeInbox(t, s, ".hidden", "secret")
+	writeFile(t, filepath.Join(s.inbox, ".hidden"), "secret")
 
-	moved, err := s.SyncOnce()
+	inserted, err := s.DrainInbox(context.Background())
 	if err != nil {
-		t.Fatalf("SyncOnce: %v", err)
+		t.Fatalf("DrainInbox: %v", err)
 	}
-	if moved != 0 {
-		t.Fatalf("moved = %d, want 0", moved)
+	if inserted != 0 {
+		t.Fatalf("inserted = %d, want 0", inserted)
 	}
 	for _, name := range []string{"subdir", ".hidden"} {
-		if _, err := os.Stat(filepath.Join(s.root, InboxDir, name)); err != nil {
+		if _, err := os.Stat(filepath.Join(s.inbox, name)); err != nil {
 			t.Errorf("%s should remain in inbox: %v", name, err)
 		}
-	}
-}
-
-func TestSyncOnceResolvesNameCollisions(t *testing.T) {
-	s := newTestService(t, t.TempDir())
-
-	for i, content := range []string{"first", "second", "third"} {
-		writeInbox(t, s, "report.txt", content)
-		if _, err := s.SyncOnce(); err != nil {
-			t.Fatalf("SyncOnce #%d: %v", i+1, err)
-		}
-	}
-
-	if got := readSynced(t, s, "report.txt"); got != "first" {
-		t.Errorf("report.txt = %q, want %q", got, "first")
-	}
-	if got := readSynced(t, s, "report-1.txt"); got != "second" {
-		t.Errorf("report-1.txt = %q, want %q", got, "second")
-	}
-	if got := readSynced(t, s, "report-2.txt"); got != "third" {
-		t.Errorf("report-2.txt = %q, want %q", got, "third")
 	}
 }
 
@@ -133,7 +113,7 @@ func TestVerify(t *testing.T) {
 	}
 }
 
-func TestRunSyncsInBackground(t *testing.T) {
+func TestRunInsertsInBackground(t *testing.T) {
 	s, err := New(Config{
 		Root:     t.TempDir(),
 		Interval: 10 * time.Millisecond,
@@ -142,19 +122,20 @@ func TestRunSyncsInBackground(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	writeInbox(t, s, "bg.txt", "background")
+	writeFile(t, filepath.Join(s.inbox, "bg.txt"), "background")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
 
+	target := filepath.Join(s.store.Dir(), "1", "bg.txt")
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, err := os.Stat(filepath.Join(s.root, SyncedDir, "bg.txt")); err == nil {
+		if _, err := os.Stat(target); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("bg.txt was not synced within 2s")
+			t.Fatal("bg.txt was not inserted within 2s")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

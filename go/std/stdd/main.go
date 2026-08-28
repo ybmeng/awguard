@@ -4,6 +4,7 @@
 // Usage:
 //
 //	stdd run -dir DIR [-interval D]   run all services in the foreground (what launchd executes)
+//	stdd insert -dir DIR FILE...      move files into a managed artifact dir, print its id
 //	stdd verify                       fast self-check of every service, then exit
 //	stdd install -dir DIR             install + start the macOS LaunchAgent
 //	stdd uninstall                    stop + remove the LaunchAgent
@@ -32,6 +33,7 @@ func usage() {
 
 Commands:
   run -dir DIR [-interval D]   run all services in the foreground
+  insert -dir DIR FILE...      move files into a managed artifact dir, print its id
   verify                       fast self-check of every service
   install -dir DIR             install + start the macOS LaunchAgent
   uninstall                    stop + remove the LaunchAgent
@@ -60,6 +62,8 @@ func main() {
 	switch cmd {
 	case "run":
 		err = cmdRun(args)
+	case "insert":
+		err = cmdInsert(args)
 	case "verify":
 		err = cmdVerify(args)
 	case "install":
@@ -151,6 +155,33 @@ func cmdVerify(args []string) error {
 	if failed > 0 {
 		return fmt.Errorf("%d service(s) failed verification", failed)
 	}
+	return nil
+}
+
+// cmdInsert moves the given files into a fresh managed dir and prints the
+// managed dir id the files are now referenced by.
+func cmdInsert(args []string) error {
+	fs, dir, interval := runFlags("insert")
+	fs.Parse(args)
+	if *dir == "" {
+		return errors.New("-dir is required")
+	}
+	if fs.NArg() == 0 {
+		return errors.New("insert needs at least one file")
+	}
+
+	svc, err := artifacts.New(artifacts.Config{Root: *dir, Interval: *interval})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	id, err := svc.Insert(ctx, fs.Args()...)
+	if err != nil {
+		return err
+	}
+	fmt.Println(id)
 	return nil
 }
 

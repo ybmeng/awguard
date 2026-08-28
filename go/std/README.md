@@ -62,20 +62,37 @@ scripts/verify-std.sh
 
 ## std_artifacts
 
-Filesystem-only artifact sync. Watches `<dir>/inbox` in the background and
-moves every file that appears there into `<dir>/synced`.
+A managed artifact store. The insert pipeline:
 
-- `inbox/` and `synced/` are created under the root dir if missing.
-- Files move via atomic `os.Rename` (same filesystem, no copies).
-- Name collisions in `synced/` get a numeric suffix (`report.txt` → `report-1.txt`).
-- Dotfiles and subdirectories in `inbox/` are left alone.
+1. **Insert** takes on-disk file locations and moves them (consumes the
+   sources) into a fresh subdirectory of the global `managed/` dir.
+2. The subdirectory gets a **monotonically increasing id** — durable across
+   restarts via a counter file, never reused even if local dirs are evicted.
+3. The dir is **force-synced** to remote storage (Google Drive).
+4. Only after the sync succeeds is the **managed dir id returned** — from then
+   on the files are referenced by `id` in our system.
+5. **Open(id, name)** serves the file from local storage, or falls back to
+   fetching it from Drive when the local copy is gone.
 
-Embeddable as a library too:
+```bash
+# Insert files and get back the managed dir id
+./stdd insert -dir ~/artifacts report.pdf data.csv
+# -> 7        (files now live in ~/artifacts/managed/7/)
+```
+
+The background service also watches `<dir>/inbox`: every file dropped there
+is auto-inserted (one managed dir per file).
+
+The remote side is a pluggable `Syncer` interface (`ForceSync`, `Fetch`), so
+the whole pipeline is testable in milliseconds with a fake; `NopSyncer` gives
+local-only operation until the Google Drive syncer is wired in.
+
+As a library:
 
 ```go
-svc, err := artifacts.New(artifacts.Config{Root: "/path/to/dir"})
-if err != nil { ... }
-go svc.Run(ctx) // background sync until ctx is canceled
+svc, err := artifacts.New(artifacts.Config{Root: "/path/to/dir", Syncer: drive})
+id, err := svc.Insert(ctx, "/path/to/report.pdf")   // blocks until synced
+r, err := svc.Open(ctx, id, "report.pdf")           // local, or Drive fallback
 ```
 
 ## Adding a new service
