@@ -5,6 +5,7 @@
 //
 //	stdd run -dir DIR [-interval D]   run all services in the foreground (what launchd executes)
 //	stdd insert -dir DIR FILE...      move files into a managed artifact dir, print its id
+//	stdd ls -dir DIR                  list managed dirs with their state-machine stage
 //	stdd drive auth ...               one-time Google Drive authorization
 //	stdd verify                       fast self-check of every service, then exit
 //	stdd install -dir DIR             install + start the macOS LaunchAgent
@@ -39,6 +40,7 @@ func usage() {
 Commands:
   run -dir DIR [-interval D]   run all services in the foreground
   insert -dir DIR FILE...      move files into a managed artifact dir, print its id
+  ls -dir DIR                  list managed dirs with their state-machine stage
   drive auth -credentials F    one-time Google Drive authorization (or -client-id/-client-secret)
   verify                       fast self-check of every service
   install -dir DIR             install + start the macOS LaunchAgent
@@ -93,6 +95,8 @@ func main() {
 		err = cmdRun(args)
 	case "insert":
 		err = cmdInsert(args)
+	case "ls":
+		err = cmdLs(args)
 	case "drive":
 		err = cmdDrive(args)
 	case "verify":
@@ -231,6 +235,39 @@ func cmdInstall(args []string) error {
 		return errors.New("-dir is required")
 	}
 	return installService(*dir, *interval)
+}
+
+// cmdLs lists every managed dir with its state-machine stage.
+func cmdLs(args []string) error {
+	fs, dir, _ := runFlags("ls")
+	fs.Parse(args)
+	if *dir == "" {
+		return errors.New("-dir is required")
+	}
+
+	svc, err := artifacts.New(artifacts.Config{Root: *dir})
+	if err != nil {
+		return err
+	}
+	statuses, err := svc.Store().List()
+	if err != nil {
+		return err
+	}
+	if len(statuses) == 0 {
+		fmt.Println("no managed dirs")
+		return nil
+	}
+	for _, s := range statuses {
+		line := fmt.Sprintf("%-8s %-12s", s.ID, s.Stage)
+		if !s.UpdatedAt.IsZero() {
+			line += "  " + s.UpdatedAt.Local().Format(time.RFC3339)
+		}
+		if s.Error != "" {
+			line += "  " + s.Error
+		}
+		fmt.Println(line)
+	}
+	return nil
 }
 
 // cmdDrive handles `stdd drive auth`: the one-time OAuth flow whose refresh

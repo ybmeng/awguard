@@ -2,126 +2,98 @@ package drive
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"awguard/go/std/bg_services/artifacts"
 )
 
 // ArtifactsSyncer implements artifacts.Syncer on Google Drive. Managed dirs
-// mirror to Drive as <rootFolder>/<id>/<files>; ForceSync blocks until every
-// file's upload has been acknowledged, which is what makes Insert safe to
-// hand out an id.
+// mirror to Drive as <rootFolder>/<id>/<files>. CreateDir is the machine's
+// stage 2, SyncFile its stage 3 (each upload acknowledged before returning a
+// static reference), and Fetch the serving fallback by Drive file id.
 type ArtifactsSyncer struct {
 	client     *Client
 	rootFolder string
 
-	mu      sync.Mutex
-	rootID  string
-	folders map[string]string // managed dir name -> Drive folder id
+	mu     sync.Mutex
+	rootID string
 }
 
 // NewArtifactsSyncer returns a syncer mirroring managed dirs under the named
 // top-level Drive folder (created on first use).
 func NewArtifactsSyncer(client *Client, rootFolder string) *ArtifactsSyncer {
-	return &ArtifactsSyncer{
-		client:     client,
-		rootFolder: rootFolder,
-		folders:    map[string]string{},
-	}
+	return &ArtifactsSyncer{client: client, rootFolder: rootFolder}
 }
 
-// folderID resolves (and caches) the Drive folder for one managed dir name.
-// With create false it returns "" when the folder does not exist remotely.
-func (s *ArtifactsSyncer) folderID(ctx context.Context, name string, create bool) (string, error) {
+// rootFolderID resolves and caches the top-level Drive folder.
+func (s *ArtifactsSyncer) rootFolderID(ctx context.Context) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if id, ok := s.folders[name]; ok {
-		return id, nil
+	if s.rootID != "" {
+		return s.rootID, nil
 	}
-	if s.rootID == "" {
-		var err error
-		if create {
-			s.rootID, err = s.client.FindOrCreateFolder(ctx, s.rootFolder, "")
-		} else {
-			s.rootID, err = s.client.FindFolder(ctx, s.rootFolder, "")
-		}
-		if err != nil {
-			return "", err
-		}
-		if s.rootID == "" {
-			return "", nil
-		}
-	}
-
-	var id string
-	var err error
-	if create {
-		id, err = s.client.FindOrCreateFolder(ctx, name, s.rootID)
-	} else {
-		id, err = s.client.FindFolder(ctx, name, s.rootID)
-	}
+	id, err := s.client.FindOrCreateFolder(ctx, s.rootFolder, "")
 	if err != nil {
 		return "", err
 	}
-	if id != "" {
-		s.folders[name] = id
-	}
+	s.rootID = id
 	return id, nil
 }
 
-// ForceSync implements artifacts.Syncer: it uploads every regular file of
-// the managed dir and returns only once all uploads are acknowledged.
-// Re-syncing the same dir replaces remote content instead of duplicating it.
-func (s *ArtifactsSyncer) ForceSync(ctx context.Context, dir string) error {
-	folder, err := s.folderID(ctx, filepath.Base(dir), true)
+// CreateDir implements artifacts.Syncer (stage 2): it creates the Drive
+// folder for one managed dir and returns the folder id as the remote dir.
+func (s *ArtifactsSyncer) CreateDir(ctx context.Context, id artifacts.ID) (string, error) {
+	root, err := s.rootFolderID(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
-
-	entries, err := os.ReadDir(dir)
+	folder, err := s.client.FindOrCreateFolder(ctx, id.String(), root)
 	if err != nil {
-		return fmt.Errorf("drive: read %s: %w", dir, err)
+		return "", fmt.Errorf("drive: create remote dir for %s: %w", id, err)
 	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || strings.HasPrefix(name, ".") {
-			continue
-		}
-		f, err := os.Open(filepath.Join(dir, name))
-		if err != nil {
-			return fmt.Errorf("drive: open %s: %w", name, err)
-		}
-		_, err = s.client.Upload(ctx, name, folder, f)
-		f.Close()
-		if err != nil {
-			return fmt.Errorf("drive: upload %s: %w", name, err)
-		}
-	}
-	return nil
+	return folder, nil
 }
 
-// Fetch implements artifacts.Syncer: it streams one managed file back from
-// Drive when the local copy is gone.
-func (s *ArtifactsSyncer) Fetch(ctx context.Context, id artifacts.ID, name string) (io.ReadCloser, error) {
-	folder, err := s.folderID(ctx, id.String(), false)
+// SyncFile implements artifacts.Syncer (stage 3): it uploads one file into
+// the remote dir, blocking until Drive acknowledges it, and returns the
+// static reference (Drive file id, size, sha256). Re-syncing replaces remote
+// content instead of duplicating it.
+func (s *ArtifactsSyncer) SyncFile(ctx context.Context, remoteDir, localPath string) (artifacts.FileRef, error) {
+	f, err := os.Open(localPath)
 	if err != nil {
-		return nil, err
+		return artifacts.FileRef{}, fmt.Errorf("drive: open %s: %w", localPath, err)
 	}
-	if folder == "" {
-		return nil, fmt.Errorf("drive: managed dir %s not found remotely", id)
-	}
-	fileID, err := s.client.FindFile(ctx, name, folder)
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return artifacts.FileRef{}, fmt.Errorf("drive: stat %s: %w", localPath, err)
 	}
-	if fileID == "" {
-		return nil, fmt.Errorf("drive: %s/%s not found remotely", id, name)
+
+	name := filepath.Base(localPath)
+	h := sha256.New()
+	fileID, err := s.client.Upload(ctx, name, remoteDir, io.TeeReader(f, h))
+	if err != nil {
+		return artifacts.FileRef{}, fmt.Errorf("drive: upload %s: %w", name, err)
 	}
-	return s.client.Download(ctx, fileID)
+	return artifacts.FileRef{
+		Name:     name,
+		RemoteID: fileID,
+		Size:     info.Size(),
+		SHA256:   hex.EncodeToString(h.Sum(nil)),
+	}, nil
+}
+
+// Fetch implements artifacts.Syncer: it streams a file back from Drive by
+// the static id recorded in its reference.
+func (s *ArtifactsSyncer) Fetch(ctx context.Context, ref artifacts.FileRef) (io.ReadCloser, error) {
+	if ref.RemoteID == "" {
+		return nil, fmt.Errorf("drive: reference for %s has no remote id", ref.Name)
+	}
+	return s.client.Download(ctx, ref.RemoteID)
 }

@@ -2,6 +2,8 @@ package drive
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -291,9 +293,9 @@ func TestUploadCreatesThenUpdates(t *testing.T) {
 	}
 }
 
-// TestStoreWithDriveSyncerEndToEnd runs the full artifacts pipeline against
-// the fake Drive: insert -> force sync -> id, then local eviction -> Fetch
-// fallback.
+// TestStoreWithDriveSyncerEndToEnd runs the full state machine against the
+// fake Drive: insert -> stages 1-5 -> id, static refs pointing at real Drive
+// file ids, then local eviction -> Fetch fallback by RemoteID.
 func TestStoreWithDriveSyncerEndToEnd(t *testing.T) {
 	d := &fakeDrive{}
 	syncer := NewArtifactsSyncer(newTestClient(t, d), "std_artifacts")
@@ -312,13 +314,27 @@ func TestStoreWithDriveSyncerEndToEnd(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 
-	// The managed dir is mirrored on Drive before the id was handed out.
+	// Stage 2+3 mirrored the dir on Drive before the id was handed out.
 	remote := d.byPath("std_artifacts/" + id.String() + "/report.txt")
 	if remote == nil || string(remote.content) != "quarterly numbers" {
 		t.Fatalf("remote copy = %v, want mirrored content", remote)
 	}
 
-	// Evict the local copy: Open must serve from Drive.
+	// Stage 4's static refs carry the actual Drive file id and checksum.
+	refs, err := st.Refs(id)
+	if err != nil {
+		t.Fatalf("Refs: %v", err)
+	}
+	ref, ok := refs.Find("report.txt")
+	if !ok || ref.RemoteID != remote.id {
+		t.Fatalf("ref = %+v, want RemoteID %q", ref, remote.id)
+	}
+	wantSum := sha256.Sum256([]byte("quarterly numbers"))
+	if ref.SHA256 != hex.EncodeToString(wantSum[:]) || ref.Size != int64(len("quarterly numbers")) {
+		t.Errorf("ref checksum/size = %+v", ref)
+	}
+
+	// Evict the local copy: Open must serve from Drive via the static ref.
 	if err := os.Remove(st.Path(id, "report.txt")); err != nil {
 		t.Fatal(err)
 	}
@@ -332,9 +348,10 @@ func TestStoreWithDriveSyncerEndToEnd(t *testing.T) {
 		t.Errorf("fetched content = %q", got)
 	}
 
-	// A second store instance (fresh process) can also fetch it.
+	// A fresh syncer (new process) resolves the same static ref with no
+	// name lookups.
 	syncer2 := NewArtifactsSyncer(newTestClient(t, d), "std_artifacts")
-	r2, err := syncer2.Fetch(ctx, id, "report.txt")
+	r2, err := syncer2.Fetch(ctx, ref)
 	if err != nil {
 		t.Fatalf("Fetch from fresh syncer: %v", err)
 	}
@@ -344,29 +361,40 @@ func TestStoreWithDriveSyncerEndToEnd(t *testing.T) {
 		t.Errorf("fresh fetch = %q", got2)
 	}
 
-	if _, err := syncer2.Fetch(ctx, id, "missing.txt"); err == nil {
-		t.Error("expected error fetching a file that was never synced")
+	if _, err := syncer2.Fetch(ctx, artifacts.FileRef{Name: "missing.txt"}); err == nil {
+		t.Error("expected error fetching a ref with no remote id")
 	}
 }
 
-func TestForceSyncRetryDoesNotDuplicate(t *testing.T) {
+func TestSyncFileRetryDoesNotDuplicate(t *testing.T) {
 	d := &fakeDrive{}
 	syncer := NewArtifactsSyncer(newTestClient(t, d), "std_artifacts")
 	ctx := context.Background()
 
-	dir := filepath.Join(t.TempDir(), "42")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
+	remoteDir, err := syncer.CreateDir(ctx, 42)
+	if err != nil {
+		t.Fatalf("CreateDir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("v1"), 0o644); err != nil {
-		t.Fatal(err)
+	// CreateDir is idempotent too: a retry lands on the same folder.
+	again, err := syncer.CreateDir(ctx, 42)
+	if err != nil || again != remoteDir {
+		t.Fatalf("CreateDir retry = %q (err=%v), want %q", again, err, remoteDir)
 	}
 
-	if err := syncer.ForceSync(ctx, dir); err != nil {
-		t.Fatalf("ForceSync: %v", err)
+	local := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(local, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if err := syncer.ForceSync(ctx, dir); err != nil {
-		t.Fatalf("ForceSync (retry): %v", err)
+	ref1, err := syncer.SyncFile(ctx, remoteDir, local)
+	if err != nil {
+		t.Fatalf("SyncFile: %v", err)
+	}
+	ref2, err := syncer.SyncFile(ctx, remoteDir, local)
+	if err != nil {
+		t.Fatalf("SyncFile (retry): %v", err)
+	}
+	if ref2.RemoteID != ref1.RemoteID {
+		t.Errorf("retry produced new remote id %q, want %q", ref2.RemoteID, ref1.RemoteID)
 	}
 
 	d.mu.Lock()

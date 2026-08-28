@@ -70,15 +70,18 @@ func TestDrainInboxInsertsFiles(t *testing.T) {
 		t.Errorf("inbox not empty after drain: %d entries", len(entries))
 	}
 
-	// Each file got its own managed dir with a monotonic id.
+	// Each file got its own COMPLETE managed dir with a monotonic id.
 	seen := map[string]bool{}
 	for id := ID(1); id <= 2; id++ {
-		dir := filepath.Join(s.store.Dir(), id.String())
-		files, err := os.ReadDir(dir)
-		if err != nil || len(files) != 1 {
-			t.Fatalf("managed/%s: err=%v files=%d, want 1 file", id, err, len(files))
+		status, err := s.store.Status(id)
+		if err != nil || status.Stage != StageComplete {
+			t.Fatalf("managed/%s status = %+v (err=%v), want COMPLETE", id, status, err)
 		}
-		seen[files[0].Name()] = true
+		files, err := contentFiles(filepath.Join(s.store.Dir(), id.String()))
+		if err != nil || len(files) != 1 {
+			t.Fatalf("managed/%s: err=%v files=%v, want 1 content file", id, err, files)
+		}
+		seen[files[0]] = true
 	}
 	if !seen["a.txt"] || !seen["b.txt"] {
 		t.Errorf("managed dirs hold %v, want a.txt and b.txt", seen)

@@ -202,6 +202,21 @@ func (s *Service) Verify(ctx context.Context) error {
 		return fmt.Errorf("artifacts verify: ids not monotonic (%s then %s)", id, id2)
 	}
 
+	status, err := probe.Status(id)
+	if err != nil {
+		return fmt.Errorf("artifacts verify: %w", err)
+	}
+	if status.Stage != StageComplete {
+		return fmt.Errorf("artifacts verify: machine ended at stage %s, want %s", status.Stage, StageComplete)
+	}
+	refs, err := probe.Refs(id)
+	if err != nil {
+		return fmt.Errorf("artifacts verify: %w", err)
+	}
+	if ref, ok := refs.Find("probe.txt"); !ok || ref.SHA256 == "" || ref.Size == 0 {
+		return fmt.Errorf("artifacts verify: static refs incomplete: %+v", refs)
+	}
+
 	r, err := probe.Open(ctx, id, "probe.txt")
 	if err != nil {
 		return fmt.Errorf("artifacts verify: open managed file: %w", err)

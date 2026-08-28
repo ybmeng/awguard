@@ -63,31 +63,64 @@ scripts/verify-std.sh
 
 ## std_artifacts
 
-A managed artifact store. The insert pipeline:
+A managed artifact store. Insert is an explicit state machine, persisted on
+disk in the managed dir itself:
 
-1. **Insert** takes on-disk file locations and moves them (consumes the
-   sources) into a fresh subdirectory of the global `managed/` dir.
-2. The subdirectory gets a **monotonically increasing id** — durable across
-   restarts via a counter file, never reused even if local dirs are evicted.
-3. The dir is **force-synced** to remote storage (Google Drive).
-4. Only after the sync succeeds is the **managed dir id returned** — from then
-   on the files are referenced by `id` in our system.
-5. **Open(id, name)** serves the file from local storage, or falls back to
-   fetching it from Drive when the local copy is gone.
+```
+INIT ──1──> MOVED ──2──> REMOTE_DIR ──3──> SYNCED ──4──> REFS ──5──> COMPLETE
+  └──────────┴────────────┴───────────────┴───────────┘
+                     any failure ──> ERR (terminal, irrecoverable for now)
+```
+
+- **INIT** — `managed/<id>/` created with a fresh monotonic id and tagged
+  WIP (`.wip` marker) before anything else happens.
+- **Stage 1 → MOVED** — the referenced on-disk files are moved in
+  (sources consumed).
+- **Stage 2 → REMOTE_DIR** — the Drive folder structure
+  (`std_artifacts/<id>/`) is created.
+- **Stage 3 → SYNCED** — every file uploaded and acknowledged.
+- **Stage 4 → REFS** — static references written to `.refs.json` in the dir:
+  Drive file id, size, sha256 per file. Never rewritten afterwards.
+- **Stage 5 → COMPLETE** — the WIP tag is removed; only now does Insert
+  return the managed dir id.
+- **ERR** — any failure renames `.wip` to `.err` recording the stage that
+  died and why. Terminal: nothing retries, the dir stays for inspection,
+  its id is burned. An insert left mid-WIP by a dead process is swept to
+  ERR on the next startup.
+
+Serving: `Open(id, name)` refuses non-COMPLETE dirs, serves from local
+storage when present, and otherwise fetches from Drive by the static
+`remote_id` in the refs — no name lookups.
 
 ```bash
-# Insert files and get back the managed dir id
+# Insert files and get back the managed dir id (only on COMPLETE)
 ./stdd insert -dir ~/artifacts report.pdf data.csv
-# -> 7        (files now live in ~/artifacts/managed/7/)
+# -> 7        (files + .refs.json now live in ~/artifacts/managed/7/)
+
+# Inspect the state machine
+./stdd ls -dir ~/artifacts
+# 7        complete      2026-08-28T10:41:00Z
+# 8        err           2026-08-28T10:44:12Z  stage remote_dir: drive: ...
 ```
 
 The background service also watches `<dir>/inbox`: every file dropped there
 is auto-inserted (one managed dir per file).
 
-The remote side is a pluggable `Syncer` interface (`ForceSync`, `Fetch`); the
-real implementation is Google Drive (below), and the whole pipeline stays
-testable in milliseconds with fakes. Without Drive configured, `stdd` runs
-local-only via `NopSyncer` and says so at startup.
+The remote stages are a pluggable `Syncer` interface — `CreateDir` (stage 2),
+`SyncFile` (stage 3), `Fetch` (serving fallback) — so the whole machine stays
+testable in milliseconds with fakes. The real implementation is Google Drive
+(below). Without Drive configured, `stdd` runs local-only via `NopSyncer`
+and says so at startup.
+
+As a library:
+
+```go
+svc, _ := artifacts.New(artifacts.Config{Root: dir, Syncer: driveSyncer})
+id, err := svc.Insert(ctx, "/path/report.pdf")  // walks the machine, id on COMPLETE
+st, _  := svc.Store().Status(id)                // Stage, Error, UpdatedAt
+refs, _ := svc.Store().Refs(id)                 // static .refs.json contents
+r, err := svc.Open(ctx, id, "report.pdf")       // local, or Drive by remote_id
+```
 
 ### Google Drive setup (one time)
 
@@ -109,14 +142,6 @@ replace content instead of duplicating it.
 
 From then on `stdd run` and `stdd insert` force-sync through Drive
 automatically.
-
-As a library:
-
-```go
-svc, err := artifacts.New(artifacts.Config{Root: "/path/to/dir", Syncer: drive})
-id, err := svc.Insert(ctx, "/path/to/report.pdf")   // blocks until synced
-r, err := svc.Open(ctx, id, "report.pdf")           // local, or Drive fallback
-```
 
 ## Adding a new service
 

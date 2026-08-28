@@ -2,7 +2,10 @@ package artifacts
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -11,26 +14,46 @@ import (
 	"testing"
 )
 
-// fakeSyncer records ForceSync calls and can be told to fail or to serve
-// remote content for Fetch.
+// fakeSyncer records the order of remote-stage calls and can be told to fail
+// stage 2 or stage 3. Synced content is kept in memory, keyed by the
+// RemoteID it hands out, so Fetch serves it back by static reference.
 type fakeSyncer struct {
-	synced  []string          // dirs passed to ForceSync
-	failErr error             // returned by ForceSync when set
-	remote  map[string]string // "id/name" -> content served by Fetch
+	calls      []string
+	failCreate error
+	failSync   error
+	remote     map[string]string // RemoteID -> content
 }
 
-func (f *fakeSyncer) ForceSync(_ context.Context, dir string) error {
-	if f.failErr != nil {
-		return f.failErr
+func newFakeSyncer() *fakeSyncer { return &fakeSyncer{remote: map[string]string{}} }
+
+func (f *fakeSyncer) CreateDir(_ context.Context, id ID) (string, error) {
+	if f.failCreate != nil {
+		return "", f.failCreate
 	}
-	f.synced = append(f.synced, dir)
-	return nil
+	f.calls = append(f.calls, "createdir:"+id.String())
+	return "rdir-" + id.String(), nil
 }
 
-func (f *fakeSyncer) Fetch(_ context.Context, id ID, name string) (io.ReadCloser, error) {
-	content, ok := f.remote[id.String()+"/"+name]
+func (f *fakeSyncer) SyncFile(_ context.Context, remoteDir, localPath string) (FileRef, error) {
+	if f.failSync != nil {
+		return FileRef{}, f.failSync
+	}
+	name := filepath.Base(localPath)
+	f.calls = append(f.calls, "syncfile:"+remoteDir+"/"+name)
+	content, err := os.ReadFile(localPath)
+	if err != nil {
+		return FileRef{}, err
+	}
+	remoteID := "rid-" + remoteDir + "-" + name
+	f.remote[remoteID] = string(content)
+	sum := sha256.Sum256(content)
+	return FileRef{Name: name, RemoteID: remoteID, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])}, nil
+}
+
+func (f *fakeSyncer) Fetch(_ context.Context, ref FileRef) (io.ReadCloser, error) {
+	content, ok := f.remote[ref.RemoteID]
 	if !ok {
-		return nil, os.ErrNotExist
+		return nil, fmt.Errorf("no remote content for %q", ref.RemoteID)
 	}
 	return io.NopCloser(strings.NewReader(content)), nil
 }
@@ -44,8 +67,8 @@ func newTestStore(t *testing.T, syncer Syncer) *Store {
 	return st
 }
 
-func TestInsertMovesFilesAndSyncsBeforeReturningID(t *testing.T) {
-	syncer := &fakeSyncer{}
+func TestInsertHappyPathWalksStages(t *testing.T) {
+	syncer := newFakeSyncer()
 	st := newTestStore(t, syncer)
 	ctx := context.Background()
 
@@ -61,72 +84,227 @@ func TestInsertMovesFilesAndSyncsBeforeReturningID(t *testing.T) {
 		t.Errorf("id = %s, want 1", id)
 	}
 
-	// Sources are consumed.
+	// Remote stages ran in machine order: stage 2 before any stage 3 call,
+	// and no marker files were synced.
+	want := []string{"createdir:1", "syncfile:rdir-1/a.txt", "syncfile:rdir-1/b.txt"}
+	if fmt.Sprint(syncer.calls) != fmt.Sprint(want) {
+		t.Errorf("remote calls = %v, want %v", syncer.calls, want)
+	}
+
+	// Sources consumed, files in the managed dir.
 	for _, p := range []string{a, b} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("source %s should be gone: %v", p, err)
 		}
 	}
-	// Both files landed in the one managed dir.
-	for name, want := range map[string]string{"a.txt": "alpha", "b.txt": "bravo"} {
-		got, err := os.ReadFile(st.Path(id, name))
-		if err != nil || string(got) != want {
-			t.Errorf("managed %s = %q (err=%v), want %q", name, got, err, want)
+
+	// COMPLETE: WIP removed, no ERR, refs present and static.
+	dir := filepath.Join(st.Dir(), id.String())
+	for _, marker := range []string{wipMarker, errMarker} {
+		if _, err := os.Stat(filepath.Join(dir, marker)); !os.IsNotExist(err) {
+			t.Errorf("%s should not exist after complete: %v", marker, err)
 		}
 	}
-	// Force sync ran for exactly this dir.
-	wantDir := filepath.Join(st.Dir(), id.String())
-	if len(syncer.synced) != 1 || syncer.synced[0] != wantDir {
-		t.Errorf("synced dirs = %v, want [%s]", syncer.synced, wantDir)
+	status, err := st.Status(id)
+	if err != nil || status.Stage != StageComplete {
+		t.Fatalf("Status = %+v (err=%v), want COMPLETE", status, err)
+	}
+
+	refs, err := st.Refs(id)
+	if err != nil {
+		t.Fatalf("Refs: %v", err)
+	}
+	if refs.ID != id || refs.RemoteDir != "rdir-1" || len(refs.Files) != 2 {
+		t.Fatalf("refs = %+v", refs)
+	}
+	ref, ok := refs.Find("a.txt")
+	wantSum := sha256.Sum256([]byte("alpha"))
+	if !ok || ref.RemoteID != "rid-rdir-1-a.txt" || ref.Size != 5 || ref.SHA256 != hex.EncodeToString(wantSum[:]) {
+		t.Errorf("a.txt ref = %+v", ref)
 	}
 }
 
-func TestInsertIDsAreMonotonicAcrossRestarts(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), ManagedDir)
-	ctx := context.Background()
-	quiet := log.New(io.Discard, "", 0)
+func TestInsertFailureLandsInErr(t *testing.T) {
+	cases := []struct {
+		name      string
+		configure func(*fakeSyncer)
+		wantStage Stage
+	}{
+		{"stage2_create_remote_dir", func(f *fakeSyncer) { f.failCreate = errors.New("drive down") }, StageRemoteDir},
+		{"stage3_sync_files", func(f *fakeSyncer) { f.failSync = errors.New("upload refused") }, StageSynced},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			syncer := newFakeSyncer()
+			tc.configure(syncer)
+			st := newTestStore(t, syncer)
+			ctx := context.Background()
 
-	st, err := NewStore(dir, nil, quiet)
+			src := writeFile(t, filepath.Join(t.TempDir(), "a.txt"), "alpha")
+			_, err := st.Insert(ctx, src)
+			if err == nil {
+				t.Fatal("expected insert to fail")
+			}
+			if !strings.Contains(err.Error(), string(tc.wantStage)) {
+				t.Errorf("error %q does not name failed stage %s", err, tc.wantStage)
+			}
+
+			// ERR is terminal and visible: .err present, .wip gone.
+			status, serr := st.Status(1)
+			if serr != nil || status.Stage != StageErr {
+				t.Fatalf("Status = %+v (err=%v), want ERR", status, serr)
+			}
+			if !strings.Contains(status.Error, string(tc.wantStage)) {
+				t.Errorf("status error %q does not name stage %s", status.Error, tc.wantStage)
+			}
+			if _, err := os.Stat(filepath.Join(st.Dir(), "1", wipMarker)); !os.IsNotExist(err) {
+				t.Errorf(".wip should be gone in ERR state: %v", err)
+			}
+			// The moved file stays for inspection, but the dir is not servable.
+			if _, err := os.Stat(st.Path(1, "a.txt")); err != nil {
+				t.Errorf("moved file should remain in ERR dir: %v", err)
+			}
+			if _, err := st.Open(ctx, 1, "a.txt"); err == nil {
+				t.Error("Open must refuse an ERR dir")
+			}
+			if _, err := st.Refs(1); err == nil {
+				t.Error("Refs must refuse an ERR dir")
+			}
+		})
+	}
+}
+
+func TestInsertIDsStayMonotonicPastErrAndRestarts(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ManagedDir)
+	quiet := log.New(io.Discard, "", 0)
+	ctx := context.Background()
+
+	failing := newFakeSyncer()
+	failing.failCreate = errors.New("boom")
+	st, err := NewStore(dir, failing, quiet)
 	if err != nil {
-		t.Fatalf("NewStore: %v", err)
+		t.Fatal(err)
 	}
 	src := t.TempDir()
-	id1, err := st.Insert(ctx, writeFile(t, filepath.Join(src, "one"), "1"))
-	if err != nil {
-		t.Fatalf("Insert: %v", err)
+	if _, err := st.Insert(ctx, writeFile(t, filepath.Join(src, "one"), "1")); err == nil {
+		t.Fatal("expected failure")
 	}
 
-	// Simulate the managed dir being evicted locally after a Drive sync:
-	// the counter file must still keep ids monotonic.
-	if err := os.RemoveAll(filepath.Join(dir, id1.String())); err != nil {
+	// Restart with a healthy syncer: the ERR dir keeps its id, the next
+	// insert gets a fresh one.
+	st2, err := NewStore(dir, newFakeSyncer(), quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := st2.Insert(ctx, writeFile(t, filepath.Join(src, "two"), "2"))
+	if err != nil {
+		t.Fatalf("Insert after restart: %v", err)
+	}
+	if id != 2 {
+		t.Errorf("id = %s, want 2 (1 burned by the ERR insert)", id)
+	}
+}
+
+func TestSweepInterruptedWIPToErr(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ManagedDir)
+	quiet := log.New(io.Discard, "", 0)
+
+	// Simulate a process that died during stage 3 of insert 5.
+	interrupted := filepath.Join(dir, "5")
+	if err := os.MkdirAll(interrupted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(interrupted, wipMarker), marker{Stage: StageSynced}); err != nil {
 		t.Fatal(err)
 	}
 
-	st2, err := NewStore(dir, nil, quiet)
+	st, err := NewStore(dir, newFakeSyncer(), quiet)
 	if err != nil {
-		t.Fatalf("NewStore (restart): %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
-	id2, err := st2.Insert(ctx, writeFile(t, filepath.Join(src, "two"), "2"))
+	status, err := st.Status(5)
+	if err != nil || status.Stage != StageErr {
+		t.Fatalf("Status = %+v (err=%v), want swept to ERR", status, err)
+	}
+	if !strings.Contains(status.Error, "interrupted") || !strings.Contains(status.Error, string(StageSynced)) {
+		t.Errorf("swept error %q should mention interruption at stage synced", status.Error)
+	}
+	// The burned id is not reused.
+	id, err := st.Insert(context.Background(), writeFile(t, filepath.Join(t.TempDir(), "f"), "x"))
 	if err != nil {
-		t.Fatalf("Insert: %v", err)
+		t.Fatal(err)
 	}
-	if id2 != id1+1 {
-		t.Errorf("id after restart = %s, want %s", id2, id1+1)
+	if id != 6 {
+		t.Errorf("next id = %s, want 6", id)
 	}
 }
 
-func TestInsertFailedSyncReturnsNoID(t *testing.T) {
-	syncer := &fakeSyncer{failErr: errors.New("drive unreachable")}
+func TestListReportsAllDirs(t *testing.T) {
+	syncer := newFakeSyncer()
 	st := newTestStore(t, syncer)
+	ctx := context.Background()
+	src := t.TempDir()
 
-	src := writeFile(t, filepath.Join(t.TempDir(), "a.txt"), "alpha")
-	if _, err := st.Insert(context.Background(), src); err == nil {
-		t.Fatal("expected error when force sync fails")
+	if _, err := st.Insert(ctx, writeFile(t, filepath.Join(src, "ok"), "fine")); err != nil {
+		t.Fatal(err)
 	}
-	// The file is still safe in the managed dir, just not handed out.
-	got, err := os.ReadFile(st.Path(1, "a.txt"))
-	if err != nil || string(got) != "alpha" {
-		t.Errorf("managed a.txt = %q (err=%v), want kept locally", got, err)
+	syncer.failSync = errors.New("upload refused")
+	if _, err := st.Insert(ctx, writeFile(t, filepath.Join(src, "bad"), "nope")); err == nil {
+		t.Fatal("expected failure")
+	}
+
+	statuses, err := st.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("List = %+v, want 2 entries", statuses)
+	}
+	if statuses[0].ID != 1 || statuses[0].Stage != StageComplete {
+		t.Errorf("statuses[0] = %+v, want 1/COMPLETE", statuses[0])
+	}
+	if statuses[1].ID != 2 || statuses[1].Stage != StageErr {
+		t.Errorf("statuses[1] = %+v, want 2/ERR", statuses[1])
+	}
+}
+
+func TestOpenServesLocalThenFallsBackByStaticRef(t *testing.T) {
+	syncer := newFakeSyncer()
+	st := newTestStore(t, syncer)
+	ctx := context.Background()
+
+	src := writeFile(t, filepath.Join(t.TempDir(), "a.txt"), "the content")
+	id, err := st.Insert(ctx, src)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	read := func() string {
+		t.Helper()
+		r, err := st.Open(ctx, id, "a.txt")
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer r.Close()
+		b, _ := io.ReadAll(r)
+		return string(b)
+	}
+
+	if got := read(); got != "the content" {
+		t.Errorf("local read = %q", got)
+	}
+
+	// Evict the local copy: Open must fetch by the static RemoteID from
+	// .refs.json, which stayed in the dir.
+	if err := os.Remove(st.Path(id, "a.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got != "the content" {
+		t.Errorf("fallback read = %q", got)
+	}
+
+	if _, err := st.Open(ctx, id, "not-a-file.txt"); err == nil {
+		t.Error("expected error for a name not in the refs")
 	}
 }
 
@@ -142,6 +320,10 @@ func TestInsertRejectsMissingAndIrregularSources(t *testing.T) {
 	}
 	if _, err := st.Insert(ctx, t.TempDir()); err == nil {
 		t.Error("expected error for directory source")
+	}
+	// Nothing above got far enough to create a managed dir.
+	if statuses, err := st.List(); err != nil || len(statuses) != 0 {
+		t.Errorf("List = %+v (err=%v), want empty", statuses, err)
 	}
 }
 
@@ -160,48 +342,5 @@ func TestInsertResolvesBasenameCollisions(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(st.Path(id, "report-1.txt")); string(got) != "second" {
 		t.Errorf("report-1.txt = %q, want %q", got, "second")
-	}
-}
-
-func TestOpenServesLocalThenFallsBackToRemote(t *testing.T) {
-	syncer := &fakeSyncer{remote: map[string]string{}}
-	st := newTestStore(t, syncer)
-	ctx := context.Background()
-
-	src := writeFile(t, filepath.Join(t.TempDir(), "a.txt"), "local copy")
-	id, err := st.Insert(ctx, src)
-	if err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-
-	// Served from local storage while present.
-	r, err := st.Open(ctx, id, "a.txt")
-	if err != nil {
-		t.Fatalf("Open (local): %v", err)
-	}
-	got, _ := io.ReadAll(r)
-	r.Close()
-	if string(got) != "local copy" {
-		t.Errorf("local read = %q", got)
-	}
-
-	// Evict the local copy; Open must fall back to the remote.
-	syncer.remote[id.String()+"/a.txt"] = "remote copy"
-	if err := os.Remove(st.Path(id, "a.txt")); err != nil {
-		t.Fatal(err)
-	}
-	r, err = st.Open(ctx, id, "a.txt")
-	if err != nil {
-		t.Fatalf("Open (fallback): %v", err)
-	}
-	got, _ = io.ReadAll(r)
-	r.Close()
-	if string(got) != "remote copy" {
-		t.Errorf("fallback read = %q, want remote copy", got)
-	}
-
-	// Missing everywhere is an error.
-	if _, err := st.Open(ctx, id, "nope.txt"); err == nil {
-		t.Error("expected error for file missing locally and remotely")
 	}
 }
