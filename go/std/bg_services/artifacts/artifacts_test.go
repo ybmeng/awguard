@@ -8,7 +8,12 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	bgservices "awguard/go/std/bg_services"
 )
+
+// Compile-time check that Service satisfies the bg service contract.
+var _ bgservices.Service = (*Service)(nil)
 
 func newTestService(t *testing.T, root string) *Service {
 	t.Helper()
@@ -118,6 +123,13 @@ func TestSyncOnceResolvesNameCollisions(t *testing.T) {
 	}
 	if got := readSynced(t, s, "report-2.txt"); got != "third" {
 		t.Errorf("report-2.txt = %q, want %q", got, "third")
+	}
+}
+
+func TestVerify(t *testing.T) {
+	s := newTestService(t, t.TempDir())
+	if err := s.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify: %v", err)
 	}
 }
 

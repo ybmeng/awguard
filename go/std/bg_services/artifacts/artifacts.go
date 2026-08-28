@@ -1,13 +1,12 @@
-// Package artifacts is part of the std tooling set: small, dependency-free
-// services with one job each.
-//
-// std_artifacts watches <root>/inbox and moves every file that appears there
-// into <root>/synced. Filesystem only — no network, no database.
+// Package artifacts is the std_artifacts background service: it watches
+// <root>/inbox and moves every file that appears there into <root>/synced.
+// Filesystem only — no network, no database.
 package artifacts
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -38,7 +37,8 @@ type Config struct {
 	Logger *log.Logger
 }
 
-// Service moves files from Root/inbox to Root/synced.
+// Service moves files from Root/inbox to Root/synced. It implements
+// bgservices.Service.
 type Service struct {
 	root     string
 	inbox    string
@@ -80,6 +80,9 @@ func New(cfg Config) (*Service, error) {
 	return s, nil
 }
 
+// Name implements bgservices.Service.
+func (s *Service) Name() string { return "artifacts" }
+
 // Root returns the absolute root directory the service operates in.
 func (s *Service) Root() string { return s.root }
 
@@ -100,6 +103,47 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// Verify is a fast end-to-end self-check: it runs a full inbox -> synced
+// cycle in a throwaway temp directory and confirms the file arrives intact.
+func (s *Service) Verify(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tmp, err := os.MkdirTemp("", "std_artifacts_verify_")
+	if err != nil {
+		return fmt.Errorf("artifacts verify: temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+
+	probe, err := New(Config{Root: tmp, Logger: log.New(io.Discard, "", 0)})
+	if err != nil {
+		return fmt.Errorf("artifacts verify: %w", err)
+	}
+	const name, content = "probe.txt", "std_artifacts verify probe"
+	if err := os.WriteFile(filepath.Join(probe.inbox, name), []byte(content), 0o644); err != nil {
+		return fmt.Errorf("artifacts verify: write probe: %w", err)
+	}
+	if _, err := probe.SyncOnce(); err != nil {
+		return fmt.Errorf("artifacts verify: sync: %w", err)
+	}
+	got, err := os.ReadFile(filepath.Join(probe.synced, name))
+	if err != nil {
+		return fmt.Errorf("artifacts verify: probe not synced: %w", err)
+	}
+	if string(got) != content {
+		return fmt.Errorf("artifacts verify: probe corrupted after sync")
+	}
+
+	// Also confirm the configured root is actually usable.
+	for _, dir := range []string{s.inbox, s.synced} {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			return fmt.Errorf("artifacts verify: %s is not a usable directory (%v)", dir, err)
+		}
+	}
+	return nil
 }
 
 // SyncOnce scans the inbox a single time and moves every regular file into
