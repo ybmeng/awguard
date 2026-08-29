@@ -32,7 +32,8 @@ type Server struct {
 	store   *Store
 	llm     LLM
 	netID   string
-	keyPath string // where SetKey persists the OpenRouter key; "" disables persistence
+	keyPath string  // where SetKey persists the OpenRouter key; "" disables persistence
+	search  *Router // web-search backend router; nil disables the client web_search tool
 	turns   sync.WaitGroup
 }
 
@@ -44,6 +45,13 @@ func (s *Server) Wait() { s.turns.Wait() }
 // ConfigureKeyPersistence tells the server where to save a key set via the
 // config endpoint, so it survives a restart.
 func (s *Server) ConfigureKeyPersistence(path string) { s.keyPath = path }
+
+// ConfigureSearch installs the web-search backend router. botnetd builds it from
+// the environment (NewRouterFromEnv) and calls this; a server left unconfigured
+// (as in tests) has a nil router, offers no client web_search tool, and keeps
+// falling back to OpenRouter's server tool. Kept out of NewServer so ambient
+// provider keys cannot make the test suite non-deterministic.
+func (s *Server) ConfigureSearch(r *Router) { s.search = r }
 
 // NewServer wires a store and an LLM into an HTTP handler, ensuring a default
 // net exists to own the bots.
@@ -244,7 +252,7 @@ func (s *Server) listModels(w http.ResponseWriter, _ *http.Request) {
 // list is derived from the binary's memoryCommands registry, not stored data:
 // it changes only on deploy, so it is unversioned and outside the change feed.
 func (s *Server) listTools(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, toolWireDefs())
+	writeJSON(w, http.StatusOK, toolWireDefs(s.search))
 }
 
 // listBots returns every bot with its list metadata, most recently active
@@ -607,14 +615,16 @@ func (s *Server) runTurn(ctx context.Context, bot Bot, msg Message) error {
 		Memory:   bot.Memory,
 		Summary:  summary,
 		Messages: history,
-		Tools:    NewBotToolbox(s.store, bot.ID),
+		Tools:    NewBotToolbox(s.store, bot.ID, s.search),
 	})
 	if err != nil {
 		return err
 	}
 	// One transaction: the reply lands and the user turn settles together, so
-	// the bot is never observably free with its reply missing.
-	_, err = s.store.CompleteTurn(bot.ID, msg.ID, reply)
+	// the bot is never observably free with its reply missing. Any web sources
+	// the model cited and the audit trail of every tool it called this turn are
+	// stored on the reply.
+	_, err = s.store.CompleteTurn(bot.ID, msg.ID, reply.Content, reply.Citations, reply.ToolCalls)
 	return err
 }
 

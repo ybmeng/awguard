@@ -17,6 +17,9 @@ struct Snapshot {
         let out = argument("--out") ?? "snapshot.png"
         let dark = CommandLine.arguments.contains("--dark")
         let details = CommandLine.arguments.contains("--details")
+        // Renders the inspector with Memory collapsed (Tools stays open) so the
+        // section hairline rule can be checked in a mixed open/closed state.
+        let collapseMemory = CommandLine.arguments.contains("--collapse-memory")
         let width = Double(argument("--width") ?? "") ?? 1400
         let height = Double(argument("--height") ?? "") ?? 900
 
@@ -34,11 +37,13 @@ struct Snapshot {
         await store.loadConversation(bot.id)
 
         render(store: store, bot: bot, dark: dark, details: details,
+               collapseMemory: collapseMemory,
                size: CGSize(width: width, height: height), to: out)
     }
 
     @MainActor
-    private static func render(store: AppStore, bot: Bot, dark: Bool, details: Bool, size: CGSize, to path: String) {
+    private static func render(store: AppStore, bot: Bot, dark: Bool, details: Bool,
+                               collapseMemory: Bool, size: CGSize, to path: String) {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
 
         let content = HStack(spacing: 0) {
@@ -51,7 +56,7 @@ struct Snapshot {
             // content offscreen.
             if details {
                 Rectangle().fill(Palette.hairline).frame(width: 1)
-                BotDetails(bot: bot, expanded: .constant(true))
+                BotDetails(bot: bot, expanded: .constant(!collapseMemory))
                     .frame(width: 300)
             }
         }

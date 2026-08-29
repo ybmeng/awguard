@@ -47,7 +47,13 @@ From `swift/botnet/`:
 - `BotNetApp.swift` — @main + ContentView: NavigationSplitView, selection,
   sheet/inspector presentation state. Window-chrome state lives here.
 - `ChatView.swift` — chat pane (header, transcript, composer) and BotDetails
-  (the right-hand inspector: the bot's editable memory panel).
+  (the right-hand inspector). New inspector sections go through
+  `InspectorSection` (same file) — title + expanded binding + content, with an
+  optional accessory slot; never hand-roll the chevron/hairline header. Its
+  hairline rule is neighbor-blind (header and open body each draw one bottom
+  line); verify mixed open/closed states with `snapshot --details
+  --collapse-memory`. State that must survive collapse (drafts) lives on
+  BotDetails, not inside the content closure — collapse destroys content.
 - `SidebarView.swift` — bot list, search, delete context menu.
 - `Store.swift` — AppStore, thin @MainActor client over botnetd; caches server
   responses, owns no durable state. `awaitReply` polls a sent turn until it

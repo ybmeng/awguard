@@ -27,6 +27,7 @@ import (
 type fakeLLM struct {
 	mu         sync.Mutex
 	reply      string
+	citations  []Citation
 	failErr    error
 	gate       chan struct{}
 	prompts    []Prompt
@@ -40,23 +41,29 @@ type summarizeCall struct {
 	msgs     []Message
 }
 
-func (f *fakeLLM) Complete(ctx context.Context, p Prompt) (string, error) {
+func (f *fakeLLM) Complete(ctx context.Context, p Prompt) (Completion, error) {
 	f.mu.Lock()
 	f.prompts = append(f.prompts, p)
-	gate, failErr, reply := f.gate, f.failErr, f.reply
+	gate, failErr, reply, citations := f.gate, f.failErr, f.reply, f.citations
 	f.mu.Unlock()
 
 	if gate != nil {
 		select {
 		case <-gate:
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return Completion{}, ctx.Err()
 		}
 	}
 	if failErr != nil {
-		return "", failErr
+		return Completion{}, failErr
 	}
-	return reply, nil
+	return Completion{Content: reply, Citations: citations}, nil
+}
+
+func (f *fakeLLM) setCitations(c []Citation) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.citations = c
 }
 
 // Summarize folds visibly, so a later assertion can see that the newest summary

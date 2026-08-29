@@ -62,6 +62,20 @@ struct Message: Identifiable, Codable, Hashable {
     var status: Status?
     var error: String?
 
+    // The web sources a bot reply drew on, in the order OpenRouter returned
+    // them. Present only on bot replies that used web search, and omitted from
+    // the JSON otherwise (the common turn), so it decodes as nil on both an old
+    // server and an ordinary reply — never a real value, per the header rule.
+    var citations: [Citation]?
+
+    // The tools this reply used, in the order the model called them — the audit
+    // trail behind the answer. Present only on a bot reply that ran a tool, and
+    // omitted from the JSON otherwise, so it decodes as nil on both an old
+    // server and an ordinary reply. `citations` above stays the aggregate of
+    // this turn's web_search results, so the Sources row is unchanged; this is
+    // the additive, per-call surface.
+    var toolCalls: [ToolCall]?
+
     enum Role: String, Codable {
         case user, bot, system
     }
@@ -86,11 +100,79 @@ struct Message: Identifiable, Codable, Hashable {
             content: content,
             sentAt: Date(),
             status: .awaiting,
-            error: nil
+            error: nil,
+            citations: nil,
+            toolCalls: nil
         )
     }
 
     var isPlaceholder: Bool { id.hasPrefix("pending_") }
+}
+
+// One web source behind a bot reply — mirrors go/botnet/schema.go's Citation.
+// The server always sends url and title (title falls back to the url host
+// there); snippet and the index pair are omitted when unset. The indices point
+// into the reply content for a later inline-superscript refinement the sources
+// row doesn't use yet. title stays Optional here so a host fallback is always
+// available even if a source ever arrives without one.
+struct Citation: Codable, Hashable {
+    var url: String
+    var title: String?
+    var snippet: String?
+    var startIndex: Int?
+    var endIndex: Int?
+
+    /// What the sources row labels the link: the title, else the bare host, else
+    /// the raw url — so a link is never blank.
+    var displayTitle: String {
+        if let title, !title.isEmpty { return title }
+        return host ?? url
+    }
+
+    /// Bare host for the trailing label and the title fallback, minus a leading
+    /// "www." so "www.example.com" reads as "example.com".
+    var host: String? {
+        guard let h = URLComponents(string: url)?.host else { return nil }
+        return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+    }
+
+    var link: URL? { URL(string: url) }
+}
+
+// One recorded tool invocation behind a bot reply — mirrors go/botnet/schema.go's
+// ToolCall, the shared audit shape. `name` is the tool ("web_search", "memory"),
+// `arguments` the raw JSON the model sent, `result` the string fed back to it
+// (truncated server-side for a large search dump). `backend` and `results` ride
+// only on a web_search call, so both are Optional; `at` is display-optional too,
+// so a fixture that omits it still decodes. The transcript's tool-call list
+// decodes these; nothing here is a real value on an old server (the key is
+// absent there), per the Models header rule.
+struct ToolCall: Codable, Hashable {
+    var name: String
+    var arguments: String
+    var result: String
+    var backend: String?
+    var results: [Citation]?
+    var at: Date?
+
+    /// The web_search query, pulled from the raw arguments JSON. Nil when the
+    /// call carried none or the args don't parse — the summary falls back then.
+    var query: String? { argument("query") }
+
+    /// The memory command ("read"/"replace"/"clear"), parsed the same way.
+    var command: String? { argument("command") }
+
+    /// The structured web sources this call returned; empty when it wasn't a
+    /// search or found nothing. Feeds the row's expanded results, in order.
+    var citations: [Citation] { results ?? [] }
+
+    private func argument(_ key: String) -> String? {
+        guard let data = arguments.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let value = obj[key] as? String, !value.isEmpty
+        else { return nil }
+        return value
+    }
 }
 
 // One link in a bot's conversation chain. Exactly one segment is open (nil
@@ -108,29 +190,67 @@ struct Segment: Identifiable, Codable, Hashable {
     var isOpen: Bool { sealed == nil }
 }
 
-// Decoded from GET /v1/tools: the exact tool definitions the server sends the
-// model with every turn, in OpenAI function-calling shape
-// ({type, function: {name, description, parameters}}). Shown so the user can
-// read precisely what the model is told; nothing here is paraphrased.
+// Decoded from GET /v1/tools: the exact tools the server sends the model each
+// turn. The list is heterogeneous — a function tool is
+// {type:"function", function:{name, description, parameters}} (OpenAI shape),
+// while a server-side tool like web search is a bare
+// {type:"openrouter:web_search"} with no function object. So `type` always
+// decodes and `function` is optional; a tool with no function still lists
+// (showing its type) rather than failing the whole array's decode. Shown so the
+// user can read precisely what the model is offered; nothing here is paraphrased.
 struct ToolDefinition: Identifiable, Decodable, Hashable {
-    var name: String
-    /// Multiline prose, kept verbatim — line breaks and all.
-    var description: String
-    /// The parameters JSON Schema, re-indented for display. Decoded opaquely
-    /// (the schema's shape will evolve), never into typed fields.
-    var parametersJSON: String
+    /// "function" for a function tool, or the server tool's own tag
+    /// (e.g. "openrouter:web_search").
+    var type: String
+    /// Present only for a function tool; nil for a server tool.
+    var function: FunctionSpec?
 
-    var id: String { name }
+    /// The function-calling payload, shown verbatim.
+    struct FunctionSpec: Decodable, Hashable {
+        var name: String
+        /// Multiline prose, kept verbatim — line breaks and all.
+        var description: String
+        /// The parameters JSON Schema, re-indented for display. Decoded opaquely
+        /// (the schema's shape will evolve), never into typed fields.
+        var parametersJSON: String
 
-    private enum CodingKeys: String, CodingKey { case function }
-    private enum FunctionKeys: String, CodingKey { case name, description, parameters }
+        private enum Keys: String, CodingKey { case name, description, parameters }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: Keys.self)
+            name = try c.decode(String.self, forKey: .name)
+            description = try c.decode(String.self, forKey: .description)
+            parametersJSON = try c.decode(JSONValue.self, forKey: .parameters).prettyPrinted
+        }
+    }
 
+    private enum CodingKeys: String, CodingKey { case type, function }
     init(from decoder: Decoder) throws {
-        let outer = try decoder.container(keyedBy: CodingKeys.self)
-        let fn = try outer.nestedContainer(keyedBy: FunctionKeys.self, forKey: .function)
-        name = try fn.decode(String.self, forKey: .name)
-        description = try fn.decode(String.self, forKey: .description)
-        parametersJSON = try fn.decode(JSONValue.self, forKey: .parameters).prettyPrinted
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Default to "function" so a server that ever omits type on its function
+        // tools still classifies them; a real server tool always sends its type.
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "function"
+        function = try c.decodeIfPresent(FunctionSpec.self, forKey: .function)
+    }
+
+    /// Stable across the list: a function tool by its name, a server tool by its
+    /// type (both unique within one /v1/tools payload).
+    var id: String { function?.name ?? type }
+
+    /// The row's heading: the function name, or a readable label derived from a
+    /// server tool's type ("openrouter:web_search" → "Web search"). The raw type
+    /// is shown alongside in the inspector, so this label never hides what it is.
+    var displayTitle: String {
+        function?.name ?? Self.humanize(type)
+    }
+
+    /// "openrouter:web_search" → "Web search": drop the namespace, split on the
+    /// separators, capitalize the first word. General on purpose, so an unknown
+    /// future server tool still reads as words rather than a raw tag.
+    private static func humanize(_ type: String) -> String {
+        let tail = type.split(whereSeparator: { $0 == ":" || $0 == "/" }).last.map(String.init) ?? type
+        let words = tail.split(whereSeparator: { $0 == "_" || $0 == "-" }).joined(separator: " ")
+        guard let first = words.first else { return type }
+        return first.uppercased() + words.dropFirst()
     }
 }
 

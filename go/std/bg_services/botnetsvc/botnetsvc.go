@@ -173,6 +173,19 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	srv.ConfigureKeyPersistence(s.keyPath)
 
+	// Client-side web search: offer the model our own web_search tool when a
+	// backend key resolves (SEARCH_BACKEND / EXA_API_KEY / BRAVE_API_KEY /
+	// TAVILY_API_KEY), else fall back to OpenRouter's fused server tool. Built
+	// from the environment here, the same way botnetd does it — this is the
+	// production path, so without this the router would never activate under stdd.
+	search := botnet.NewRouterFromEnv()
+	srv.ConfigureSearch(search)
+	if search.Available() {
+		s.logger.Printf("botnet: web search backends: %s", strings.Join(search.Names(), ", "))
+	} else {
+		s.logger.Printf("botnet: no web search backend configured; using OpenRouter's server tool")
+	}
+
 	httpSrv := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	serveErr := make(chan error, 1)
 	s.setBound(ln.Addr().String())

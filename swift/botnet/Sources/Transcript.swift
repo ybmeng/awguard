@@ -26,6 +26,12 @@ struct TranscriptMessage: Identifiable {
     let bubbles: [TranscriptBubble]
     let status: Message.Status?
     let error: String?
+    // The message's web sources, if any. Empty is the common case; the sources
+    // row renders only when this is non-empty and the message is a bot's.
+    let citations: [Citation]
+    // The tools this reply ran, in call order. Empty on the common turn; the
+    // tool-call list renders only when non-empty and the message is a bot's.
+    let toolCalls: [ToolCall]
 
     var didFail: Bool { status == .failed }
     var isAwaiting: Bool { status == .awaiting }
@@ -71,7 +77,9 @@ extension ChatTurn {
                 id: message.id,
                 bubbles: bubbles,
                 status: message.status,
-                error: message.error
+                error: message.error,
+                citations: message.citations ?? [],
+                toolCalls: message.toolCalls ?? []
             ))
         }
         flush()

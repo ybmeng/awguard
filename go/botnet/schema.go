@@ -173,6 +173,72 @@ type Message struct {
 	SentAt    time.Time     `json:"sentAt"`
 	Status    MessageStatus `json:"status"`
 	Error     string        `json:"error"` // set only when Status is StatusFailed
+
+	// Citations are the web sources a bot reply drew on. They exist only on bot
+	// replies that searched — the common turn has none.
+	// DECISION (search is now a CLIENT tool, with the server tool as fallback):
+	// we first shipped search as OpenRouter's fused `openrouter:web_search` server
+	// tool — OpenRouter ran the search itself and returned only url_citation
+	// annotations, never the query or a tool-call record. To get a full audit
+	// trail (the model's actual queries and results as real, recorded tool calls)
+	// and swappable backends, botnet now OWNS the search: it offers the model its
+	// own `web_search` FUNCTION tool, runs the query through a backend router
+	// (Exa/Brave/Tavily — see search.go), feeds the results back, and records
+	// every step (see ToolCalls below). The old server tool remains the
+	// no-regression FALLBACK: when no client backend key is configured the request
+	// keeps offering `openrouter:web_search` and citations still enter via
+	// annotations. Whichever path ran, Citations holds the AGGREGATE of the
+	// sources so the shipped "Sources (N)" UI is unchanged.
+	// DECISION (persist as a JSON column, omit when empty): Citations ride in the
+	// same INSERT as the message — no new write path, so the change_log triggers
+	// capture the reply exactly as before. The JSON key is omitted entirely when
+	// there are no citations (the common case), which is the shape the client
+	// decodes as absent/nil.
+	Citations []Citation `json:"citations,omitempty"`
+
+	// ToolCalls is the ordered audit trail of every tool the model invoked to
+	// produce this reply — web_search and memory alike — the thing the fused
+	// server tool could never give us. It exists only on bot replies that called
+	// a tool; the common turn has none.
+	// DECISION (aggregate vs. per-call): Citations above stays the flat aggregate
+	// of all web_search sources this turn (the Sources UI decodes it unchanged);
+	// ToolCalls is the additive, per-call record the new tool-call surface decodes.
+	// A web_search entry carries its Backend and structured Results; a memory
+	// entry carries only its Result text. Arguments is the raw JSON the model
+	// sent, so the query is recoverable verbatim.
+	// DECISION (persist as a JSON column, omit when empty): like Citations it
+	// rides the message's own INSERT — no new write path, so change_log capture is
+	// unchanged — and the key is omitted entirely on the common no-tool turn.
+	// DECISION (truncate the stored Result): the Result fed back to the model is
+	// stored capped (maxToolResultBytes) so a large search dump cannot bloat the
+	// row; the structured Results carry the real sources anyway.
+	ToolCalls []ToolCall `json:"toolCalls,omitempty"`
+}
+
+// ToolCall is one tool invocation recorded on a bot reply — the audit record the
+// UI decodes. Name and Arguments are what the model sent; Result is the text fed
+// back to it (truncated for storage). Backend and Results are set for web_search
+// only: which backend ran the query and its normalized sources. At is when it ran.
+type ToolCall struct {
+	Name      string     `json:"name"`              // "web_search" | "memory"
+	Arguments string     `json:"arguments"`         // raw JSON args the model sent
+	Result    string     `json:"result"`            // string result fed back (may be truncated)
+	Backend   string     `json:"backend,omitempty"` // web_search only: the backend that ran it
+	Results   []Citation `json:"results,omitempty"` // web_search only: its structured sources
+	At        time.Time  `json:"at"`                // when it ran
+}
+
+// Citation is one web source behind a bot's reply — the shared shape the UI
+// decodes. url and title are always set (title falls back to the url host when
+// the source has none); snippet and the index pair are optional. The indices
+// point into the reply Content, for a later refinement that anchors inline
+// superscripts; v1 carries them but renders only the sources row.
+type Citation struct {
+	URL        string `json:"url"`
+	Title      string `json:"title"`
+	Snippet    string `json:"snippet,omitempty"`
+	StartIndex int    `json:"startIndex,omitempty"`
+	EndIndex   int    `json:"endIndex,omitempty"`
 }
 
 // MessageStatus distinguishes a user turn still awaiting a reply from one whose

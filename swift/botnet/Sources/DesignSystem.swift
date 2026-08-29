@@ -86,6 +86,10 @@ enum Metric {
     static let inspectorPad: CGFloat = 12
     /// A panel section grows with its content up to this, then scrolls inside.
     static let inspectorSectionMaxHeight: CGFloat = 300
+
+    /// Fixed width for a tool-call row's leading icon, so the summaries line up
+    /// down the list even though each tool's glyph is a different width.
+    static let toolIconWidth: CGFloat = 15
 }
 
 enum TypeScale {
@@ -101,6 +105,8 @@ enum TypeScale {
     /// Verbatim machine text shown as a block (a tool's parameters schema):
     /// monospaced, one step up from messageMeta so indentation stays legible.
     static let codeBlock = Font.system(size: 11, design: .monospaced)
+    /// The rotating disclosure chevron on an inspector section header.
+    static let sectionChevron = Font.system(size: 9, weight: .semibold)
 }
 
 // MARK: - Avatar

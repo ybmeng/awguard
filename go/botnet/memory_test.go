@@ -1,6 +1,7 @@
 package botnet
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -212,8 +213,8 @@ func TestTurnCarriesMemoryAndTools(t *testing.T) {
 		t.Fatal("turn carries no toolbox")
 	}
 	// The toolbox is bound to THIS bot: a memory read returns its blob.
-	if got, err := p.Tools.Run("memory", []byte(`{"command":"read"}`)); err != nil || got != "remember: prefers Go" {
-		t.Errorf("toolbox memory read = (%q, %v), want the bot's memory", got, err)
+	if got, err := p.Tools.Run(context.Background(), "memory", []byte(`{"command":"read"}`)); err != nil || got.text != "remember: prefers Go" {
+		t.Errorf("toolbox memory read = (%q, %v), want the bot's memory", got.text, err)
 	}
 
 	// A bot with no memory hands the turn an empty blob (nothing is injected).

@@ -221,7 +221,7 @@ func TestOneAwaitingTurnPerBot(t *testing.T) {
 	}
 
 	// Settling the turn frees the bot.
-	if _, err := s.CompleteTurn(bot.ID, first.ID, "the answer"); err != nil {
+	if _, err := s.CompleteTurn(bot.ID, first.ID, "the answer", nil, nil); err != nil {
 		t.Fatalf("complete turn: %v", err)
 	}
 	if _, err := s.InFlight(bot.ID); !errors.Is(err, ErrNotFound) {
@@ -247,7 +247,7 @@ func TestCompleteTurnSettlesAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	reply, err := s.CompleteTurn(bot.ID, user.ID, "answer")
+	reply, err := s.CompleteTurn(bot.ID, user.ID, "answer", nil, nil)
 	if err != nil {
 		t.Fatalf("complete turn: %v", err)
 	}

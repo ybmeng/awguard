@@ -206,7 +206,7 @@ private struct MessageView: View {
     var body: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 2) {
             ForEach(message.bubbles) { bubble in
-                Text(bubble.text)
+                bubbleText(bubble.text)
                     .font(TypeScale.message)
                     .foregroundStyle(isUser ? Palette.userBubbleText : Palette.botBubbleText)
                     .textSelection(.enabled)
@@ -219,6 +219,21 @@ private struct MessageView: View {
                     )
                     .opacity(message.isAwaiting ? 0.55 : 1)
                     .id(bubble.id)
+            }
+
+            // The audit trail sits beneath the answer, never on a user turn.
+            // When the reply's tool calls are recorded, the tool-call list shows
+            // each one — including a search's own sources — so the aggregate
+            // Sources row is dropped to avoid listing the same links twice. A
+            // reply from a server that only reports citations (the
+            // openrouter:web_search fallback, no per-call record) still shows
+            // Sources as before. The common reply carries neither and nothing draws.
+            if !isUser {
+                if !message.toolCalls.isEmpty {
+                    ToolCallsView(toolCalls: message.toolCalls)
+                } else if !message.citations.isEmpty {
+                    SourcesView(citations: message.citations)
+                }
             }
 
             if let failure = message.failureText {
@@ -236,6 +251,26 @@ private struct MessageView: View {
 
             details
         }
+    }
+
+    // The model routinely writes inline markdown (**bold**, *italic*, `code`,
+    // links). SwiftUI only auto-parses markdown from a LocalizedStringKey
+    // literal, never a String, so parse it ourselves. User bubbles stay
+    // literal: a person typing "2 * 3" or "*sigh*" means the characters, not
+    // emphasis, and their text is shown exactly as sent.
+    private func bubbleText(_ text: String) -> Text {
+        isUser ? Text(text) : Text(Self.render(markdown: text))
+    }
+
+    // inlineOnlyPreservingWhitespace keeps the single newlines a bubble may
+    // hold (paragraphs already split on blank lines upstream) and leaves block
+    // syntax as literal text rather than laying out lists or code fences a
+    // bubble can't frame. On a parse failure the raw text is shown unchanged.
+    private static func render(markdown text: String) -> AttributedString {
+        (try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )) ?? AttributedString(text)
     }
 
     private var details: some View {
@@ -286,6 +321,229 @@ private struct MessageView: View {
     }
 }
 
+// The web sources behind a bot reply, as a "Sources (n)" disclosure: the count
+// row toggles a numbered list of links, each opening its url in the browser.
+// Shown only when a bot message carries citations, so it stays out of the way on
+// the common turn. A search turn can return ~20 sources, so a long list starts
+// collapsed and never buries the reply — and nothing here nests a scroll inside
+// the transcript, which is itself a ScrollView.
+private struct SourcesView: View {
+    let citations: [Citation]
+    @Environment(\.openURL) private var openURL
+    @State private var expanded: Bool
+
+    init(citations: [Citation]) {
+        self.citations = citations
+        // A handful shows inline; a search turn's ~20 sources stay folded so the
+        // list never buries the reply. The count is the handle to open them.
+        _expanded = State(initialValue: citations.count <= 3)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "chevron.right")
+                        .font(TypeScale.sectionChevron)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Text("Sources (\(citations.count))")
+                        .font(TypeScale.rowMeta)
+                }
+                .foregroundStyle(Palette.secondaryText)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(expanded ? "Hide sources" : "Show sources")
+
+            if expanded {
+                ForEach(Array(citations.enumerated()), id: \.offset) { index, citation in
+                    SourceLink(number: index + 1, citation: citation)
+                }
+            }
+        }
+        .padding(.horizontal, 2)
+        .padding(.top, 2)
+        .animation(.easeOut(duration: 0.12), value: expanded)
+    }
+}
+
+// One numbered source row that opens its url in the browser. Shared by the
+// aggregate Sources disclosure and a web_search tool call's expanded results, so
+// both read identically. Title carries the weight; the host trails it whole so
+// the domain — what a reader judges a source by — survives a long title's
+// truncation, and is skipped when the title already fell back to the host.
+private struct SourceLink: View {
+    let number: Int
+    let citation: Citation
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        Button {
+            if let url = citation.link { openURL(url) }
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("\(number)")
+                    .font(TypeScale.messageMeta)
+                    .foregroundStyle(Palette.secondaryText)
+                Text(citation.displayTitle)
+                    .font(TypeScale.rowMeta)
+                    .foregroundStyle(Palette.botBubbleText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if let host = citation.host, host != citation.displayTitle {
+                    Text(host)
+                        .font(TypeScale.rowMeta)
+                        .foregroundStyle(Palette.secondaryText)
+                        .lineLimit(1)
+                        .layoutPriority(1)
+                }
+                Image(systemName: "arrow.up.right")
+                    .font(TypeScale.sectionChevron)
+                    .foregroundStyle(Palette.secondaryText)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(citation.url)
+    }
+}
+
+// The tool calls behind a bot reply, as a "Tool calls (n)" disclosure mirroring
+// the Sources row. Each entry is a ToolCallRow — an icon, the tool, and a
+// one-line summary — that expands to its own detail. A turn rarely runs more
+// than a couple of tools, but the list stays collapsible so a busy turn never
+// buries the reply, and nothing here nests a scroll inside the transcript, which
+// is itself a ScrollView.
+private struct ToolCallsView: View {
+    let toolCalls: [ToolCall]
+    @State private var expanded: Bool
+
+    init(toolCalls: [ToolCall]) {
+        self.toolCalls = toolCalls
+        // A handful shows inline; a longer run folds so the count is the handle.
+        _expanded = State(initialValue: toolCalls.count <= 3)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "chevron.right")
+                        .font(TypeScale.sectionChevron)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Text("Tool calls (\(toolCalls.count))")
+                        .font(TypeScale.rowMeta)
+                }
+                .foregroundStyle(Palette.secondaryText)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(expanded ? "Hide tool calls" : "Show tool calls")
+
+            if expanded {
+                ForEach(Array(toolCalls.enumerated()), id: \.offset) { _, call in
+                    ToolCallRow(call: call)
+                }
+            }
+        }
+        .padding(.horizontal, 2)
+        .padding(.top, 2)
+        .animation(.easeOut(duration: 0.12), value: expanded)
+    }
+}
+
+// One recorded tool call: a summary line — icon, tool name, and what it did (a
+// web_search's query and result count, or a memory command) — that expands to
+// the call's detail. web_search reveals its sources in the same SourceLink
+// styling as the Sources row; every other tool reveals the verbatim result it
+// fed back to the model. Collapsed by default so the list reads at a glance.
+private struct ToolCallRow: View {
+    let call: ToolCall
+    @State private var expanded = false
+
+    private var isWebSearch: Bool { call.name == "web_search" }
+    private var hasDetail: Bool { !call.citations.isEmpty || !call.result.isEmpty }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Button {
+                if hasDetail { expanded.toggle() }
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: symbol)
+                        .font(TypeScale.rowMeta)
+                        .foregroundStyle(Palette.secondaryText)
+                        .frame(width: Metric.toolIconWidth)
+                    summary
+                        .font(TypeScale.rowMeta)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 6)
+                    if hasDetail {
+                        Image(systemName: "chevron.right")
+                            .font(TypeScale.sectionChevron)
+                            .foregroundStyle(Palette.secondaryText)
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(call.arguments)
+
+            if expanded { detail }
+        }
+        .animation(.easeOut(duration: 0.12), value: expanded)
+    }
+
+    // The tool's glyph: a search lens, memory's document, else a generic tool.
+    private var symbol: String {
+        switch call.name {
+        case "web_search": return "magnifyingglass"
+        case "memory": return "brain"
+        default: return "wrench.and.screwdriver"
+        }
+    }
+
+    // Icon aside, the row names the tool quietly and lets the informative bit —
+    // the query, or the command — carry the weight, the way SourceLink leads
+    // with the title. Built as one Text so it truncates as a single line.
+    private var summary: Text {
+        switch call.name {
+        case "web_search":
+            let n = call.citations.count
+            let query = Text(call.query ?? "search").foregroundColor(Palette.botBubbleText)
+            let count = Text("  \(n) result\(n == 1 ? "" : "s")").foregroundColor(Palette.secondaryText)
+            return Text("Web search  ").foregroundColor(Palette.secondaryText) + query + count
+        case "memory":
+            let command = Text(call.command ?? "—").foregroundColor(Palette.botBubbleText)
+            return Text("Memory  ").foregroundColor(Palette.secondaryText) + command
+        default:
+            return Text(call.name).foregroundColor(Palette.botBubbleText)
+        }
+    }
+
+    @ViewBuilder private var detail: some View {
+        if isWebSearch, !call.citations.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(call.citations.enumerated()), id: \.offset) { index, citation in
+                    SourceLink(number: index + 1, citation: citation)
+                }
+            }
+            .padding(.top, 1)
+        } else if !call.result.isEmpty {
+            // Every non-search tool (and a search that returned no sources)
+            // reveals the exact string it handed back to the model.
+            MachineText(text: call.result)
+                .padding(.top, 1)
+        }
+    }
+}
+
 private struct ThinkingBubble: View {
     var body: some View {
         HStack(spacing: 0) {
@@ -306,6 +564,67 @@ private struct ThinkingBubble: View {
     }
 }
 
+// One collapsible inspector section: a header that is the toggle (rotating
+// chevron + title, with an optional trailing accessory that stays clickable on
+// its own), and a body shown only while expanded. Hairlines are self-contained
+// so N sections stack cleanly with no knowledge of their neighbors: the header
+// draws one bottom hairline, and an open section draws one more under its
+// body. Collapsing removes the content view — state that must survive a
+// collapse/expand round-trip (like Memory's draft) belongs to the caller, not
+// inside the content closure.
+struct InspectorSection<Content: View, Accessory: View>: View {
+    let title: String
+    @Binding var expanded: Bool
+    @ViewBuilder let content: () -> Content
+    @ViewBuilder let accessory: () -> Accessory
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            if expanded {
+                content()
+                hairline
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack {
+            Button {
+                withAnimation(.easeOut(duration: 0.12)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "chevron.right")
+                        .font(TypeScale.sectionChevron)
+                        .foregroundStyle(Palette.secondaryText)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Text(title)
+                        .font(TypeScale.headerTitle)
+                        .foregroundStyle(Palette.primaryText)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(expanded ? "Collapse \(title.lowercased())" : "Expand \(title.lowercased())")
+            accessory()
+        }
+        .padding(.horizontal, Metric.inspectorPad)
+        .frame(height: Metric.headerHeight)
+        .overlay(alignment: .bottom) { hairline }
+    }
+
+    private var hairline: some View {
+        Rectangle().fill(Palette.hairline).frame(height: 1)
+    }
+}
+
+extension InspectorSection where Accessory == EmptyView {
+    init(title: String, expanded: Binding<Bool>, @ViewBuilder content: @escaping () -> Content) {
+        self.init(title: title, expanded: expanded, content: content, accessory: { EmptyView() })
+    }
+}
+
 // The details inspector: the bot's memory, readable at rest and editable behind
 // the pencil. Saves are explicit — the server's model calls can also write
 // memory, and last-write-wins is the accepted semantics, so nothing autosaves.
@@ -323,17 +642,30 @@ struct BotDetails: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            // Collapsing only hides the body; `editing` and `draft` stay put,
-            // so expanding again lands back in the untouched editor.
-            if expanded {
+            // Collapsing only hides the body; `editing` and `draft` live on
+            // this view, not in the section content, so expanding again lands
+            // back in the untouched editor.
+            InspectorSection(title: "Memory", expanded: $expanded) {
                 if editing { editor } else { reader }
+            } accessory: {
+                if expanded && !editing {
+                    Button {
+                        draft = memory
+                        editing = true
+                    } label: {
+                        Image(systemName: "pencil")
+                            .foregroundStyle(Palette.secondaryText)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Edit memory")
+                }
             }
             // Absent entirely (not empty) until the server has answered; an
             // older botnetd without the route keeps `tools` nil for the run.
             if let tools = store.tools {
-                toolsHeader
-                if toolsExpanded { toolsBody(tools) }
+                InspectorSection(title: "Tools", expanded: $toolsExpanded) {
+                    toolsBody(tools)
+                }
             }
             Spacer(minLength: 0)
         }
@@ -342,44 +674,6 @@ struct BotDetails: View {
         // Switching bots must never carry one bot's unsaved draft to another.
         .onChange(of: bot.id) { editing = false }
         .task { await store.loadTools() }
-    }
-
-    private var header: some View {
-        HStack {
-            Button {
-                withAnimation(.easeOut(duration: 0.12)) { expanded.toggle() }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(Palette.secondaryText)
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
-                    Text("Memory")
-                        .font(TypeScale.headerTitle)
-                        .foregroundStyle(Palette.primaryText)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help(expanded ? "Collapse memory" : "Expand memory")
-            Spacer()
-            if expanded && !editing {
-                Button {
-                    draft = memory
-                    editing = true
-                } label: {
-                    Image(systemName: "pencil")
-                        .foregroundStyle(Palette.secondaryText)
-                }
-                .buttonStyle(.borderless)
-                .help("Edit memory")
-            }
-        }
-        .padding(.horizontal, Metric.inspectorPad)
-        .frame(height: Metric.headerHeight)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(Palette.hairline).frame(height: 1)
-        }
     }
 
     private var reader: some View {
@@ -436,39 +730,6 @@ struct BotDetails: View {
         .padding(Metric.inspectorPad)
     }
 
-    // Same disclosure idiom as the Memory header. The top hairline only draws
-    // when Memory's body is open above it — when Memory is collapsed its own
-    // bottom hairline already marks this boundary, and two would read heavy.
-    private var toolsHeader: some View {
-        Button {
-            withAnimation(.easeOut(duration: 0.12)) { toolsExpanded.toggle() }
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(Palette.secondaryText)
-                    .rotationEffect(.degrees(toolsExpanded ? 90 : 0))
-                Text("Tools")
-                    .font(TypeScale.headerTitle)
-                    .foregroundStyle(Palette.primaryText)
-                Spacer()
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(toolsExpanded ? "Collapse tools" : "Expand tools")
-        .padding(.horizontal, Metric.inspectorPad)
-        .frame(height: Metric.headerHeight)
-        .overlay(alignment: .top) {
-            if expanded {
-                Rectangle().fill(Palette.hairline).frame(height: 1)
-            }
-        }
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(Palette.hairline).frame(height: 1)
-        }
-    }
-
     // What the model is told, verbatim: the description keeps its line breaks
     // and the parameters schema is shown as re-indented JSON, never paraphrased.
     // Read-only by design — these change only with the server binary.
@@ -477,26 +738,24 @@ struct BotDetails: View {
             VStack(alignment: .leading, spacing: Metric.inspectorPad) {
                 ForEach(tools) { tool in
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(tool.name)
+                        Text(tool.displayTitle)
                             .font(TypeScale.rowTitle)
                             .foregroundStyle(Palette.primaryText)
                             .textSelection(.enabled)
-                        Text(tool.description)
-                            .font(TypeScale.message)
-                            .foregroundStyle(Palette.primaryText)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(tool.parametersJSON)
-                            .font(TypeScale.codeBlock)
-                            .foregroundStyle(Palette.primaryText)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(6)
-                            .background(
-                                Palette.fieldFill,
-                                in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
-                            )
+                        if let fn = tool.function {
+                            Text(fn.description)
+                                .font(TypeScale.message)
+                                .foregroundStyle(Palette.primaryText)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                            MachineText(text: fn.parametersJSON)
+                        } else {
+                            // A server-side tool carries no function schema — the
+                            // model runs it directly. Show its raw type in the
+                            // same machine-text box so the row is honest about
+                            // exactly what the model is offered.
+                            MachineText(text: tool.type)
+                        }
                     }
                 }
                 if tools.isEmpty {
@@ -521,5 +780,27 @@ struct BotDetails: View {
             }
             saving = false
         }
+    }
+}
+
+// Verbatim machine text in a boxed monospace block — a function tool's
+// parameters schema, a server tool's raw type, or the result a tool call fed
+// back to the model. One treatment so machine output reads as one thing
+// wherever it appears.
+private struct MachineText: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(TypeScale.codeBlock)
+            .foregroundStyle(Palette.primaryText)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(6)
+            .background(
+                Palette.fieldFill,
+                in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
+            )
     }
 }

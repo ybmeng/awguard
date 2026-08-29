@@ -3,3 +3,4 @@ stdd
 swift/botnet/build/
 swift/botnet/BotNet.xcodeproj/
 swift/botnet/botnetd
+.claude/worktrees/

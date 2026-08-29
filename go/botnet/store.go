@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -207,6 +208,14 @@ END;
 		{"messages", "segment_id", `TEXT NOT NULL DEFAULT ''`},
 		{"messages", "status", `TEXT NOT NULL DEFAULT 'sent'`},
 		{"messages", "error", `TEXT NOT NULL DEFAULT ''`},
+		// citations is a JSON array of Citation, '' when the reply cited nothing
+		// (the common case). Riding a column keeps it in the message's own INSERT,
+		// so the change_log triggers capture it with no new write path.
+		{"messages", "citations", `TEXT NOT NULL DEFAULT ''`},
+		// tool_calls is a JSON array of ToolCall, '' when the reply called no tool
+		// (the common case). Same rationale as citations: it rides the message
+		// INSERT, so change_log capture needs no new write path.
+		{"messages", "tool_calls", `TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, c := range added {
 		if err := s.addColumn(c.table, c.column, c.decl); err != nil {
@@ -629,7 +638,7 @@ func (s *Store) append(id string, botID BotID, role, content string, status Mess
 			}
 		}
 		var err error
-		msg, err = appendMessage(q, id, botID, role, content, status)
+		msg, err = appendMessage(q, id, botID, role, content, status, nil, nil)
 		return err
 	})
 	return msg, replayed, err
@@ -643,11 +652,11 @@ func (s *Store) append(id string, botID BotID, role, content string, status Mess
 // second send slip its user turn in ahead of the reply; appending the reply
 // first would leave a window in which the reply exists beside a user turn still
 // marked awaiting. One transaction has neither window.
-func (s *Store) CompleteTurn(botID BotID, userMessageID, reply string) (Message, error) {
+func (s *Store) CompleteTurn(botID BotID, userMessageID, reply string, citations []Citation, toolCalls []ToolCall) (Message, error) {
 	var msg Message
 	err := s.tx(func(q dbtx) error {
 		var err error
-		if msg, err = appendMessage(q, "", botID, "bot", reply, StatusSent); err != nil {
+		if msg, err = appendMessage(q, "", botID, "bot", reply, StatusSent, citations, toolCalls); err != nil {
 			return err
 		}
 		return setStatus(q, userMessageID, StatusSent, "")
@@ -684,8 +693,11 @@ func claimBot(q dbtx, botID BotID) error {
 	return nil
 }
 
-// appendMessage inserts one message row; an empty id mints one.
-func appendMessage(q dbtx, id string, botID BotID, role, content string, status MessageStatus) (Message, error) {
+// appendMessage inserts one message row; an empty id mints one. Citations and
+// tool_calls are stored as JSON arrays, ” when there are none — only bot
+// replies that searched or called a tool carry any. Both ride this one INSERT,
+// so the change_log triggers capture them with no separate write path.
+func appendMessage(q dbtx, id string, botID BotID, role, content string, status MessageStatus, citations []Citation, toolCalls []ToolCall) (Message, error) {
 	seg, err := ensureOpenSegment(q, botID)
 	if err != nil {
 		return Message{}, err
@@ -701,11 +713,29 @@ func appendMessage(q dbtx, id string, botID BotID, role, content string, status 
 		Content:   content,
 		SentAt:    time.Now().UTC(),
 		Status:    status,
+		Citations: citations,
+		ToolCalls: toolCalls,
+	}
+	citeJSON := ""
+	if len(citations) > 0 {
+		encoded, err := json.Marshal(citations)
+		if err != nil {
+			return Message{}, fmt.Errorf("encode citations: %w", err)
+		}
+		citeJSON = string(encoded)
+	}
+	toolJSON := ""
+	if len(toolCalls) > 0 {
+		encoded, err := json.Marshal(toolCalls)
+		if err != nil {
+			return Message{}, fmt.Errorf("encode tool_calls: %w", err)
+		}
+		toolJSON = string(encoded)
 	}
 	if _, err := q.Exec(
-		`INSERT INTO messages (id, bot_id, segment_id, role, content, sent_at, status, error)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, '')`,
-		msg.ID, msg.BotID, msg.SegmentID, msg.Role, msg.Content, fmtTime(msg.SentAt), msg.Status,
+		`INSERT INTO messages (id, bot_id, segment_id, role, content, sent_at, status, error, citations, tool_calls)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)`,
+		msg.ID, msg.BotID, msg.SegmentID, msg.Role, msg.Content, fmtTime(msg.SentAt), msg.Status, citeJSON, toolJSON,
 	); err != nil {
 		return Message{}, fmt.Errorf("append message: %w", err)
 	}
@@ -737,17 +767,27 @@ func setStatus(q dbtx, id string, status MessageStatus, errText string) error {
 	return nil
 }
 
-const messageColumns = `id, bot_id, segment_id, role, content, sent_at, status, error`
+const messageColumns = `id, bot_id, segment_id, role, content, sent_at, status, error, citations, tool_calls`
 
 func scanMessage(sc interface{ Scan(...any) error }) (Message, error) {
 	var m Message
-	var sentAt string
-	if err := sc.Scan(&m.ID, &m.BotID, &m.SegmentID, &m.Role, &m.Content, &sentAt, &m.Status, &m.Error); err != nil {
+	var sentAt, citations, toolCalls string
+	if err := sc.Scan(&m.ID, &m.BotID, &m.SegmentID, &m.Role, &m.Content, &sentAt, &m.Status, &m.Error, &citations, &toolCalls); err != nil {
 		return Message{}, err
 	}
 	var err error
 	if m.SentAt, err = parseTime(sentAt); err != nil {
 		return Message{}, fmt.Errorf("parse sent_at: %w", err)
+	}
+	if citations != "" {
+		if err := json.Unmarshal([]byte(citations), &m.Citations); err != nil {
+			return Message{}, fmt.Errorf("parse citations: %w", err)
+		}
+	}
+	if toolCalls != "" {
+		if err := json.Unmarshal([]byte(toolCalls), &m.ToolCalls); err != nil {
+			return Message{}, fmt.Errorf("parse tool_calls: %w", err)
+		}
 	}
 	return m, nil
 }

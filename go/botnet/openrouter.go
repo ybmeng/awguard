@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	modelselector "stdtools/go/lib/modelSelector"
 )
@@ -19,8 +21,9 @@ import (
 // chat round-trip and compaction are verifiable offline.
 type LLM interface {
 	// Complete answers the next turn. The prompt carries at most ONE summary;
-	// that is the invariant compaction exists to preserve.
-	Complete(ctx context.Context, p Prompt) (string, error)
+	// that is the invariant compaction exists to preserve. The reply carries any
+	// web citations the model gathered mid-turn — see Completion.
+	Complete(ctx context.Context, p Prompt) (Completion, error)
 	// Summarize folds previous (the summary of everything before this segment,
 	// "" the first time) together with this segment's raw messages into a single
 	// summary covering everything so far.
@@ -63,11 +66,13 @@ func (o *OpenRouter) key() string {
 
 // wireMsg is one chat-completions message. The same shape decodes the
 // assistant's reply, so a tool_calls turn appends back into the context as-is.
+// Annotations decode off the reply only — the messages we build never set them.
 type wireMsg struct {
-	Role       string         `json:"role"`
-	Content    string         `json:"content"`
-	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"` // on "tool" role results
+	Role        string           `json:"role"`
+	Content     string           `json:"content"`
+	ToolCalls   []wireToolCall   `json:"tool_calls,omitempty"`
+	ToolCallID  string           `json:"tool_call_id,omitempty"` // on "tool" role results
+	Annotations []wireAnnotation `json:"annotations,omitempty"`
 }
 
 // wireToolCall is one function call the model requested.
@@ -80,6 +85,32 @@ type wireToolCall struct {
 	} `json:"function"`
 }
 
+// wireAnnotation is one entry of a reply's "annotations" array. OpenRouter's
+// web_search server tool resolves the search itself and attaches the sources
+// here (type "url_citation"), rather than handing back a tool_call we would
+// dispatch — so this is where citations enter, not the tool loop.
+type wireAnnotation struct {
+	Type        string `json:"type"`
+	URLCitation struct {
+		URL        string `json:"url"`
+		Title      string `json:"title"`
+		Content    string `json:"content"` // an excerpt of the source
+		StartIndex int    `json:"start_index"`
+		EndIndex   int    `json:"end_index"`
+	} `json:"url_citation"`
+}
+
+// Completion is one answered turn: the assistant's content, any web sources it
+// cited, and the ordered audit trail of every tool it called. Citations is the
+// aggregate of all web_search results this turn (or the fallback server tool's
+// annotations); ToolCalls is the per-call record. Both are nil on the common
+// turn where the model neither searched nor called a tool.
+type Completion struct {
+	Content   string
+	Citations []Citation
+	ToolCalls []ToolCall
+}
+
 // wireTool is one entry of the request's "tools" array (OpenAI function style).
 type wireTool struct {
 	Type     string           `json:"type"`
@@ -90,6 +121,49 @@ type wireToolFunction struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	Parameters  map[string]any `json:"parameters"`
+}
+
+// serverTool is a provider-resolved tool entry — OpenRouter's web_search. It
+// carries only "type" (and optional parameters), no "function" object, so it
+// marshals as exactly {"type":"..."} rather than dragging an empty function
+// along the way a wireTool with a zero Function would.
+type serverTool struct {
+	Type       string         `json:"type"`
+	Parameters map[string]any `json:"parameters,omitempty"`
+}
+
+// citationsFromAnnotations maps a reply's url_citation annotations to the shared
+// Citation shape, preserving OpenRouter's order. A missing title falls back to
+// the url host so the UI always has something to render. Non-url_citation
+// annotations, if any ever appear, are skipped.
+func citationsFromAnnotations(anns []wireAnnotation) []Citation {
+	var out []Citation
+	for _, a := range anns {
+		if a.Type != "url_citation" {
+			continue
+		}
+		c := Citation{
+			URL:        a.URLCitation.URL,
+			Title:      a.URLCitation.Title,
+			Snippet:    a.URLCitation.Content,
+			StartIndex: a.URLCitation.StartIndex,
+			EndIndex:   a.URLCitation.EndIndex,
+		}
+		if c.Title == "" {
+			c.Title = citationHost(c.URL)
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// citationHost is the title fallback: the host of the source url, or the raw
+// url if it does not parse.
+func citationHost(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return raw
 }
 
 // summaryPreamble introduces the one cumulative summary in the system turn. It
@@ -131,34 +205,81 @@ func promptContext(p Prompt) []wireMsg {
 	return msgs
 }
 
-func (o *OpenRouter) Complete(ctx context.Context, p Prompt) (string, error) {
+func (o *OpenRouter) Complete(ctx context.Context, p Prompt) (Completion, error) {
 	msgs := promptContext(p)
 	if p.Tools == nil {
-		return o.chat(ctx, p.Bot.Model, msgs)
+		// Tool-less turns are compaction/summarize: no tools offered, so no
+		// web_search and no annotations to carry.
+		content, err := o.chat(ctx, p.Bot.Model, msgs)
+		return Completion{Content: content}, err
 	}
-	// The tool loop: offer the registry's tools, execute what the model calls,
-	// append the results as "tool" turns, and re-call until the model answers
-	// in plain content. The cap keeps a model stuck in tool calls from holding
-	// the bot's in-flight slot until the turn timeout.
-	tools := toolWireDefs()
+	// The tool loop: offer the toolbox's surface (memory plus EITHER botnet's own
+	// web_search function tool OR OpenRouter's web_search server tool, gated on
+	// the search router), execute what the model calls, append the results as
+	// "tool" turns, and re-call until the model answers in plain content. Every
+	// dispatched call is recorded into the turn's audit trail; the fallback
+	// server tool instead resolves upstream and returns url_citation annotations
+	// on the final reply. Either way the reply's Citations is the aggregate of the
+	// sources gathered. The cap keeps a model stuck in tool calls from holding the
+	// bot's in-flight slot until the turn timeout.
+	tools := p.Tools.wireDefs()
+	var auditCalls []ToolCall
+	var searchCitations []Citation
 	for range maxToolIterations {
 		reply, err := o.chatOnce(ctx, p.Bot.Model, msgs, tools)
 		if err != nil {
-			return "", err
+			return Completion{}, err
 		}
 		if len(reply.ToolCalls) == 0 {
-			return reply.Content, nil
+			// Aggregate citations: the client web_search results gathered this
+			// turn, plus the fallback server tool's annotations (only one path is
+			// ever active, so these never double up).
+			citations := append(searchCitations, citationsFromAnnotations(reply.Annotations)...)
+			return Completion{
+				Content:   reply.Content,
+				Citations: citations,
+				ToolCalls: auditCalls,
+			}, nil
 		}
 		msgs = append(msgs, reply)
 		for _, tc := range reply.ToolCalls {
-			result, err := p.Tools.Run(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			res, err := p.Tools.Run(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 			if err != nil {
-				return "", fmt.Errorf("tool %s: %w", tc.Function.Name, err)
+				return Completion{}, fmt.Errorf("tool %s: %w", tc.Function.Name, err)
 			}
-			msgs = append(msgs, wireMsg{Role: "tool", Content: result, ToolCallID: tc.ID})
+			auditCalls = append(auditCalls, ToolCall{
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+				Result:    truncateResult(res.text),
+				Backend:   res.backend,
+				Results:   res.results,
+				At:        time.Now().UTC(),
+			})
+			searchCitations = append(searchCitations, res.results...)
+			// The model gets the FULL result text; only the stored audit record is
+			// truncated.
+			msgs = append(msgs, wireMsg{Role: "tool", Content: res.text, ToolCallID: tc.ID})
 		}
 	}
-	return "", fmt.Errorf("openrouter: the model was still calling tools after %d rounds; the turn was stopped at that cap", maxToolIterations)
+	return Completion{}, fmt.Errorf("openrouter: the model was still calling tools after %d rounds; the turn was stopped at that cap", maxToolIterations)
+}
+
+// maxToolResultBytes caps the tool result stored in the audit record, so a large
+// search dump cannot bloat a message row. The model still receives the full
+// result on the wire; only Message.ToolCalls[].Result is capped.
+const maxToolResultBytes = 8 << 10 // 8 KiB
+
+// truncateResult caps s for storage, marking where it was cut. It cuts on a byte
+// boundary rounded back off any partial UTF-8 rune.
+func truncateResult(s string) string {
+	if len(s) <= maxToolResultBytes {
+		return s
+	}
+	cut := maxToolResultBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n…[truncated]"
 }
 
 // compactInstruction asks for a replacement summary rather than an addendum —
@@ -208,7 +329,7 @@ func (o *OpenRouter) chat(ctx context.Context, model modelselector.ModelID, msgs
 
 // chatOnce makes one chat-completions request and returns the assistant's
 // message, tool calls included.
-func (o *OpenRouter) chatOnce(ctx context.Context, model modelselector.ModelID, msgs []wireMsg, tools []wireTool) (wireMsg, error) {
+func (o *OpenRouter) chatOnce(ctx context.Context, model modelselector.ModelID, msgs []wireMsg, tools []any) (wireMsg, error) {
 	apiKey := o.key()
 	if apiKey == "" {
 		return wireMsg{}, fmt.Errorf("openrouter: no API key configured — set it in the app's Settings")

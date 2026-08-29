@@ -54,6 +54,18 @@ func main() {
 	}
 	srv.ConfigureKeyPersistence(keyPath)
 
+	// Client-side web search: offer the model our own web_search tool when any
+	// provider key resolves; otherwise the server keeps falling back to
+	// OpenRouter's fused server tool. Built from the environment here, never in
+	// NewServer, so tests stay deterministic.
+	search := botnet.NewRouterFromEnv()
+	srv.ConfigureSearch(search)
+	if search.Available() {
+		log.Printf("botnetd: web search backends: %s (active: first)", strings.Join(search.Names(), ", "))
+	} else {
+		log.Printf("botnetd: no web search backend configured; using OpenRouter's server tool")
+	}
+
 	log.Printf("botnetd: serving on http://%s  (db: %s)", addr, dbPath)
 	if err := http.Serve(ln, srv.Handler()); err != nil {
 		log.Fatalf("botnetd: %v", err)

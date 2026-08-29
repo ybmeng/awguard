@@ -83,6 +83,66 @@ struct DecodeCheck {
             }
         }
 
+        // Citations landed with web search: a bot reply that used the tool
+        // carries them, the ordinary reply omits the key. Present, they decode in
+        // order with snippet and indices; an empty title falls back to the host.
+        // Absent (every fixture above has no citations key) they must stay nil.
+        let replyWithCitations = Data("""
+        {"id":"msg_01M9CITEAAAAAAAAAAAAAAAAA1","botId":"bot_01M172K2T51MJDV0B263GQ1BFA","segmentId":null,"role":"bot","content":"Here is what I found.","sentAt":"2026-08-30T10:00:00Z","status":"sent","error":"","citations":[{"url":"https://apnews.com/article/markets","title":"Markets steady","snippet":"an excerpt","startIndex":10,"endIndex":42},{"url":"https://en.wikipedia.org/wiki/RAG","title":""}]}
+        """.utf8)
+        await check("Message.citations decodes in order when present, nil when absent") {
+            let withCites = try decoder.decode(Message.self, from: replyWithCitations)
+            guard withCites.citations?.count == 2,
+                  withCites.citations?[0].url == "https://apnews.com/article/markets",
+                  withCites.citations?[0].title == "Markets steady",
+                  withCites.citations?[0].snippet == "an excerpt",
+                  withCites.citations?[0].startIndex == 10,
+                  withCites.citations?[0].endIndex == 42,
+                  // Empty title must fall back to the host for the sources row.
+                  withCites.citations?[1].displayTitle == "en.wikipedia.org"
+            else {
+                throw NSError(domain: "decode-check", code: 9, userInfo: [
+                    NSLocalizedDescriptionKey: "citations decoded wrong: \(String(describing: withCites.citations))",
+                ])
+            }
+            let noCites = try decoder.decode(Message.self, from: plain)
+            guard noCites.citations == nil else {
+                throw NSError(domain: "decode-check", code: 10, userInfo: [
+                    NSLocalizedDescriptionKey: "absent citations decoded as \(String(describing: noCites.citations))",
+                ])
+            }
+        }
+
+        // Tool calls landed with the client-side search router: a reply that ran
+        // a tool carries an ordered toolCalls array (a web_search with backend +
+        // structured results, a memory call with its command + result string);
+        // the ordinary reply omits the key and it must stay nil. web_search
+        // `results` map to the same Citation shape the Sources row uses.
+        let replyWithToolCalls = Data("""
+        {"id":"msg_01M9TOOLCALLSAAAAAAAAAAAA1","botId":"bot_01M172K2T51MJDV0B263GQ1BFA","segmentId":null,"role":"bot","content":"Done.","sentAt":"2026-08-30T10:00:00Z","status":"sent","error":"","citations":[{"url":"https://apnews.com/x","title":"AP"}],"toolCalls":[{"name":"web_search","arguments":"{\\"query\\":\\"gdp 2026\\"}","result":"1. AP — https://apnews.com/x","backend":"exa","results":[{"url":"https://apnews.com/x","title":"AP"}],"at":"2026-08-30T09:59:58Z"},{"name":"memory","arguments":"{\\"command\\":\\"replace\\",\\"content\\":\\"x\\"}","result":"memory saved","at":"2026-08-30T09:59:59Z"}]}
+        """.utf8)
+        await check("Message.toolCalls decodes in order when present, nil when absent") {
+            let withCalls = try decoder.decode(Message.self, from: replyWithToolCalls)
+            guard withCalls.toolCalls?.count == 2,
+                  let search = withCalls.toolCalls?[0], let mem = withCalls.toolCalls?[1],
+                  search.name == "web_search", search.query == "gdp 2026",
+                  search.backend == "exa", search.citations.count == 1,
+                  search.citations.first?.displayTitle == "AP",
+                  mem.name == "memory", mem.command == "replace",
+                  mem.result == "memory saved", mem.results == nil
+            else {
+                throw NSError(domain: "decode-check", code: 12, userInfo: [
+                    NSLocalizedDescriptionKey: "toolCalls decoded wrong: \(String(describing: withCalls.toolCalls))",
+                ])
+            }
+            let noCalls = try decoder.decode(Message.self, from: plain)
+            guard noCalls.toolCalls == nil else {
+                throw NSError(domain: "decode-check", code: 13, userInfo: [
+                    NSLocalizedDescriptionKey: "absent toolCalls decoded as \(String(describing: noCalls.toolCalls))",
+                ])
+            }
+        }
+
         // GET /v1/tools carries what the model is literally told: the multiline
         // description must survive verbatim and the parameters schema — decoded
         // opaquely, since its shape will evolve — must re-indent to real JSON.
@@ -91,26 +151,49 @@ struct DecodeCheck {
         """.utf8)
         await check("ToolDefinition: verbatim description, opaque pretty schema") {
             let list = try decoder.decode([ToolDefinition].self, from: tools)
-            guard list.count == 1, let t = list.first,
-                  t.name == "memory",
-                  t.description == "Replace your memory document.\n\nWrite the full document each time; it is not appended."
+            guard list.count == 1, let t = list.first, let fn = t.function,
+                  t.type == "function",
+                  fn.name == "memory",
+                  fn.description == "Replace your memory document.\n\nWrite the full document each time; it is not appended."
             else {
                 throw NSError(domain: "decode-check", code: 6, userInfo: [
                     NSLocalizedDescriptionKey: "tool decoded wrong: \(list)",
                 ])
             }
-            guard t.parametersJSON.contains("\"required\""),
-                  t.parametersJSON.contains("\n"),        // pretty-printed, not one line
-                  t.parametersJSON.contains("\"maxLength\""),
-                  !t.parametersJSON.contains("3.0")        // integral survives as 3
+            guard fn.parametersJSON.contains("\"required\""),
+                  fn.parametersJSON.contains("\n"),        // pretty-printed, not one line
+                  fn.parametersJSON.contains("\"maxLength\""),
+                  !fn.parametersJSON.contains("3.0")        // integral survives as 3
             else {
                 throw NSError(domain: "decode-check", code: 7, userInfo: [
-                    NSLocalizedDescriptionKey: "schema not re-indented as expected: \(t.parametersJSON)",
+                    NSLocalizedDescriptionKey: "schema not re-indented as expected: \(fn.parametersJSON)",
                 ])
             }
         }
         await check("empty tool list decodes") {
             _ = try decoder.decode([ToolDefinition].self, from: Data("[]".utf8))
+        }
+
+        // The tools list is heterogeneous: a function tool plus a server tool
+        // like web search — a bare {type:...} with NO function object. The
+        // missing `function` key must not fail the whole array: the server tool
+        // decodes as a functionless entry that still lists, showing its type,
+        // and an unknown future {type:...} degrades the same way.
+        let heterogeneous = Data("""
+        [{"type":"function","function":{"name":"memory","description":"d","parameters":{"type":"object"}}},{"type":"openrouter:web_search"},{"type":"acme:some_future_tool"}]
+        """.utf8)
+        await check("heterogeneous /v1/tools: function tool + functionless server tools") {
+            let list = try decoder.decode([ToolDefinition].self, from: heterogeneous)
+            guard list.count == 3,
+                  list[0].function?.name == "memory",
+                  list[1].function == nil, list[1].type == "openrouter:web_search",
+                  list[1].displayTitle == "Web search",              // humanized label
+                  list[2].function == nil, list[2].displayTitle == "Some future tool"
+            else {
+                throw NSError(domain: "decode-check", code: 11, userInfo: [
+                    NSLocalizedDescriptionKey: "heterogeneous tools decoded wrong: \(list)",
+                ])
+            }
         }
         // The absent-route path: an older botnetd 404s /v1/tools, which the app
         // must read as "hide the section", never as an error.

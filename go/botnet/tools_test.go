@@ -132,23 +132,27 @@ func TestToolLoopReadReplaceAnswer(t *testing.T) {
 		Bot:      bot,
 		Memory:   "old notes",
 		Messages: []Message{{Role: "user", Content: "remember that I like Go"}},
-		Tools:    NewBotToolbox(s, bot.ID),
+		Tools:    NewBotToolbox(s, bot.ID, nil),
 	})
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	if reply != "noted!" {
-		t.Errorf("reply = %q, want the final answer", reply)
+	if reply.Content != "noted!" {
+		t.Errorf("reply = %q, want the final answer", reply.Content)
 	}
 	if got := sc.requestCount(); got != 3 {
 		t.Fatalf("the loop made %d requests, want 3 (read, replace, answer)", got)
 	}
 
-	// Request 0 advertised exactly ONE tool: "memory", flat schema with the
-	// strict command enum, and a description spelling out the commands.
+	// Request 0 advertised the memory FUNCTION tool — flat schema with the strict
+	// command enum and a description spelling out the commands — alongside the
+	// web_search SERVER tool (its own shape is pinned in websearch_test.go).
 	first := sc.request(t, 0)
-	if len(first.Tools) != 1 || first.Tools[0].Function.Name != "memory" {
-		t.Fatalf("tools advertised = %+v, want the one memory tool", first.Tools)
+	if len(first.Tools) != 2 || first.Tools[0].Function.Name != "memory" {
+		t.Fatalf("tools advertised = %+v, want memory then web_search", first.Tools)
+	}
+	if first.Tools[1].Type != webSearchToolName {
+		t.Errorf("second tool type = %q, want %q", first.Tools[1].Type, webSearchToolName)
 	}
 	fn := first.Tools[0].Function
 	props, _ := fn.Parameters["properties"].(map[string]any)
@@ -225,12 +229,12 @@ func TestToolLoopMalformedCallRecovers(t *testing.T) {
 	}}
 	or := newScriptedOpenRouter(t, sc)
 
-	reply, err := or.Complete(context.Background(), Prompt{Bot: bot, Tools: NewBotToolbox(s, bot.ID)})
+	reply, err := or.Complete(context.Background(), Prompt{Bot: bot, Tools: NewBotToolbox(s, bot.ID, nil)})
 	if err != nil {
 		t.Fatalf("a malformed tool call failed the turn: %v", err)
 	}
-	if reply != "fixed it" {
-		t.Errorf("reply = %q, want the recovered answer", reply)
+	if reply.Content != "fixed it" {
+		t.Errorf("reply = %q, want the recovered answer", reply.Content)
 	}
 	if got := findToolResult(t, sc.request(t, 1), "call_1"); got.Content != "error: 'replace' requires a 'content' field" {
 		t.Errorf("malformed call result = %q, want the instructive error", got.Content)
@@ -262,7 +266,7 @@ func TestToolLoopClearAndEmptyRead(t *testing.T) {
 
 	if _, err := or.Complete(context.Background(), Prompt{
 		Bot:   bot,
-		Tools: NewBotToolbox(s, bot.ID),
+		Tools: NewBotToolbox(s, bot.ID, nil),
 	}); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
@@ -284,11 +288,11 @@ func TestMemoryToolValidation(t *testing.T) {
 	}
 	defer s.Close()
 	bot := newBot(t, s)
-	tb := NewBotToolbox(s, bot.ID)
+	tb := NewBotToolbox(s, bot.ID, nil)
 
 	cases := []struct{ name, tool, args, want string }{
 		{"unknown tool", "launch_missiles", `{}`,
-			"error: unknown tool 'launch_missiles' — the only tool is 'memory'"},
+			"error: unknown tool 'launch_missiles' — valid: memory, web_search"},
 		{"bad json", "memory", `not json`,
 			`error: arguments must be a JSON object like {"command": "read"}`},
 		{"missing command", "memory", `{}`,
@@ -301,12 +305,12 @@ func TestMemoryToolValidation(t *testing.T) {
 			"error: 'clear' takes no 'content' field — use 'replace' to overwrite your memory"},
 	}
 	for _, c := range cases {
-		got, err := tb.Run(c.tool, json.RawMessage(c.args))
+		got, err := tb.Run(context.Background(), c.tool, json.RawMessage(c.args))
 		if err != nil {
 			t.Errorf("%s: Run returned a turn-failing error %v, want an instructive result", c.name, err)
 		}
-		if got != c.want {
-			t.Errorf("%s: result %q, want %q", c.name, got, c.want)
+		if got.text != c.want {
+			t.Errorf("%s: result %q, want %q", c.name, got.text, c.want)
 		}
 	}
 
@@ -315,8 +319,8 @@ func TestMemoryToolValidation(t *testing.T) {
 		t.Errorf("a rejected call wrote memory: %q", after.Memory)
 	}
 	// And an explicit empty content on replace is legal — it is a provided value.
-	if got, err := tb.Run("memory", json.RawMessage(`{"command":"replace","content":""}`)); err != nil || got != "memory saved" {
-		t.Errorf("replace with empty content = (%q, %v), want it accepted", got, err)
+	if got, err := tb.Run(context.Background(), "memory", json.RawMessage(`{"command":"replace","content":""}`)); err != nil || got.text != "memory saved" {
+		t.Errorf("replace with empty content = (%q, %v), want it accepted", got.text, err)
 	}
 }
 
@@ -338,7 +342,7 @@ func TestToolLoopCap(t *testing.T) {
 	sc := &scriptedUpstream{responses: responses}
 	or := newScriptedOpenRouter(t, sc)
 
-	_, err = or.Complete(context.Background(), Prompt{Bot: bot, Tools: NewBotToolbox(s, bot.ID)})
+	_, err = or.Complete(context.Background(), Prompt{Bot: bot, Tools: NewBotToolbox(s, bot.ID, nil)})
 	if err == nil {
 		t.Fatal("an endless tool loop completed, want the cap to stop it")
 	}
@@ -431,8 +435,9 @@ func TestToolsEndpointServesTheWireTools(t *testing.T) {
 	}
 	body := bytes.TrimSuffix(raw, []byte("\n")) // writeJSON's Encoder appends one
 
-	// The bytes the shared source marshals to...
-	want, err := json.Marshal(toolWireDefs())
+	// The bytes the shared source marshals to (the harness server has no search
+	// router, so it offers the OpenRouter fallback — the same nil the endpoint uses)...
+	want, err := json.Marshal(toolWireDefs(nil))
 	if err != nil {
 		t.Fatalf("marshal defs: %v", err)
 	}
@@ -452,7 +457,7 @@ func TestToolsEndpointServesTheWireTools(t *testing.T) {
 	if _, err := or.Complete(context.Background(), Prompt{
 		Bot:      bot,
 		Messages: []Message{{Role: "user", Content: "hi"}},
-		Tools:    NewBotToolbox(s, bot.ID),
+		Tools:    NewBotToolbox(s, bot.ID, nil),
 	}); err != nil {
 		t.Fatalf("complete: %v", err)
 	}

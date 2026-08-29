@@ -147,7 +147,7 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 	expectRows(t, logAfter(t, s, mark), []changeRow{{"message", msg.ID, "updated"}}, "ClaimRetry")
 
 	mark = topSeq(t, s)
-	reply, err := s.CompleteTurn(bot.ID, msg.ID, "hi!")
+	reply, err := s.CompleteTurn(bot.ID, msg.ID, "hi!", nil, nil)
 	if err != nil {
 		t.Fatalf("complete turn: %v", err)
 	}
