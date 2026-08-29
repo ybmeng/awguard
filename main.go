@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"os/exec"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -24,14 +24,11 @@ var (
 )
 
 func main() {
-	if os.Geteuid() != 0 {
-		log.Fatal("awguard requires root privileges for packet capture. Run with sudo.")
-	}
 	systray.Run(onReady, onExit)
 }
 
 func onReady() {
-	systray.SetTemplateIcon(iconPNG, iconPNG)
+	systray.SetIcon(iconPNG)
 	systray.SetTitle("")
 	systray.SetTooltip("AWGuard — BitTorrent killswitch")
 
@@ -77,7 +74,7 @@ func onReady() {
 			}
 			log.Printf("awguard: *** BT TRAFFIC DETECTED *** %s", d)
 			notify(d)
-			killAnyWatch()
+			killByPort(d)
 
 			ts := time.Now().Format("15:04:05")
 			lastDetected.Store(fmt.Sprintf("VIOLATION %s: %s", ts, d.Type))
@@ -107,18 +104,36 @@ func onReady() {
 
 func onExit() {}
 
-func killAnyWatch() {
-	out, err := exec.Command("pkill", "-9", "-f", "anywatch").CombinedOutput()
-	if err != nil {
-		log.Printf("awguard: pkill anywatch: %v (%s)", err, string(out))
-	} else {
-		log.Printf("awguard: killed anywatch")
+// killByPort finds the process owning the source port and kills it.
+func killByPort(d *detect.Detection) {
+	// Use lsof to find the process that owns this local port
+	port := fmt.Sprintf(":%d", d.SrcPort)
+	out, err := exec.Command("lsof", "-ti", port).Output()
+	if err != nil || len(out) == 0 {
+		// Try destination port (we might be the receiver)
+		port = fmt.Sprintf(":%d", d.DstPort)
+		out, err = exec.Command("lsof", "-ti", port).Output()
+	}
+	if err != nil || len(out) == 0 {
+		log.Printf("awguard: no process found for ports %d/%d", d.SrcPort, d.DstPort)
+		return
+	}
+	// Kill every PID returned
+	pids := strings.Fields(strings.TrimSpace(string(out)))
+	for _, pid := range pids {
+		if err := exec.Command("kill", "-9", pid).Run(); err != nil {
+			log.Printf("awguard: kill %s: %v", pid, err)
+		} else {
+			// Look up process name for logging
+			name, _ := exec.Command("ps", "-p", pid, "-o", "comm=").Output()
+			log.Printf("awguard: killed pid %s (%s)", pid, strings.TrimSpace(string(name)))
+		}
 	}
 }
 
 func notify(d *detect.Detection) {
 	title := "AWGuard: BitTorrent Traffic Detected"
-	msg := fmt.Sprintf("%s — %s:%d → %s:%d. AnyWatch killed.",
+	msg := fmt.Sprintf("%s — %s:%d → %s:%d. Process killed.",
 		d.Type, d.SrcIP, d.SrcPort, d.DstIP, d.DstPort)
 	script := fmt.Sprintf(`display notification %q with title %q sound name "Basso"`, msg, title)
 	_ = exec.Command("osascript", "-e", script).Run()
