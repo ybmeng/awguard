@@ -36,13 +36,37 @@ type SegmentID string // "seg_" + ULID
 // PATCH rather than being unreadable. ModelValid reports that condition.
 // DECISION: the open segment is NOT denormalized here — it is derived as the
 // bot's segment with a zero SealedAt.
-// DEFERRED (tools): userspace will design tools later; nothing here yet.
+// DECISION (tools): the model's tool surface is ONE tool named "memory",
+// Anthropic-memory-tool style, declared by the command registry in tools.go.
+// The schema is FLAT — a strict "command" enum (read, replace, clear) plus an
+// optional "content" string, no nested unions — because mid-tier models handle
+// a flat schema with a prose description far better. The enum, description and
+// dispatch all derive from the registry, so a future command (append and list
+// operations are planned) is one appended entry. A malformed call gets an
+// instructive tool-result error to self-correct from rather than failing the
+// turn. Executions run server-side mid-turn as plain store writes, no If-Match.
 type Bot struct {
 	ID           BotID                 `json:"id"`
 	DisplayName  string                `json:"displayName"`
 	CreatedAt    time.Time             `json:"createdAt"`
 	SystemPrompt string                `json:"systemPrompt"`
 	Model        modelselector.ModelID `json:"model"` // e.g. modelselector.DeepSeekV4.ID
+
+	// Memory is the bot's durable, editable memory blob — the first piece of
+	// "what survives outside the transcript" (see the OPEN on Segment). Both
+	// sides write it: the user via PATCH /v1/bots/{id} (a "memory" field; ""
+	// is a valid value and clears it), and the model via the "memory" tool,
+	// executed server-side during a turn. When non-empty it is injected into
+	// every turn's context as a system-level "## Your memory" block.
+	// DECISION: Memory is NOT part of the derived Version hash. The model
+	// writes memory during chat, and chat traffic must never 412 a user's
+	// in-flight prompt edit — the same reason list metadata is excluded.
+	// DECISION: the tool's "replace" command overwrites the whole blob.
+	// Sub-string patching is a possible later refinement, not built in v0.
+	// OPEN (memory conflicts): user-vs-model memory writes are last-write-wins.
+	// Per-field If-Match, or a separate memory version, could layer on later
+	// if lost memory edits turn out to matter in practice.
+	Memory string `json:"memory"`
 
 	// List metadata, denormalized so the sidebar draws a row per bot without
 	// fetching every conversation. Maintained on append; never authored.
@@ -98,8 +122,9 @@ type Bot struct {
 //
 // OPEN (what survives): this keeps only a text Summary. The intent is that
 // durable state lives outside the transcript entirely — memory, skills, files in
-// std_artifacts — with the transcript as scratchpad. That layer is not designed
-// yet and is deliberately not modelled here; Summary is the interim.
+// std_artifacts — with the transcript as scratchpad. Bot.Memory is the first
+// piece of that layer to exist; skills and files are still undesigned, and
+// Summary remains the interim for everything else.
 type Segment struct {
 	ID       SegmentID `json:"id"`
 	BotID    BotID     `json:"botId"`
@@ -184,10 +209,18 @@ type PrivateBotNet struct {
 // Making it a type rather than a message slice is what keeps the cumulative-
 // summary invariant checkable: Summary is one string, so there is nowhere to put
 // a second one.
+// Context order on the wire: SystemPrompt, Memory (when non-empty), Summary,
+// then Messages.
 type Prompt struct {
 	Bot      Bot       // SystemPrompt and Model come from here
+	Memory   string    // the bot's editable memory blob; "" injects nothing
 	Summary  string    // newest sealed segment's cumulative summary; "" if never compacted
 	Messages []Message // the OPEN segment's raw messages only
+
+	// Tools is the turn's tool surface, bound to this bot — nil offers the
+	// model no tools (compaction, tests). The registry behind it is in
+	// tools.go; tool calls execute mid-turn as plain store writes.
+	Tools *BotToolbox
 }
 
 // DECISION (multi-client sync): built bespoke, borrowing JMAP's model and

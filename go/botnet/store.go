@@ -203,6 +203,7 @@ END;
 		{"bots", "last_message_at", `TEXT NOT NULL DEFAULT ''`},
 		{"bots", "last_message_text", `TEXT NOT NULL DEFAULT ''`},
 		{"bots", "read_at", `TEXT NOT NULL DEFAULT ''`},
+		{"bots", "memory", `TEXT NOT NULL DEFAULT ''`},
 		{"messages", "segment_id", `TEXT NOT NULL DEFAULT ''`},
 		{"messages", "status", `TEXT NOT NULL DEFAULT 'sent'`},
 		{"messages", "error", `TEXT NOT NULL DEFAULT ''`},
@@ -485,6 +486,7 @@ type BotPatch struct {
 	DisplayName  *string                `json:"displayName"`
 	SystemPrompt *string                `json:"systemPrompt"`
 	Model        *modelselector.ModelID `json:"model"`
+	Memory       *string                `json:"memory"` // "" is a real value: it clears the memory
 }
 
 // UpdateBot applies a patch and returns the bot as stored. A model in the patch
@@ -522,8 +524,11 @@ func (s *Store) UpdateBot(id BotID, p BotPatch, ifVersion string) (Bot, error) {
 			}
 			bot.Model = *p.Model
 		}
-		if _, err := q.Exec(`UPDATE bots SET display_name = ?, system_prompt = ?, model = ? WHERE id = ?`,
-			bot.DisplayName, bot.SystemPrompt, bot.Model, id); err != nil {
+		if p.Memory != nil {
+			bot.Memory = *p.Memory
+		}
+		if _, err := q.Exec(`UPDATE bots SET display_name = ?, system_prompt = ?, model = ?, memory = ? WHERE id = ?`,
+			bot.DisplayName, bot.SystemPrompt, bot.Model, bot.Memory, id); err != nil {
 			return fmt.Errorf("update bot: %w", err)
 		}
 		return nil
@@ -534,6 +539,24 @@ func (s *Store) UpdateBot(id BotID, p BotPatch, ifVersion string) (Bot, error) {
 	_, bot.ModelValid = modelselector.ByID(bot.Model)
 	bot.Version = botVersion(bot)
 	return bot, nil
+}
+
+// SetMemory replaces the bot's whole memory blob — the model's write path,
+// used by the memory tool's replace and clear commands mid-turn. It is deliberately
+// unconditional (no If-Match): a tool execution is one atomic store write, and
+// user-vs-model memory writes are last-write-wins for now (OPEN in schema.go).
+// The bots AFTER UPDATE trigger captures it into change_log like any other
+// write, and it never moves the derived Version — memory is not an authored
+// field, so it cannot 412 an edit in flight.
+func (s *Store) SetMemory(id BotID, memory string) (Bot, error) {
+	res, err := s.db.Exec(`UPDATE bots SET memory = ? WHERE id = ?`, memory, id)
+	if err != nil {
+		return Bot{}, fmt.Errorf("set memory: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return Bot{}, ErrNotFound
+	}
+	return s.GetBot(id)
 }
 
 // MarkRead marks the bot read up to its newest message — NOT as of now.
@@ -930,13 +953,13 @@ func (s *Store) DeleteBot(id BotID) error {
 	return nil
 }
 
-const botColumns = `id, display_name, created_at, system_prompt, model, last_message_at, last_message_text, read_at`
+const botColumns = `id, display_name, created_at, system_prompt, model, memory, last_message_at, last_message_text, read_at`
 
 func scanBot(sc interface{ Scan(...any) error }) (Bot, error) {
 	var b Bot
 	var createdAt, lastAt, readAt string
 	if err := sc.Scan(&b.ID, &b.DisplayName, &createdAt, &b.SystemPrompt, &b.Model,
-		&lastAt, &b.LastMessageText, &readAt); err != nil {
+		&b.Memory, &lastAt, &b.LastMessageText, &readAt); err != nil {
 		return Bot{}, err
 	}
 	var err error
@@ -959,6 +982,8 @@ func scanBot(sc interface{ Scan(...any) error }) (Bot, error) {
 // botVersion derives the opaque edit version If-Match compares against: a
 // hash over the authored fields only, so message traffic (which touches the
 // row's list metadata constantly) can never invalidate an edit in progress.
+// Memory is deliberately excluded for the same reason: the model writes it
+// mid-chat via the memory tools, and that must never 412 a user's edit.
 func botVersion(b Bot) string {
 	h := sha256.Sum256([]byte(b.DisplayName + "\x00" + b.SystemPrompt + "\x00" + string(b.Model)))
 	return "v" + hex.EncodeToString(h[:8])

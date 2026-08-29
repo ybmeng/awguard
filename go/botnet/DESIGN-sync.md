@@ -519,6 +519,26 @@ SQLite's own change capture, while keeping a surface small enough to debug.
 
 ---
 
+## 13. Memory writes (added 2026-08-30)
+
+Per-bot editable memory (`bots.memory`, `Bot.Memory`) added two write paths, both
+captured by the existing bots `AFTER UPDATE` trigger — no new trigger, no new entity:
+
+- **User path**: `PATCH /v1/bots/{id}` with a `memory` field, through `UpdateBot`.
+  Conditional under `If-Match` like any PATCH.
+- **Model path**: `Store.SetMemory`, called mid-turn by the `memory` tool's
+  `replace` / `clear` commands. Deliberately unconditional — a tool execution is
+  one atomic store write.
+
+Two rules the feed relies on: memory is **excluded from the derived `Bot.Version`**
+(a model taking notes mid-chat must never 412 a user's in-flight edit — same
+reasoning as list metadata), and a memory-only UPDATE **still emits a bot-updated
+change row** (SQLite fires the row trigger for any UPDATE of the row), so a second
+client sees the model take notes. User-vs-model memory writes are last-write-wins
+for now; recorded as OPEN in `schema.go`.
+
+---
+
 ## Appendix: store/tx-layer facts the implementation will need
 
 Recorded here so this survives outside any one session's context.
@@ -549,7 +569,8 @@ mutation.
 | Function | Entity | Op |
 |---|---|---|
 | `CreateBot` | bot | created (also creates segment 0 → segment created) |
-| `UpdateBot` | bot | updated |
+| `UpdateBot` | bot | updated (memory field included — a memory-only PATCH still emits) |
+| `SetMemory` | bot | updated (the model's memory tools, mid-turn) |
 | `MarkRead` | bot | updated |
 | `DeleteBot` | bot + its messages + its segments | destroyed (tombstones) |
 | `AppendMessage` | message | created (+ bot updated — list metadata changes) |

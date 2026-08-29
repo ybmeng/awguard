@@ -572,8 +572,10 @@ func (s *Server) startTurn(bot Bot, msg Message) {
 // records the result.
 //
 // The prompt it assembles is the whole point of segments: the bot's system
-// prompt, the ONE newest cumulative summary, and the open segment's raw
-// messages. Sealed segments contribute only through that summary.
+// prompt, its memory blob, the ONE newest cumulative summary, and the open
+// segment's raw messages. Sealed segments contribute only through that
+// summary. The turn also carries the bot's toolbox, so the model can read and
+// edit its memory mid-turn.
 func (s *Server) runTurn(ctx context.Context, bot Bot, msg Message) error {
 	if !bot.ModelValid {
 		return unusableModel(bot)
@@ -590,7 +592,13 @@ func (s *Server) runTurn(ctx context.Context, bot Bot, msg Message) error {
 	if err != nil {
 		return err
 	}
-	reply, err := s.llm.Complete(ctx, Prompt{Bot: bot, Summary: summary, Messages: history})
+	reply, err := s.llm.Complete(ctx, Prompt{
+		Bot:      bot,
+		Memory:   bot.Memory,
+		Summary:  summary,
+		Messages: history,
+		Tools:    NewBotToolbox(s.store, bot.ID),
+	})
 	if err != nil {
 		return err
 	}

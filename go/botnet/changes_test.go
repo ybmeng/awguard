@@ -108,6 +108,15 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 	}
 	expectRows(t, logAfter(t, s, mark), []changeRow{{"bot", string(bot.ID), "updated"}}, "MarkRead")
 
+	// SetMemory is the model's memory write path (the memory tool's replace
+	// and clear commands). A memory-only UPDATE must still fire the bots
+	// trigger, or a second client would never see the model take notes.
+	mark = topSeq(t, s)
+	if _, err := s.SetMemory(bot.ID, "remember this"); err != nil {
+		t.Fatalf("set memory: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark), []changeRow{{"bot", string(bot.ID), "updated"}}, "SetMemory")
+
 	// AppendMessage is the easy one to get wrong: the message insert AND the
 	// bot's denormalized list metadata both change, so it is two rows — the
 	// sidebar depends on the second.
