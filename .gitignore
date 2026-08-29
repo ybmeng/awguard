@@ -1,2 +1,4 @@
 stdd
 .DS_Store
+swift/botnet/build/
+swift/botnet/BotNet.xcodeproj/
