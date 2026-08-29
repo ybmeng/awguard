@@ -433,10 +433,22 @@ func (st *Store) Path(id ID, name string) string {
 	return filepath.Join(st.dir, id.String(), name)
 }
 
+// validName reports whether name is a plain file name — non-empty, no path
+// separators, no traversal — so joining it under a managed dir cannot escape
+// that dir.
+func validName(name string) bool {
+	return name != "" && name != "." && name != ".." &&
+		!strings.ContainsAny(name, `/\`) && name == filepath.Base(name)
+}
+
 // Open serves one file of a COMPLETE managed dir: from local storage when
 // present, otherwise fetched from the remote by its static reference.
-// Dirs in any other stage (WIP or ERR) are not servable.
+// Dirs in any other stage (WIP or ERR) are not servable. Names with path
+// separators or traversal are rejected outright.
 func (st *Store) Open(ctx context.Context, id ID, name string) (io.ReadCloser, error) {
+	if !validName(name) {
+		return nil, fmt.Errorf("artifacts: invalid file name %q", name)
+	}
 	s, err := st.Status(id)
 	if err != nil {
 		return nil, err

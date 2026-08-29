@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +121,36 @@ func TestServiceAPIEndToEnd(t *testing.T) {
 	if c, err := Dial(ctx, svc.Root()); err == nil {
 		c.Close()
 		t.Error("Dial should fail once the service is down")
+	}
+}
+
+func TestOpenAPIRejectsTraversalNames(t *testing.T) {
+	svc, err := New(Config{Root: shortRoot(t), Syncer: newFakeSyncer(), Logger: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := svc.Insert(ctx, writeFile(t, filepath.Join(t.TempDir(), "a.txt"), "fine")); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	// A secret outside the managed dir, reachable only by escaping it.
+	writeFile(t, filepath.Join(svc.Root(), "secret.txt"), "top secret")
+
+	mux := svc.apiMux()
+	for _, target := range []string{
+		"/v1/open/1/..%2Fsecret.txt",          // managed/secret.txt (none, but must not even try)
+		"/v1/open/1/..%2F..%2Fsecret.txt",     // root/secret.txt — the planted file
+		"/v1/open/1/x%2F..%2F..%2Fsecret.txt", // cleaned variant
+	} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code == http.StatusOK {
+			t.Errorf("GET %s = 200, want rejection", target)
+		}
+		if strings.Contains(rec.Body.String(), "top secret") {
+			t.Errorf("GET %s leaked file content outside the managed dir", target)
+		}
 	}
 }
 

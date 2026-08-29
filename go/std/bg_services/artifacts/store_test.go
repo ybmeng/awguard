@@ -417,6 +417,40 @@ func TestOpenServesLocalThenFallsBackByStaticRef(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsPathTraversal(t *testing.T) {
+	st := newTestStore(t, newFakeSyncer())
+	ctx := context.Background()
+	id, err := st.Insert(ctx, writeFile(t, filepath.Join(t.TempDir(), "a.txt"), "fine"))
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	// Plant secrets at every level an escaping name could reach.
+	writeFile(t, filepath.Join(st.Dir(), "in-managed.txt"), "secret")
+	writeFile(t, filepath.Join(filepath.Dir(st.Dir()), "outside.txt"), "secret")
+
+	for _, name := range []string{
+		"../in-managed.txt",
+		"../../outside.txt",
+		"..", ".", "",
+		"x/../a.txt",
+		`..\outside.txt`,
+	} {
+		r, err := st.Open(ctx, id, name)
+		if err == nil {
+			r.Close()
+			t.Errorf("Open(%q) succeeded, want rejection", name)
+		}
+	}
+
+	// The legitimate name still works.
+	r, err := st.Open(ctx, id, "a.txt")
+	if err != nil {
+		t.Fatalf("Open(a.txt): %v", err)
+	}
+	r.Close()
+}
+
 func TestInsertRejectsMissingAndIrregularSources(t *testing.T) {
 	st := newTestStore(t, nil)
 	ctx := context.Background()

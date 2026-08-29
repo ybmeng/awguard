@@ -140,7 +140,14 @@ func (s *Service) apiMux() *http.ServeMux {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		rc, err := s.store.Open(r.Context(), id, r.PathValue("name"))
+		// Defense in depth: the wildcard decodes %2F and friends, so reject
+		// traversal here too, before the name reaches the store.
+		name := r.PathValue("name")
+		if !validName(name) {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid file name %q", name))
+			return
+		}
+		rc, err := s.store.Open(r.Context(), id, name)
 		if err != nil {
 			writeErr(w, http.StatusNotFound, err)
 			return
