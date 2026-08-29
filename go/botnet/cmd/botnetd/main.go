@@ -1,0 +1,76 @@
+// Command botnetd is the PrivateBotNet server: it owns all state (bots,
+// messages) in one SQLite file and makes the OpenRouter calls. The UI is a
+// thin client that talks to it over HTTP on localhost.
+//
+// Config (env):
+//
+//	BOTNET_DB    path to the SQLite file (default ~/.botnet/net.db)
+//	BOTNET_ADDR  listen address        (default 127.0.0.1:8730)
+//	OPENROUTER_API_KEY  the key; if unset, falls back to ~/.config/botnet/openrouter.txt
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"stdtools/go/botnet"
+)
+
+func main() {
+	log.SetFlags(0)
+
+	dbPath := env("BOTNET_DB", filepath.Join(home(), ".botnet", "net.db"))
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		log.Fatalf("botnetd: create db dir: %v", err)
+	}
+	store, err := botnet.Open(dbPath)
+	if err != nil {
+		log.Fatalf("botnetd: open store: %v", err)
+	}
+	defer store.Close()
+
+	keyPath := filepath.Join(home(), ".config", "botnet", "openrouter.txt")
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		log.Fatalf("botnetd: create config dir: %v", err)
+	}
+	srv, err := botnet.NewServer(store, botnet.NewOpenRouter(apiKey()))
+	if err != nil {
+		log.Fatalf("botnetd: %v", err)
+	}
+	srv.ConfigureKeyPersistence(keyPath)
+
+	addr := env("BOTNET_ADDR", "127.0.0.1:8730")
+	log.Printf("botnetd: serving on http://%s  (db: %s)", addr, dbPath)
+	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
+		log.Fatalf("botnetd: %v", err)
+	}
+}
+
+func apiKey() string {
+	if k := os.Getenv("OPENROUTER_API_KEY"); k != "" {
+		return k
+	}
+	data, err := os.ReadFile(filepath.Join(home(), ".config", "botnet", "openrouter.txt"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func home() string {
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return "."
+	}
+	return h
+}

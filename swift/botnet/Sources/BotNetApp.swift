@@ -1,5 +1,5 @@
-// BotNetApp.swift — app entry + the three-pane layout from ChatUI.md:
-// left nav (Services + Bots), chat panel, bot-details right panel (inspector).
+// BotNetApp.swift — app entry + the layout from ChatUI.md: left nav (Services +
+// Bots), chat panel, bot-details inspector. All state comes from botnetd.
 
 import SwiftUI
 
@@ -11,6 +11,7 @@ struct BotNetApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(store)
+                .task { await store.refresh() }
         }
     }
 }
@@ -25,13 +26,12 @@ struct ContentView: View {
         NavigationSplitView {
             List(selection: $selectedBotID) {
                 Section("Services") {
-                    // Services are persistently running apps (e.g. std_artifacts).
-                    // Placeholder until service access lands; agents will use these.
+                    // Services are persistently running apps (e.g. std_artifacts);
+                    // agents will access these. Placeholder until wired.
                     Label("std_artifacts", systemImage: "externaldrive")
                         .foregroundStyle(.secondary)
-                        .selectionDisabled()
                 }
-                Section("Bots") {
+                Section {
                     ForEach(store.bots) { bot in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(bot.displayName)
@@ -40,19 +40,40 @@ struct ContentView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .tag(bot.id)
+                        .contextMenu {
+                            Button("Delete", role: .destructive) {
+                                Task { await store.deleteBot(bot) }
+                            }
+                        }
                     }
-                    .onDelete { idx in
-                        idx.map { store.bots[$0] }.forEach { store.deleteBot($0) }
+                } header: {
+                    // Create button anchored to the right of the "Bots" header.
+                    HStack {
+                        Text("Bots")
+                        Spacer()
+                        Button {
+                            showNewBot = true
+                        } label: {
+                            Image(systemName: "plus")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Create a bot")
                     }
                 }
             }
             .navigationTitle("BotNet")
             .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button { showNewBot = true } label: { Image(systemName: "plus") }
-                }
-                ToolbarItem(placement: .secondaryAction) {
+                ToolbarItem {
                     Button { showSettings = true } label: { Image(systemName: "gear") }
+                        .help("Settings")
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                if !store.serverReachable {
+                    Label("botnetd not reachable", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .padding(6)
                 }
             }
         } detail: {
@@ -62,7 +83,7 @@ struct ContentView: View {
                 ContentUnavailableView(
                     "No bot selected",
                     systemImage: "bubble.left.and.bubble.right",
-                    description: Text("Pick a bot from the sidebar, or create one with +.")
+                    description: Text("Pick a bot, or create one with + next to Bots.")
                 )
             }
         }
@@ -79,6 +100,6 @@ struct ContentView: View {
     }
 
     private func modelName(_ id: String) -> String {
-        ModelOption.roster.first(where: { $0.id == id })?.name ?? id
+        store.models.first(where: { $0.id == id })?.name ?? id
     }
 }

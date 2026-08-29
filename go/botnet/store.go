@@ -128,11 +128,11 @@ func (s *Store) AppendMessage(botID BotID, role, content string) (Message, error
 	return msg, nil
 }
 
-// Conversation returns a bot's messages in send order (by id, which is
-// time-sortable).
+// Conversation returns a bot's messages in insertion order (by rowid, which is
+// reliable even when several messages land in the same millisecond).
 func (s *Store) Conversation(botID BotID) ([]Message, error) {
 	rows, err := s.db.Query(
-		`SELECT id, bot_id, role, content, sent_at FROM messages WHERE bot_id = ? ORDER BY id`, botID)
+		`SELECT id, bot_id, role, content, sent_at FROM messages WHERE bot_id = ? ORDER BY rowid`, botID)
 	if err != nil {
 		return nil, fmt.Errorf("conversation: %w", err)
 	}
@@ -151,6 +151,55 @@ func (s *Store) Conversation(botID BotID) ([]Message, error) {
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// DeleteBot removes a bot and its entire conversation.
+func (s *Store) DeleteBot(id BotID) error {
+	if _, err := s.db.Exec(`DELETE FROM messages WHERE bot_id = ?`, id); err != nil {
+		return fmt.Errorf("delete bot messages: %w", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM bots WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete bot: %w", err)
+	}
+	return nil
+}
+
+// ListBots returns every bot in a net, in creation order (by id).
+func (s *Store) ListBots(netID string) ([]Bot, error) {
+	rows, err := s.db.Query(
+		`SELECT id, display_name, created_at, system_prompt, model FROM bots WHERE net_id = ? ORDER BY rowid`, netID)
+	if err != nil {
+		return nil, fmt.Errorf("list bots: %w", err)
+	}
+	defer rows.Close()
+	var out []Bot
+	for rows.Next() {
+		var b Bot
+		var createdAt string
+		if err := rows.Scan(&b.ID, &b.DisplayName, &createdAt, &b.SystemPrompt, &b.Model); err != nil {
+			return nil, fmt.Errorf("scan bot: %w", err)
+		}
+		if b.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+			return nil, fmt.Errorf("parse created_at: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// EnsureDefaultNet returns the first net, creating a "default" one if none
+// exists. The single-user MVP has exactly one net; this gives bots a home
+// without the UI having to manage nets yet.
+func (s *Store) EnsureDefaultNet() (PrivateBotNet, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT id FROM nets ORDER BY id LIMIT 1`).Scan(&id)
+	if err == nil {
+		return s.GetNet(id)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return PrivateBotNet{}, fmt.Errorf("ensure default net: %w", err)
+	}
+	return s.CreateNet("default")
 }
 
 // GetBot loads one bot by id.
@@ -182,7 +231,7 @@ func (s *Store) GetNet(id string) (PrivateBotNet, error) {
 	if err != nil {
 		return PrivateBotNet{}, fmt.Errorf("get net: %w", err)
 	}
-	rows, err := s.db.Query(`SELECT id FROM bots WHERE net_id = ? ORDER BY id`, id)
+	rows, err := s.db.Query(`SELECT id FROM bots WHERE net_id = ? ORDER BY rowid`, id)
 	if err != nil {
 		return PrivateBotNet{}, fmt.Errorf("get net bots: %w", err)
 	}

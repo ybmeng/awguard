@@ -1,5 +1,5 @@
-// ChatView.swift — the bot chat panel, plus the right-panel inspector with the
-// details the chat was created with (system prompt, model, created, count).
+// ChatView.swift — the bot chat panel + a details inspector. State is fetched
+// from and written to botnetd; this view holds only the draft text.
 
 import SwiftUI
 
@@ -23,7 +23,7 @@ struct ChatView: View {
                         }
                         if pending {
                             HStack {
-                                ProgressView()
+                                ProgressView().controlSize(.small)
                                 Text("thinking…").foregroundStyle(.secondary)
                             }
                             .id("pending")
@@ -46,19 +46,22 @@ struct ChatView: View {
                 Button(action: sendDraft) {
                     Image(systemName: "arrow.up.circle.fill").font(.title2)
                 }
+                .buttonStyle(.borderless)
                 .disabled(pending || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding()
         }
         .navigationTitle(bot.displayName)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem {
                 Button { showDetails.toggle() } label: { Image(systemName: "info.circle") }
+                    .help("Bot details")
             }
         }
         .inspector(isPresented: $showDetails) {
             BotDetails(bot: bot, messageCount: messages.count)
         }
+        .task(id: bot.id) { await store.loadConversation(bot.id) }
     }
 
     private func sendDraft() {
@@ -75,6 +78,7 @@ private struct MessageRow: View {
         HStack {
             if message.role == .user { Spacer(minLength: 40) }
             Text(message.content)
+                .textSelection(.enabled)
                 .padding(10)
                 .background(
                     message.role == .user
@@ -89,17 +93,19 @@ private struct MessageRow: View {
 }
 
 private struct BotDetails: View {
+    @EnvironmentObject var store: AppStore
     let bot: Bot
     let messageCount: Int
 
     var body: some View {
         List {
             Section("Model") {
-                Text(ModelOption.roster.first(where: { $0.id == bot.model })?.name ?? bot.model)
+                Text(store.models.first(where: { $0.id == bot.model })?.name ?? bot.model)
                 Text(bot.model).font(.caption).foregroundStyle(.secondary)
             }
             Section("System prompt") {
                 Text(bot.systemPrompt.isEmpty ? "(none)" : bot.systemPrompt)
+                    .textSelection(.enabled)
             }
             Section("Info") {
                 LabeledContent("Created", value: bot.createdAt.formatted())

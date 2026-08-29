@@ -1,4 +1,5 @@
-// Sheets.swift — create-bot and settings (OpenRouter key) sheets.
+// Sheets.swift — create-bot and settings sheets. Both write to botnetd; the
+// app stores nothing (the OpenRouter key lives on the server).
 
 import SwiftUI
 
@@ -18,11 +19,10 @@ struct NewBotSheet: View {
                 }
                 Section("Model") {
                     Picker("Model", selection: $model) {
-                        ForEach(ModelOption.roster) { opt in
+                        ForEach(store.models) { opt in
                             Text(opt.name).tag(opt.id)
                         }
                     }
-                    .pickerStyle(.inline)
                     .labelsHidden()
                 }
                 Section("System prompt") {
@@ -30,6 +30,8 @@ struct NewBotSheet: View {
                         .lineLimit(3...10)
                 }
             }
+            .formStyle(.grouped)
+            .frame(minWidth: 380, minHeight: 340)
             .navigationTitle("New Bot")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -37,7 +39,8 @@ struct NewBotSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Create") {
-                        store.createBot(displayName: name, systemPrompt: systemPrompt, model: model)
+                        let n = name, sp = systemPrompt, m = model
+                        Task { await store.createBot(displayName: n, systemPrompt: sp, model: m) }
                         dismiss()
                     }
                     .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -48,32 +51,43 @@ struct NewBotSheet: View {
 }
 
 struct SettingsSheet: View {
+    @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
-    @State private var key = Keychain.apiKey
+
+    @State private var key = ""
+    @State private var hasKey = false
+    @State private var saving = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    SecureField("sk-or-…", text: $key)
-                        .textInputAutocapitalization(.never)
+                    SecureField(hasKey ? "•••• (a key is set)" : "sk-or-…", text: $key)
                         .autocorrectionDisabled()
                 } header: {
                     Text("OpenRouter API key")
                 } footer: {
-                    Text("Stored in the Keychain on this device only.")
+                    Text("Sent to botnetd and stored on the server only. The app never keeps it.")
                 }
             }
+            .formStyle(.grouped)
+            .frame(minWidth: 420, minHeight: 200)
             .navigationTitle("Settings")
+            .task { hasKey = (try? await store.hasServerKey()) ?? false }
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
-                        Keychain.apiKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
-                        dismiss()
-                    }
-                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        let k = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                        saving = true
+                        Task {
+                            await store.setServerKey(k)
+                            dismiss()
+                        }
+                    }
+                    .disabled(saving || key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
         }
