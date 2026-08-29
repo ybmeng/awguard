@@ -158,7 +158,7 @@ because every remote stage is idempotent — before an insert is failed.
 
 ```bash
 ./stdd drive auth -credentials ~/Downloads/client_secret.json
-# opens a consent URL; approve in the browser
+# prints a consent URL — open it in your browser and approve
 ```
 
 From then on `stdd run` and `stdd insert` force-sync through Drive

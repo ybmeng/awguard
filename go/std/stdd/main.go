@@ -134,7 +134,7 @@ func main() {
 
 func runFlags(name string) (*flag.FlagSet, *string, *time.Duration) {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
-	dir := fs.String("dir", "", "root directory for the artifacts service (inbox/ and synced/ live under it)")
+	dir := fs.String("dir", "", "root directory for the artifacts service (inbox/ and managed/ live under it)")
 	interval := fs.Duration("interval", artifacts.DefaultInterval, "artifacts poll interval")
 	return fs, dir, interval
 }
