@@ -30,7 +30,7 @@ struct ModelOption: Identifiable, Codable, Hashable {
     var id: String
 
     static let roster: [ModelOption] = [
-        ModelOption(name: "DeepSeek V4", id: "openrouter/deepseek/deepseek-v4"),
+        ModelOption(name: "DeepSeek V4 Flash", id: "openrouter/deepseek/deepseek-v4-flash-0731"),
         ModelOption(name: "GLM 5.3 Flash", id: "openrouter/z-ai/glm-5.3-flash"),
     ]
 }

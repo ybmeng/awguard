@@ -19,7 +19,7 @@ type Model struct {
 
 // The starting roster: OpenRouter routing between DeepSeek V4 and GLM 5.3 Flash.
 var (
-	DeepSeekV4 = Model{Name: "DeepSeek V4", ID: "openrouter/deepseek/deepseek-v4"}
+	DeepSeekV4 = Model{Name: "DeepSeek V4 Flash", ID: "openrouter/deepseek/deepseek-v4-flash-0731"}
 	GLM53Flash = Model{Name: "GLM 5.3 Flash", ID: "openrouter/z-ai/glm-5.3-flash"}
 )
 
