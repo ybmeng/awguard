@@ -537,6 +537,10 @@ change row** (SQLite fires the row trigger for any UPDATE of the row), so a seco
 client sees the model take notes. User-vs-model memory writes are last-write-wins
 for now; recorded as OPEN in `schema.go`.
 
+The tool definitions themselves are NOT synced data: `GET /v1/tools` serves
+`toolWireDefs()` straight from the binary's `memoryCommands` registry — deploy-static,
+unversioned, and outside the change feed.
+
 ---
 
 ## Appendix: store/tx-layer facts the implementation will need

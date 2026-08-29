@@ -62,6 +62,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/config", s.getConfig)
 	mux.HandleFunc("POST /v1/config", s.setConfig)
 	mux.HandleFunc("GET /v1/models", s.listModels)
+	mux.HandleFunc("GET /v1/tools", s.listTools)
 	mux.HandleFunc("GET /v1/bots", s.listBots)
 	mux.HandleFunc("POST /v1/bots", s.createBot)
 	mux.HandleFunc("PATCH /v1/bots/{id}", s.patchBot)
@@ -235,6 +236,15 @@ func (s *Server) setConfig(w http.ResponseWriter, r *http.Request) {
 // It is also the repair menu for a bot whose stored model no longer resolves.
 func (s *Server) listModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, modelselector.All())
+}
+
+// listTools surfaces the exact tool definitions the model is sent — the same
+// toolWireDefs() array the chat request marshals as its "tools" key — so the
+// UI shows what the model is actually told and can never drift from it. The
+// list is derived from the binary's memoryCommands registry, not stored data:
+// it changes only on deploy, so it is unversioned and outside the change feed.
+func (s *Server) listTools(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, toolWireDefs())
 }
 
 // listBots returns every bot with its list metadata, most recently active

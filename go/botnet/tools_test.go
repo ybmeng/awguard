@@ -1,6 +1,7 @@
 package botnet
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -404,5 +405,77 @@ func TestToollessRequestOmitsTools(t *testing.T) {
 	}
 	if len(req.Messages) != 2 { // system prompt + user turn
 		t.Errorf("request carried %d turns, want 2: %+v", len(req.Messages), req.Messages)
+	}
+}
+
+// TestToolsEndpointServesTheWireTools pins GET /v1/tools' guarantee: its body
+// is byte-for-byte the "tools" array a real chat request carries, because both
+// are toolWireDefs() through encoding/json. If they ever diverged, the UI
+// would show the user something the model is not being told.
+func TestToolsEndpointServesTheWireTools(t *testing.T) {
+	h := newHarness(t, &fakeLLM{reply: "ok"})
+	resp, err := http.Get(h.ts.URL + "/v1/tools")
+	if err != nil {
+		t.Fatalf("get /v1/tools: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("content-type = %q, want application/json", ct)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	body := bytes.TrimSuffix(raw, []byte("\n")) // writeJSON's Encoder appends one
+
+	// The bytes the shared source marshals to...
+	want, err := json.Marshal(toolWireDefs())
+	if err != nil {
+		t.Fatalf("marshal defs: %v", err)
+	}
+	if !bytes.Equal(body, want) {
+		t.Errorf("endpoint body = %s, want %s", body, want)
+	}
+
+	// ...and, end to end, the bytes an actual chat request put on the wire.
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	bot := newBot(t, s)
+	sc := &scriptedUpstream{responses: []string{contentResponse("ok")}}
+	or := newScriptedOpenRouter(t, sc)
+	if _, err := or.Complete(context.Background(), Prompt{
+		Bot:      bot,
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		Tools:    NewBotToolbox(s, bot.ID),
+	}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	var payload struct {
+		Tools json.RawMessage `json:"tools"` // raw, so the wire bytes survive verbatim
+	}
+	if err := json.Unmarshal(sc.requests[0], &payload); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if !bytes.Equal(body, []byte(payload.Tools)) {
+		t.Errorf("endpoint body = %s, but the chat request sent tools = %s", body, payload.Tools)
+	}
+}
+
+// TestToolsEndpointRejectsNonGET: /v1/tools is read-only derived data.
+func TestToolsEndpointRejectsNonGET(t *testing.T) {
+	h := newHarness(t, &fakeLLM{})
+	resp, err := http.Post(h.ts.URL+"/v1/tools", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("post /v1/tools: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST /v1/tools status = %d, want 405", resp.StatusCode)
 	}
 }
