@@ -16,6 +16,7 @@ struct Snapshot {
     static func main() async {
         let out = argument("--out") ?? "snapshot.png"
         let dark = CommandLine.arguments.contains("--dark")
+        let details = CommandLine.arguments.contains("--details")
         let width = Double(argument("--width") ?? "") ?? 1400
         let height = Double(argument("--height") ?? "") ?? 900
 
@@ -29,18 +30,27 @@ struct Snapshot {
         }
         await store.loadConversation(bot.id)
 
-        render(store: store, bot: bot, dark: dark, size: CGSize(width: width, height: height), to: out)
+        render(store: store, bot: bot, dark: dark, details: details,
+               size: CGSize(width: width, height: height), to: out)
     }
 
     @MainActor
-    private static func render(store: AppStore, bot: Bot, dark: Bool, size: CGSize, to path: String) {
+    private static func render(store: AppStore, bot: Bot, dark: Bool, details: Bool, size: CGSize, to path: String) {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
 
         let content = HStack(spacing: 0) {
             SidebarView(selectedBotID: .constant(bot.id), showNewBot: .constant(false))
                 .frame(width: Metric.sidebarWidth)
             Rectangle().fill(Palette.hairline).frame(width: 1)
-            ChatView(bot: bot, showDetails: .constant(false))
+            ChatView(bot: bot, showDetails: .constant(details))
+            // The real app presents BotDetails as an .inspector, which needs a
+            // window toolbar to render; a plain third column previews the same
+            // content offscreen.
+            if details {
+                Rectangle().fill(Palette.hairline).frame(width: 1)
+                BotDetails(bot: bot)
+                    .frame(width: 300)
+            }
         }
         .environmentObject(store)
         .environment(\.colorScheme, dark ? .dark : .light)

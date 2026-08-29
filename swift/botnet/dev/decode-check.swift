@@ -62,6 +62,27 @@ struct DecodeCheck {
             _ = try decoder.decode(Bot.self, from: bot)
         }
 
+        // Memory landed after the first server release: present it must decode
+        // (the reply-settle bot refetch is what updates the memory panel), and
+        // the older fixture above must keep decoding with memory nil.
+        let botWithMemory = Data("""
+        {"id":"bot_01M16K3W6TZ0EHQFPKZ490BDX2","displayName":"hihi","createdAt":"2026-08-29T11:05:13.690398Z","systemPrompt":"","model":"openrouter/deepseek/deepseek-v4-flash-0731","memory":"Birthday: March 3.","lastMessageAt":"2026-08-29T14:57:22.589727Z","lastMessageText":"ok","readAt":"2026-08-29T11:05:22.48899Z","modelValid":true}
+        """.utf8)
+        await check("Bot.memory decodes when present, nil when absent") {
+            let new = try decoder.decode(Bot.self, from: botWithMemory)
+            guard new.memory == "Birthday: March 3." else {
+                throw NSError(domain: "decode-check", code: 4, userInfo: [
+                    NSLocalizedDescriptionKey: "memory decoded as \(String(describing: new.memory))",
+                ])
+            }
+            let old = try decoder.decode(Bot.self, from: bot)
+            guard old.memory == nil else {
+                throw NSError(domain: "decode-check", code: 5, userInfo: [
+                    NSLocalizedDescriptionKey: "absent memory decoded as \(String(describing: old.memory))",
+                ])
+            }
+        }
+
         // A failed decode must say which endpoint produced it; the bare
         // DecodingError alert ("The data couldn't be read…") names nothing.
         await check("decode failure names the endpoint") {

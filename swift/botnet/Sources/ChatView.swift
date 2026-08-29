@@ -1,7 +1,8 @@
 // ChatView.swift — the bot chat panel: header, bubble transcript, composer. A
 // pure pane: the details inspector is window chrome and belongs to whoever owns
 // the column. State is fetched from and written to botnetd; this view holds only
-// the draft text.
+// the draft text. The header's actions menu carries the per-bot operations
+// (compact, and broken-model recovery).
 
 import SwiftUI
 
@@ -15,6 +16,7 @@ struct ChatView: View {
     private var messages: [Message] { store.messages(for: bot.id) }
     private var turns: [ChatTurn] { ChatTurn.build(from: messages) }
     private var pending: Bool { store.pendingBotIDs.contains(bot.id) }
+    private var compacting: Bool { store.compactingBotIDs.contains(bot.id) }
     private var canSend: Bool {
         !pending && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -36,6 +38,7 @@ struct ChatView: View {
                 .font(TypeScale.headerTitle)
                 .foregroundStyle(Palette.primaryText)
             Spacer()
+            actionsMenu
             Button { showDetails.toggle() } label: {
                 Image(systemName: "sidebar.right")
                     .foregroundStyle(Palette.secondaryText)
@@ -48,6 +51,40 @@ struct ChatView: View {
         .overlay(alignment: .bottom) {
             Rectangle().fill(Palette.hairline).frame(height: 1)
         }
+    }
+
+    // Per-bot operations that used to be rows in the details inspector. Compact
+    // seals the conversation's memory; the model submenu appears only when the
+    // bot's model has gone away, the one state with no other route to a fix.
+    private var actionsMenu: some View {
+        Menu {
+            Button {
+                Task { await store.compact(bot) }
+            } label: {
+                Label(
+                    compacting ? "Compacting…" : "Compact conversation",
+                    systemImage: "arrow.down.right.and.arrow.up.left"
+                )
+            }
+            .disabled(compacting || messages.isEmpty)
+
+            if bot.isModelBroken {
+                Menu("Change model") {
+                    ForEach(store.models) { option in
+                        Button(option.name) {
+                            Task { await store.updateBot(bot, fields: ["model": option.id]) }
+                        }
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .foregroundStyle(Palette.secondaryText)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Bot actions")
     }
 
     private var transcript: some View {
@@ -269,101 +306,115 @@ private struct ThinkingBubble: View {
     }
 }
 
+// The details inspector: the bot's memory, readable at rest and editable behind
+// the pencil. Saves are explicit — the server's model calls can also write
+// memory, and last-write-wins is the accepted semantics, so nothing autosaves.
 struct BotDetails: View {
     @EnvironmentObject var store: AppStore
     let bot: Bot
-    let messageCount: Int
 
-    private var chain: [Segment] { store.segmentChain(for: bot.id) }
-    private var compacting: Bool { store.compactingBotIDs.contains(bot.id) }
+    @State private var editing = false
+    @State private var draft = ""
+    @State private var saving = false
+
+    private var memory: String { bot.memory ?? "" }
 
     var body: some View {
-        List {
-            Section("Model") {
-                Text(store.models.first(where: { $0.id == bot.model })?.name ?? bot.model)
-                Text(bot.model).font(.caption).foregroundStyle(.secondary)
-                if bot.isModelBroken {
-                    Label(
-                        "This model is no longer available. Sends will fail until it is changed.",
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(Palette.attention)
-                    Menu("Change model") {
-                        ForEach(store.models) { option in
-                            Button(option.name) {
-                                Task { await store.updateBot(bot, fields: ["model": option.id]) }
-                            }
-                        }
-                    }
-                }
-            }
-            Section("System prompt") {
-                Text(bot.systemPrompt.isEmpty ? "(none)" : bot.systemPrompt)
-                    .textSelection(.enabled)
-            }
-            conversationSection
-            Section("Info") {
-                LabeledContent("Created", value: bot.createdAt.formatted())
-                LabeledContent("Messages", value: "\(messageCount)")
-                LabeledContent("ID", value: bot.id)
-            }
+        VStack(spacing: 0) {
+            header
+            if editing { editor } else { reader }
         }
+        .background(Palette.chrome)
         .navigationTitle("Details")
-        .task(id: bot.id) { await store.loadSegments(bot.id) }
+        // Switching bots must never carry one bot's unsaved draft to another.
+        .onChange(of: bot.id) { editing = false }
     }
 
-    // The chain of segments this bot's one conversation is stored as. Compaction
-    // seals the open segment with a cumulative summary and opens a fresh one, so
-    // the sealed entries read oldest-first as the bot's memory of itself.
-    private var conversationSection: some View {
-        Section("Conversation") {
-            Button {
-                Task { await store.compact(bot) }
-            } label: {
-                if compacting {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("Compacting…")
-                    }
-                } else {
-                    Label("Compact", systemImage: "arrow.down.right.and.arrow.up.left")
+    private var header: some View {
+        HStack {
+            Text("Memory")
+                .font(TypeScale.headerTitle)
+                .foregroundStyle(Palette.primaryText)
+            Spacer()
+            if !editing {
+                Button {
+                    draft = memory
+                    editing = true
+                } label: {
+                    Image(systemName: "pencil")
+                        .foregroundStyle(Palette.secondaryText)
                 }
+                .buttonStyle(.borderless)
+                .help("Edit memory")
             }
-            .disabled(compacting || messageCount == 0)
+        }
+        .padding(.horizontal, Metric.inspectorPad)
+        .frame(height: Metric.headerHeight)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Palette.hairline).frame(height: 1)
+        }
+    }
 
-            if chain.isEmpty {
-                Text("Never compacted.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+    private var reader: some View {
+        Group {
+            if memory.isEmpty {
+                ContentUnavailableView {
+                    Label("No memory yet", systemImage: "pencil")
+                } description: {
+                    Text("Use the pencil to write some, or let the bot earn its own.")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ForEach(chain.sorted { $0.index < $1.index }) { segment in
-                    SegmentRow(segment: segment)
+                ScrollView {
+                    Text(memory)
+                        .font(TypeScale.message)
+                        .foregroundStyle(Palette.primaryText)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(Metric.inspectorPad)
                 }
             }
         }
     }
-}
 
-private struct SegmentRow: View {
-    let segment: Segment
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+    private var editor: some View {
+        VStack(spacing: Metric.inspectorPad) {
+            TextEditor(text: $draft)
+                .font(TypeScale.message)
+                .foregroundStyle(Palette.primaryText)
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .background(
+                    Palette.fieldFill,
+                    in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
+                        .strokeBorder(Palette.fieldStroke, lineWidth: 1)
+                }
             HStack {
-                Text("Segment \(segment.index + 1)")
-                    .font(.caption.weight(.semibold))
                 Spacer()
-                Text(segment.sealed.map { "sealed \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "open")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Button("Cancel") { editing = false }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(saving)
+                Button(saving ? "Saving…" : "Save", action: save)
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(saving)
             }
-            if let summary = segment.summary, !summary.isEmpty {
-                Text(summary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+        }
+        .padding(Metric.inspectorPad)
+    }
+
+    private func save() {
+        saving = true
+        Task {
+            // A failed patch keeps the editor open so the text isn't lost; the
+            // error itself surfaces through the store's alert.
+            if await store.updateBot(bot, fields: ["memory": draft]) {
+                editing = false
             }
+            saving = false
         }
     }
 }

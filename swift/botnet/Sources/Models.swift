@@ -34,6 +34,10 @@ struct Bot: Identifiable, Codable, Hashable {
     // send will fail until the model is changed.
     var modelValid: Bool?
 
+    // The bot's editable memory. Nil on a server that predates it; "" is a real
+    // value meaning cleared, so the UI treats both as empty.
+    var memory: String?
+
     /// Nil until the bot has any message, on both old and new servers.
     var lastActivity: Date? { lastMessageAt?.nilIfServerZero }
 

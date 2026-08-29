@@ -134,14 +134,19 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func updateBot(_ bot: Bot, fields: [String: String]) async {
+    // Returns whether the patch landed, so an editor can hold onto unsaved text
+    // when it didn't.
+    @discardableResult
+    func updateBot(_ bot: Bot, fields: [String: String]) async -> Bool {
         do {
             _ = try await api.patchBot(bot.id, fields: fields)
             bots = try await api.listBots()
+            return true
         } catch {
             lastError = APIClient.isUnimplemented(error)
                 ? "This botnetd is too old to edit a bot — restart it from the current build."
                 : error.localizedDescription
+            return false
         }
     }
 
@@ -238,7 +243,10 @@ final class AppStore: ObservableObject {
     }
 
     // The sidebar's preview and ordering are server-derived, so they go stale on
-    // every send until the bot list is re-read.
+    // every send until the bot list is re-read. The model can also write the
+    // bot's memory while composing its reply, so this same re-read is what
+    // updates an open memory panel the moment the reply settles — awaitReply
+    // must keep calling it.
     private func refreshBotList() async {
         bots = (try? await api.listBots()) ?? bots
     }

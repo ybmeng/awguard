@@ -82,6 +82,8 @@ enum Metric {
     static let composerPad: CGFloat = 12
 
     static let headerHeight: CGFloat = 44
+
+    static let inspectorPad: CGFloat = 12
 }
 
 enum TypeScale {

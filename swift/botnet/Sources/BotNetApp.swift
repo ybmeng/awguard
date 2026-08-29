@@ -37,7 +37,7 @@ struct ContentView: View {
             if let id = selectedBotID, let bot = store.bots.first(where: { $0.id == id }) {
                 ChatView(bot: bot, showDetails: $showDetails)
                     .inspector(isPresented: $showDetails) {
-                        BotDetails(bot: bot, messageCount: store.messages(for: bot.id).count)
+                        BotDetails(bot: bot)
                     }
             } else {
                 ContentUnavailableView(
