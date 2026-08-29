@@ -84,6 +84,8 @@ enum Metric {
     static let headerHeight: CGFloat = 44
 
     static let inspectorPad: CGFloat = 12
+    /// A panel section grows with its content up to this, then scrolls inside.
+    static let inspectorSectionMaxHeight: CGFloat = 300
 }
 
 enum TypeScale {

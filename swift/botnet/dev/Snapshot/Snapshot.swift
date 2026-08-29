@@ -48,7 +48,7 @@ struct Snapshot {
             // content offscreen.
             if details {
                 Rectangle().fill(Palette.hairline).frame(width: 1)
-                BotDetails(bot: bot)
+                BotDetails(bot: bot, expanded: .constant(true))
                     .frame(width: 300)
             }
         }

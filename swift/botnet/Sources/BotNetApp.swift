@@ -22,6 +22,9 @@ struct ContentView: View {
     @State private var showNewBot = false
     @State private var showSettings = false
     @State private var showDetails = false
+    // Lives here rather than in BotDetails so the choice survives the inspector
+    // closing and reopening within one run.
+    @State private var memoryExpanded = true
 
     var body: some View {
         NavigationSplitView {
@@ -37,7 +40,7 @@ struct ContentView: View {
             if let id = selectedBotID, let bot = store.bots.first(where: { $0.id == id }) {
                 ChatView(bot: bot, showDetails: $showDetails)
                     .inspector(isPresented: $showDetails) {
-                        BotDetails(bot: bot)
+                        BotDetails(bot: bot, expanded: $memoryExpanded)
                     }
             } else {
                 ContentUnavailableView(

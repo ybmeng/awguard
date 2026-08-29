@@ -312,6 +312,7 @@ private struct ThinkingBubble: View {
 struct BotDetails: View {
     @EnvironmentObject var store: AppStore
     let bot: Bot
+    @Binding var expanded: Bool
 
     @State private var editing = false
     @State private var draft = ""
@@ -322,7 +323,12 @@ struct BotDetails: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            if editing { editor } else { reader }
+            // Collapsing only hides the body; `editing` and `draft` stay put,
+            // so expanding again lands back in the untouched editor.
+            if expanded {
+                if editing { editor } else { reader }
+            }
+            Spacer(minLength: 0)
         }
         .background(Palette.chrome)
         .navigationTitle("Details")
@@ -332,11 +338,24 @@ struct BotDetails: View {
 
     private var header: some View {
         HStack {
-            Text("Memory")
-                .font(TypeScale.headerTitle)
-                .foregroundStyle(Palette.primaryText)
+            Button {
+                withAnimation(.easeOut(duration: 0.12)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Palette.secondaryText)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Text("Memory")
+                        .font(TypeScale.headerTitle)
+                        .foregroundStyle(Palette.primaryText)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(expanded ? "Collapse memory" : "Expand memory")
             Spacer()
-            if !editing {
+            if expanded && !editing {
                 Button {
                     draft = memory
                     editing = true
@@ -363,7 +382,7 @@ struct BotDetails: View {
                 } description: {
                     Text("Use the pencil to write some, or let the bot earn its own.")
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: Metric.inspectorSectionMaxHeight)
             } else {
                 ScrollView {
                     Text(memory)
@@ -374,6 +393,7 @@ struct BotDetails: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(Metric.inspectorPad)
                 }
+                .frame(maxHeight: Metric.inspectorSectionMaxHeight)
             }
         }
     }
@@ -393,6 +413,8 @@ struct BotDetails: View {
                     RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
                         .strokeBorder(Palette.fieldStroke, lineWidth: 1)
                 }
+                // TextEditor scrolls itself past the cap.
+                .frame(maxHeight: Metric.inspectorSectionMaxHeight)
             HStack {
                 Spacer()
                 Button("Cancel") { editing = false }
