@@ -12,7 +12,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	bgservices "stdtools/go/std/bg_services"
 )
+
+// Compile-time check that Service satisfies the bg service contract.
+var _ bgservices.Service = (*Service)(nil)
 
 // shortRoot returns a root directly under /tmp: unix socket paths are capped
 // around 104 bytes, and the default test temp dir can exceed that.
@@ -277,6 +282,13 @@ func TestSecondServiceRefusesBusyRoot(t *testing.T) {
 	defer cancel2()
 	if err := svc2.Run(ctx); err == nil || !strings.Contains(err.Error(), "already serving") {
 		t.Errorf("second Run = %v, want already-serving refusal", err)
+	}
+}
+
+func TestVerify(t *testing.T) {
+	svc := newTestService(t, t.TempDir())
+	if err := svc.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify: %v", err)
 	}
 }
 

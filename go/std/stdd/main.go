@@ -40,6 +40,7 @@ import (
 	bgservices "stdtools/go/std/bg_services"
 	"stdtools/go/std/bg_services/artifacts"
 	"stdtools/go/std/bg_services/botnetsvc"
+	"stdtools/go/std/bg_services/calendar"
 	"stdtools/go/std/drive"
 )
 
@@ -77,7 +78,11 @@ func services(root string, interval time.Duration, syncer artifacts.Syncer, bot 
 	if err != nil {
 		return nil, err
 	}
-	return []bgservices.Service{art, botSvc}, nil
+	cal, err := calendar.New(calendar.Config{Root: root, Interval: interval})
+	if err != nil {
+		return nil, err
+	}
+	return []bgservices.Service{art, botSvc, cal}, nil
 }
 
 // loadSyncer builds the Google Drive syncer from the persisted auth config,
