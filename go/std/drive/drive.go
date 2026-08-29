@@ -103,7 +103,10 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("drive: refresh token: %s: %s", resp.Status, body)
+		return "", fmt.Errorf("refresh token: %w", &StatusError{
+			Method: http.MethodPost, URL: c.cfg.TokenURL,
+			Status: resp.Status, StatusCode: resp.StatusCode, Body: string(body),
+		})
 	}
 	var tok struct {
 		AccessToken string `json:"access_token"`
@@ -117,8 +120,39 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	return c.accessToken, nil
 }
 
+// StatusError is a non-2xx Drive API response. It keeps the status code
+// inspectable so callers can tell transient failures (429, 5xx) from
+// permanent ones.
+type StatusError struct {
+	Method     string
+	URL        string
+	Status     string
+	StatusCode int
+	Body       string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("drive: %s %s: %s: %s", e.Method, e.URL, e.Status, e.Body)
+}
+
+// Transient reports whether err looks like a temporary Drive failure — a
+// rate limit (429), a server error (5xx), or a network error — that a retry
+// of the same idempotent operation may fix. Context cancellation is never
+// transient.
+func Transient(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.StatusCode == http.StatusTooManyRequests || se.StatusCode >= 500
+	}
+	var ue *url.Error
+	return errors.As(err, &ue)
+}
+
 // do sends an authenticated request and returns the response, converting
-// non-2xx statuses into errors.
+// non-2xx statuses into *StatusError.
 func (c *Client) do(ctx context.Context, method, rawURL, contentType string, body io.Reader) (*http.Response, error) {
 	tok, err := c.token(ctx)
 	if err != nil {
@@ -139,7 +173,7 @@ func (c *Client) do(ctx context.Context, method, rawURL, contentType string, bod
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		defer resp.Body.Close()
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("drive: %s %s: %s: %s", method, rawURL, resp.Status, msg)
+		return nil, &StatusError{Method: method, URL: rawURL, Status: resp.Status, StatusCode: resp.StatusCode, Body: string(msg)}
 	}
 	return resp, nil
 }

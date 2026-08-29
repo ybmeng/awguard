@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"stdtools/go/std/bg_services/artifacts"
 )
@@ -46,14 +47,44 @@ func (s *ArtifactsSyncer) rootFolderID(ctx context.Context) (string, error) {
 	return id, nil
 }
 
+// syncAttempts and syncBackoff bound the retry loop for transient Drive
+// failures during the remote stages. Vars so tests stay fast.
+var (
+	syncAttempts = 3
+	syncBackoff  = 250 * time.Millisecond
+)
+
+// withRetry runs op, retrying transient Drive failures (429, 5xx, network
+// errors) a bounded number of times with short backoff. Sound because every
+// remote op is idempotent: find-or-create for folders, replace-by-name for
+// uploads.
+func withRetry(ctx context.Context, op func() error) error {
+	for attempt := 1; ; attempt++ {
+		err := op()
+		if err == nil || attempt >= syncAttempts || !Transient(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt) * syncBackoff):
+		}
+	}
+}
+
 // CreateDir implements artifacts.Syncer (stage 2): it creates the Drive
 // folder for one managed dir and returns the folder id as the remote dir.
+// Transient Drive failures are retried a few times before giving up.
 func (s *ArtifactsSyncer) CreateDir(ctx context.Context, id artifacts.ID) (string, error) {
-	root, err := s.rootFolderID(ctx)
-	if err != nil {
-		return "", err
-	}
-	folder, err := s.client.FindOrCreateFolder(ctx, id.String(), root)
+	var folder string
+	err := withRetry(ctx, func() error {
+		root, err := s.rootFolderID(ctx)
+		if err != nil {
+			return err
+		}
+		folder, err = s.client.FindOrCreateFolder(ctx, id.String(), root)
+		return err
+	})
 	if err != nil {
 		return "", fmt.Errorf("drive: create remote dir for %s: %w", id, err)
 	}
@@ -63,30 +94,39 @@ func (s *ArtifactsSyncer) CreateDir(ctx context.Context, id artifacts.ID) (strin
 // SyncFile implements artifacts.Syncer (stage 3): it uploads one file into
 // the remote dir, blocking until Drive acknowledges it, and returns the
 // static reference (Drive file id, size, sha256). Re-syncing replaces remote
-// content instead of duplicating it.
+// content instead of duplicating it, which also makes transient Drive
+// failures safely retryable — each attempt re-reads the file from the start.
 func (s *ArtifactsSyncer) SyncFile(ctx context.Context, remoteDir, localPath string) (artifacts.FileRef, error) {
-	f, err := os.Open(localPath)
-	if err != nil {
-		return artifacts.FileRef{}, fmt.Errorf("drive: open %s: %w", localPath, err)
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return artifacts.FileRef{}, fmt.Errorf("drive: stat %s: %w", localPath, err)
-	}
-
 	name := filepath.Base(localPath)
-	h := sha256.New()
-	fileID, err := s.client.Upload(ctx, name, remoteDir, io.TeeReader(f, h))
+	var ref artifacts.FileRef
+	err := withRetry(ctx, func() error {
+		f, err := os.Open(localPath)
+		if err != nil {
+			return fmt.Errorf("drive: open %s: %w", localPath, err)
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return fmt.Errorf("drive: stat %s: %w", localPath, err)
+		}
+
+		h := sha256.New()
+		fileID, err := s.client.Upload(ctx, name, remoteDir, io.TeeReader(f, h))
+		if err != nil {
+			return err
+		}
+		ref = artifacts.FileRef{
+			Name:     name,
+			RemoteID: fileID,
+			Size:     info.Size(),
+			SHA256:   hex.EncodeToString(h.Sum(nil)),
+		}
+		return nil
+	})
 	if err != nil {
 		return artifacts.FileRef{}, fmt.Errorf("drive: upload %s: %w", name, err)
 	}
-	return artifacts.FileRef{
-		Name:     name,
-		RemoteID: fileID,
-		Size:     info.Size(),
-		SHA256:   hex.EncodeToString(h.Sum(nil)),
-	}, nil
+	return ref, nil
 }
 
 // Fetch implements artifacts.Syncer: it streams a file back from Drive by

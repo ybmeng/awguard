@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"stdtools/go/std/bg_services/artifacts"
 )
@@ -234,7 +235,12 @@ func (d *fakeDrive) byPath(path string) *fakeItem {
 
 func newTestClient(t *testing.T, d *fakeDrive) *Client {
 	t.Helper()
-	srv := httptest.NewServer(d.handler(t))
+	return newTestClientHandler(t, d.handler(t))
+}
+
+func newTestClientHandler(t *testing.T, h http.Handler) *Client {
+	t.Helper()
+	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	c, err := NewClient(Config{
 		ClientID:     "id",
@@ -363,6 +369,118 @@ func TestStoreWithDriveSyncerEndToEnd(t *testing.T) {
 
 	if _, err := syncer2.Fetch(ctx, artifacts.FileRef{Name: "missing.txt"}); err == nil {
 		t.Error("expected error fetching a ref with no remote id")
+	}
+}
+
+// flakyHandler serves h, but answers the next `fail` non-token requests with
+// the given status first.
+type flakyHandler struct {
+	h        http.Handler
+	mu       sync.Mutex
+	fail     int
+	status   int
+	requests int // non-token requests served (failed or not)
+}
+
+func (f *flakyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/token" {
+		f.mu.Lock()
+		f.requests++
+		shouldFail := f.fail > 0
+		if shouldFail {
+			f.fail--
+		}
+		f.mu.Unlock()
+		if shouldFail {
+			http.Error(w, "injected failure", f.status)
+			return
+		}
+	}
+	f.h.ServeHTTP(w, r)
+}
+
+// fastRetries shrinks the retry backoff for the duration of a test.
+func fastRetries(t *testing.T) {
+	t.Helper()
+	old := syncBackoff
+	syncBackoff = time.Millisecond
+	t.Cleanup(func() { syncBackoff = old })
+}
+
+func TestSyncerRetriesTransientDriveFailures(t *testing.T) {
+	fastRetries(t)
+	d := &fakeDrive{}
+	flaky := &flakyHandler{h: d.handler(t), status: http.StatusBadGateway}
+	syncer := NewArtifactsSyncer(newTestClientHandler(t, flaky), "std_artifacts")
+	ctx := context.Background()
+
+	// Stage 2: the first attempt dies on a 502, the retry succeeds.
+	flaky.mu.Lock()
+	flaky.fail = 1
+	flaky.mu.Unlock()
+	remoteDir, err := syncer.CreateDir(ctx, 7)
+	if err != nil {
+		t.Fatalf("CreateDir with one 502 = %v, want retried success", err)
+	}
+
+	// Stage 3: same — one 502, then success, with no duplicate remote copy.
+	local := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(local, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	flaky.mu.Lock()
+	flaky.fail = 1
+	flaky.mu.Unlock()
+	ref, err := syncer.SyncFile(ctx, remoteDir, local)
+	if err != nil {
+		t.Fatalf("SyncFile with one 502 = %v, want retried success", err)
+	}
+	wantSum := sha256.Sum256([]byte("payload"))
+	if ref.SHA256 != hex.EncodeToString(wantSum[:]) || ref.Size != int64(len("payload")) {
+		t.Errorf("ref after retry = %+v, want fresh hash/size", ref)
+	}
+	d.mu.Lock()
+	copies := 0
+	for _, it := range d.files {
+		if it.name == "a.txt" {
+			copies++
+		}
+	}
+	d.mu.Unlock()
+	if copies != 1 {
+		t.Errorf("remote copies of a.txt = %d, want 1", copies)
+	}
+}
+
+func TestSyncerGivesUpAfterBoundedAttemptsAndSkipsPermanentErrors(t *testing.T) {
+	fastRetries(t)
+	ctx := context.Background()
+
+	// Persistent 503: bounded retries, then the error surfaces.
+	d := &fakeDrive{}
+	flaky := &flakyHandler{h: d.handler(t), status: http.StatusServiceUnavailable, fail: 1 << 30}
+	syncer := NewArtifactsSyncer(newTestClientHandler(t, flaky), "std_artifacts")
+	if _, err := syncer.CreateDir(ctx, 1); err == nil {
+		t.Fatal("CreateDir against a dead backend should fail")
+	}
+	flaky.mu.Lock()
+	attempts := flaky.requests
+	flaky.mu.Unlock()
+	if attempts != syncAttempts {
+		t.Errorf("attempts = %d, want %d", attempts, syncAttempts)
+	}
+
+	// Permanent 403: no retry at all.
+	flaky2 := &flakyHandler{h: d.handler(t), status: http.StatusForbidden, fail: 1 << 30}
+	syncer2 := NewArtifactsSyncer(newTestClientHandler(t, flaky2), "std_artifacts")
+	if _, err := syncer2.CreateDir(ctx, 1); err == nil {
+		t.Fatal("CreateDir with 403 should fail")
+	}
+	flaky2.mu.Lock()
+	attempts2 := flaky2.requests
+	flaky2.mu.Unlock()
+	if attempts2 != 1 {
+		t.Errorf("attempts on 403 = %d, want 1 (no retry)", attempts2)
 	}
 }
 

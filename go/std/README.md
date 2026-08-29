@@ -140,7 +140,9 @@ r, err := svc.Open(ctx, id, "report.pdf")       // local, or Drive by remote_id
 `go/std/drive` talks to the Drive v3 API directly — no SDK dependencies, no
 desktop app. Managed dirs mirror to a `std_artifacts/<id>/` folder tree in
 your Drive, uploads are acknowledged before Insert returns, and re-syncs
-replace content instead of duplicating it.
+replace content instead of duplicating it. Transient Drive failures (429,
+5xx, network errors) are retried a few times with short backoff — safe
+because every remote stage is idempotent — before an insert is failed.
 
 1. In the Google Cloud console, create an OAuth client of type **Desktop
    app** (with the Drive API enabled) and download its JSON. The token scope
