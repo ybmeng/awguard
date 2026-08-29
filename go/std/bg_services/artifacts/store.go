@@ -214,11 +214,7 @@ func (st *Store) allocateID() (ID, error) {
 
 	next := st.last + 1
 	path := filepath.Join(st.dir, counterFile)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(next.String()+"\n"), 0o644); err != nil {
-		return 0, fmt.Errorf("artifacts: persist id counter: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := writeFileAtomic(path, []byte(next.String()+"\n")); err != nil {
 		return 0, fmt.Errorf("artifacts: persist id counter: %w", err)
 	}
 	st.last = next

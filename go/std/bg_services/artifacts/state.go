@@ -83,15 +83,36 @@ type marker struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// writeJSONAtomic writes v as JSON via temp file + rename, so readers never
-// observe a partial marker.
+// writeJSONAtomic writes v as JSON via temp file + fsync + rename, so
+// readers never observe a partial marker.
 func writeJSONAtomic(path string, v any) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
+	return writeFileAtomic(path, append(b, '\n'))
+}
+
+// writeFileAtomic writes b to path via temp file + fsync + rename. The fsync
+// before the rename matters: without it a crash can leave the rename durable
+// but the content not, replacing good metadata with an empty file — the
+// content copies already sync, and the metadata they depend on must be at
+// least as durable.
+func writeFileAtomic(path string, b []byte) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
