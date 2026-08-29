@@ -5,7 +5,9 @@ package calendar
 // calls, OPEN marks what's left to settle.
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -85,6 +87,50 @@ type Instance struct {
 	End      time.Time `json:"end"`
 }
 
+// validateEvent checks an event at the write boundary (create and patch):
+// every stored field must parse, so expansion can trust the store. Errors are
+// instructive — they name the offending field and the expected form.
+func validateEvent(ev Event) error {
+	if strings.TrimSpace(ev.Title) == "" {
+		return errors.New("title is required")
+	}
+	if ev.TZ == "" {
+		return errors.New(`tz is required (an IANA id like "America/New_York"); all-day events need it too — it defines which midnight their instances span`)
+	}
+	if _, err := time.LoadLocation(ev.TZ); err != nil {
+		return fmt.Errorf("unknown tz %q (want an IANA id like \"America/New_York\")", ev.TZ)
+	}
+	if ev.Start == "" || ev.End == "" {
+		return errors.New("start and end are required")
+	}
+	startW, err := parseWall(ev.Start, ev.AllDay)
+	if err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	endW, err := parseWall(ev.End, ev.AllDay)
+	if err != nil {
+		return fmt.Errorf("end: %w", err)
+	}
+	if ev.AllDay {
+		if endW.Sub(startW) < 24*time.Hour {
+			return fmt.Errorf("all-day end %q must be at least one day after start %q (end is exclusive: the first day not covered)", ev.End, ev.Start)
+		}
+	} else if !endW.After(startW) {
+		return fmt.Errorf("end %q must be after start %q", ev.End, ev.Start)
+	}
+	if ev.RRULE != "" {
+		if _, err := parseRRULE(ev.RRULE); err != nil {
+			return err
+		}
+	}
+	for _, x := range ev.EXDATE {
+		if _, err := parseWall(x, ev.AllDay); err != nil {
+			return fmt.Errorf("exdate: %w", err)
+		}
+	}
+	return nil
+}
+
 // parseWall parses a stored wall-clock string into the internal carrier: a
 // time.Time constructed in time.UTC. UTC here is NOT a claim about the zone —
 // it is a pure calendar-arithmetic space with no DST, so recurrence iteration
@@ -116,9 +162,10 @@ func formatWall(t time.Time, allDay bool) string {
 //
 // DECISION (nonexistent wall times): a wall time inside a spring-forward gap
 // (e.g. 02:30 on a US DST start date) does not exist in loc; time.Date
-// normalizes it forward past the gap (02:30 EST -> 03:30 EDT). That is the
-// defined behavior, not fought — the alternative (skipping or erroring) loses
-// instances users expect to see.
+// resolves it to a real instant by normalization (for the US gap, 02:30 comes
+// back as 01:30 standard time — the daylight offset applied, then renormalized).
+// That is the defined behavior, not fought — the alternative (skipping or
+// erroring) loses instances users expect to see.
 func anchor(w time.Time, loc *time.Location) time.Time {
 	return time.Date(w.Year(), w.Month(), w.Day(), w.Hour(), w.Minute(), w.Second(), 0, loc)
 }

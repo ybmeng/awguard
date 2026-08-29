@@ -102,10 +102,12 @@ func (s *Store) Get(id EventID) (Event, error) {
 	return scanEvent(row.Scan)
 }
 
-// List returns every event, in creation order (ULID ids sort by time).
+// List returns every event in insertion order. Ordering comes from the rowid,
+// not the id: two ULIDs minted in the same millisecond sort by their random
+// half, and insertion order is the stronger guarantee.
 func (s *Store) List() ([]Event, error) {
 	rows, err := s.db.Query(`SELECT id, title, description, location, all_day, start_wall, end_wall,
-		tz, rrule, exdate, created_at, updated_at FROM events ORDER BY id`)
+		tz, rrule, exdate, created_at, updated_at FROM events ORDER BY rowid`)
 	if err != nil {
 		return nil, fmt.Errorf("list events: %w", err)
 	}
