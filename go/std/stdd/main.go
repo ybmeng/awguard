@@ -34,9 +34,9 @@ import (
 	"syscall"
 	"time"
 
-	bgservices "awguard/go/std/bg_services"
-	"awguard/go/std/bg_services/artifacts"
-	"awguard/go/std/drive"
+	bgservices "stdtools/go/std/bg_services"
+	"stdtools/go/std/bg_services/artifacts"
+	"stdtools/go/std/drive"
 )
 
 // driveRootFolder is the top-level Drive folder managed dirs mirror into.

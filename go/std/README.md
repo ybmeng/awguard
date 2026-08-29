@@ -45,8 +45,7 @@ go build -o stdd ./go/std/stdd
 ./stdd run -dir ~/artifacts -interval 500ms
 ```
 
-No root required — it's a per-user LaunchAgent (`com.std.bgservices`), unlike
-awguard's packet-capture LaunchDaemon.
+No root required — it's a per-user LaunchAgent (`com.std.bgservices`).
 
 ## Quick verification
 

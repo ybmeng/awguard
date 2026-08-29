@@ -19,7 +19,7 @@ import (
 	"sync"
 	"testing"
 
-	"awguard/go/std/bg_services/artifacts"
+	"stdtools/go/std/bg_services/artifacts"
 )
 
 // Compile-time check that ArtifactsSyncer satisfies the artifacts contract.

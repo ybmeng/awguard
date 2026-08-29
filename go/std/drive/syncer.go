@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"awguard/go/std/bg_services/artifacts"
+	"stdtools/go/std/bg_services/artifacts"
 )
 
 // ArtifactsSyncer implements artifacts.Syncer on Google Drive. Managed dirs

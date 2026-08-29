@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	bgservices "awguard/go/std/bg_services"
+	bgservices "stdtools/go/std/bg_services"
 )
 
 // Compile-time check that Service satisfies the bg service contract.
