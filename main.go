@@ -58,6 +58,7 @@ func onReady() {
 
 	cap, err := capture.NewCapture(ifaceName, capture.DefaultSnapLen)
 	if err != nil {
+		cancel()
 		mStatus.SetTitle(fmt.Sprintf("Error: %v", err))
 		log.Printf("awguard: capture failed: %v", err)
 		return
