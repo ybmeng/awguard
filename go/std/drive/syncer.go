@@ -105,20 +105,20 @@ func (s *ArtifactsSyncer) SyncFile(ctx context.Context, remoteDir, localPath str
 			return fmt.Errorf("drive: open %s: %w", localPath, err)
 		}
 		defer f.Close()
-		info, err := f.Stat()
-		if err != nil {
-			return fmt.Errorf("drive: stat %s: %w", localPath, err)
-		}
 
+		// Size and hash both come from the bytes actually streamed to
+		// Drive, so the ref is self-consistent even if the file changes
+		// between attempts.
 		h := sha256.New()
-		fileID, err := s.client.Upload(ctx, name, remoteDir, io.TeeReader(f, h))
+		var cw countingWriter
+		fileID, err := s.client.Upload(ctx, name, remoteDir, io.TeeReader(f, io.MultiWriter(h, &cw)))
 		if err != nil {
 			return err
 		}
 		ref = artifacts.FileRef{
 			Name:     name,
 			RemoteID: fileID,
-			Size:     info.Size(),
+			Size:     cw.n,
 			SHA256:   hex.EncodeToString(h.Sum(nil)),
 		}
 		return nil
@@ -127,6 +127,14 @@ func (s *ArtifactsSyncer) SyncFile(ctx context.Context, remoteDir, localPath str
 		return artifacts.FileRef{}, fmt.Errorf("drive: upload %s: %w", name, err)
 	}
 	return ref, nil
+}
+
+// countingWriter counts the bytes written through it.
+type countingWriter struct{ n int64 }
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.n += int64(len(p))
+	return len(p), nil
 }
 
 // Fetch implements artifacts.Syncer: it streams a file back from Drive by

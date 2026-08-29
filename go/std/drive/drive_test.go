@@ -45,9 +45,10 @@ type fakeItem struct {
 }
 
 var (
-	qName   = regexp.MustCompile(`name = '((?:[^'\\]|\\.)*)'`)
-	qParent = regexp.MustCompile(`'((?:[^'\\]|\\.)*)' in parents`)
-	qMime   = regexp.MustCompile(`mimeType = '([^']*)'`)
+	qName    = regexp.MustCompile(`name = '((?:[^'\\]|\\.)*)'`)
+	qParent  = regexp.MustCompile(`'((?:[^'\\]|\\.)*)' in parents`)
+	qMime    = regexp.MustCompile(`mimeType = '([^']*)'`)
+	qMimeNot = regexp.MustCompile(`mimeType != '([^']*)'`)
 )
 
 func unescapeQ(s string) string {
@@ -78,7 +79,7 @@ func (d *fakeDrive) handler(t *testing.T) http.Handler {
 			return
 		}
 		q := r.URL.Query().Get("q")
-		var name, parent, mimeType string
+		var name, parent, mimeType, mimeNot string
 		if m := qName.FindStringSubmatch(q); m != nil {
 			name = unescapeQ(m[1])
 		}
@@ -87,6 +88,9 @@ func (d *fakeDrive) handler(t *testing.T) http.Handler {
 		}
 		if m := qMime.FindStringSubmatch(q); m != nil {
 			mimeType = m[1]
+		}
+		if m := qMimeNot.FindStringSubmatch(q); m != nil {
+			mimeNot = m[1]
 		}
 
 		d.mu.Lock()
@@ -100,6 +104,9 @@ func (d *fakeDrive) handler(t *testing.T) http.Handler {
 				continue
 			}
 			if mimeType != "" && it.mime != mimeType {
+				continue
+			}
+			if mimeNot != "" && it.mime == mimeNot {
 				continue
 			}
 			files = append(files, map[string]string{"id": it.id, "name": it.name})
@@ -369,6 +376,73 @@ func TestStoreWithDriveSyncerEndToEnd(t *testing.T) {
 
 	if _, err := syncer2.Fetch(ctx, artifacts.FileRef{Name: "missing.txt"}); err == nil {
 		t.Error("expected error fetching a ref with no remote id")
+	}
+}
+
+func TestFindFileExcludesFolders(t *testing.T) {
+	d := &fakeDrive{}
+	c := newTestClient(t, d)
+	ctx := context.Background()
+
+	parent, err := c.FindOrCreateFolder(ctx, "root", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A folder that shares the file's name must never match FindFile.
+	if _, err := c.FindOrCreateFolder(ctx, "a.txt", parent); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := c.FindFile(ctx, "a.txt", parent); err != nil || id != "" {
+		t.Fatalf("FindFile matched a folder: id=%q err=%v", id, err)
+	}
+
+	// Upload therefore creates a real file alongside the folder instead of
+	// patching the folder's "content".
+	fileID, err := c.Upload(ctx, "a.txt", parent, strings.NewReader("data"))
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	d.mu.Lock()
+	it := d.files[fileID]
+	d.mu.Unlock()
+	if it == nil || it.mime == folderMIME || string(it.content) != "data" {
+		t.Fatalf("uploaded item = %+v, want a plain file with content", it)
+	}
+	if id, err := c.FindFile(ctx, "a.txt", parent); err != nil || id != fileID {
+		t.Errorf("FindFile = %q (err=%v), want the file %q", id, err, fileID)
+	}
+}
+
+func TestSyncFileRefSizeMatchesStreamedBytes(t *testing.T) {
+	d := &fakeDrive{}
+	syncer := NewArtifactsSyncer(newTestClient(t, d), "std_artifacts")
+	ctx := context.Background()
+
+	remoteDir, err := syncer.CreateDir(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(t.TempDir(), "grow.txt")
+	if err := os.WriteFile(local, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := syncer.SyncFile(ctx, remoteDir, local)
+	if err != nil {
+		t.Fatalf("SyncFile: %v", err)
+	}
+
+	// The ref must describe exactly the bytes Drive holds: size and sha256
+	// both derived from the streamed content, never a separate Stat.
+	remote := d.byPath("std_artifacts/1/grow.txt")
+	if remote == nil {
+		t.Fatal("no remote copy")
+	}
+	if ref.Size != int64(len(remote.content)) {
+		t.Errorf("ref.Size = %d, remote holds %d bytes", ref.Size, len(remote.content))
+	}
+	sum := sha256.Sum256(remote.content)
+	if ref.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Errorf("ref.SHA256 = %s, remote content hashes to %s", ref.SHA256, hex.EncodeToString(sum[:]))
 	}
 }
 

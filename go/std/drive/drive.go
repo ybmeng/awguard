@@ -198,14 +198,15 @@ func escapeQuery(s string) string {
 }
 
 // findByName returns the id of the first non-trashed item with the given
-// name (and parent / mimeType when non-empty), or "" if none exists.
-func (c *Client) findByName(ctx context.Context, name, parentID, mimeType string) (string, error) {
+// name (and parent / mime condition when non-empty), or "" if none exists.
+// mimeCond is a complete query condition like "mimeType = '...'".
+func (c *Client) findByName(ctx context.Context, name, parentID, mimeCond string) (string, error) {
 	q := fmt.Sprintf("name = '%s' and trashed = false", escapeQuery(name))
 	if parentID != "" {
 		q += fmt.Sprintf(" and '%s' in parents", escapeQuery(parentID))
 	}
-	if mimeType != "" {
-		q += fmt.Sprintf(" and mimeType = '%s'", mimeType)
+	if mimeCond != "" {
+		q += " and " + mimeCond
 	}
 	u := fmt.Sprintf("%s/files?q=%s&fields=files(id,name)&pageSize=1", c.cfg.APIBase, url.QueryEscape(q))
 
@@ -226,13 +227,14 @@ func (c *Client) findByName(ctx context.Context, name, parentID, mimeType string
 // FindFolder returns the id of the named folder under parentID, or "" if it
 // does not exist. Empty parentID searches without a parent constraint.
 func (c *Client) FindFolder(ctx context.Context, name, parentID string) (string, error) {
-	return c.findByName(ctx, name, parentID, folderMIME)
+	return c.findByName(ctx, name, parentID, "mimeType = '"+folderMIME+"'")
 }
 
 // FindFile returns the id of the named non-folder file under parentID, or ""
-// if it does not exist.
+// if it does not exist. Folders are excluded, so a folder sharing the name
+// can never be mistaken for the file (or have its "content" patched).
 func (c *Client) FindFile(ctx context.Context, name, parentID string) (string, error) {
-	return c.findByName(ctx, name, parentID, "")
+	return c.findByName(ctx, name, parentID, "mimeType != '"+folderMIME+"'")
 }
 
 // FindOrCreateFolder returns the id of the named folder under parentID,
