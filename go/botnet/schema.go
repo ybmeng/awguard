@@ -16,16 +16,26 @@ import (
 // ── IDs ─────────────────────────────────────────────────────────────────────
 // Prefixed ULID strings: sortable by creation time, generatable client-side
 // with no coordinator, self-describing in logs. e.g. "bot_01J9X..." .
-type BotID string // "bot_" + ULID
+type BotID string     // "bot_" + ULID
+type SegmentID string // "seg_" + ULID
 
 // ── Bot ──────────────────────────────────────────────────────────────────────
 // Minimal v0: a bot is a system prompt pointed at a model. That's enough to
 // talk to it.
+// DECISION (thread shape): one bot IS one continuous conversation, permanently.
+// A bot does not hold several threads, there is no thread picker, and the
+// sidebar row is the bot. What keeps that single thread bounded is compaction
+// (see Segment), not partitioning.
 // DECISION: chatHistory is NOT a field here — it's referenced via Message,
 // keyed by BotID. Embedding would make every rename rewrite the whole
 // transcript and make "load a bot" pay for megabytes you rarely read.
 // DECISION: Model is a universal ID resolved by go/lib/modelSelector
-// (OpenRouter routing; DeepSeek V4 and GLM 5.3 Flash to start).
+// (OpenRouter routing; DeepSeek V4 and GLM 5.3 Flash to start). Unknown IDs are
+// rejected on write (create, patch) and never on read, so a bot persisted with
+// a model that has since left the roster still lists and is repairable via
+// PATCH rather than being unreadable. ModelValid reports that condition.
+// DECISION: the open segment is NOT denormalized here — it is derived as the
+// bot's segment with a zero SealedAt.
 // DEFERRED (tools): userspace will design tools later; nothing here yet.
 type Bot struct {
 	ID           BotID                 `json:"id"`
@@ -33,20 +43,130 @@ type Bot struct {
 	CreatedAt    time.Time             `json:"createdAt"`
 	SystemPrompt string                `json:"systemPrompt"`
 	Model        modelselector.ModelID `json:"model"` // e.g. modelselector.DeepSeekV4.ID
+
+	// List metadata, denormalized so the sidebar draws a row per bot without
+	// fetching every conversation. Maintained on append; never authored.
+	LastMessageAt   time.Time `json:"lastMessageAt"`   // zero until the first message
+	LastMessageText string    `json:"lastMessageText"` // preview, whitespace collapsed
+	// ReadAt is a watermark, not a timestamp of the act of reading: the bot is
+	// unread when LastMessageAt is after it, and marking it read copies
+	// LastMessageAt rather than the clock, so a message arriving mid-read cannot
+	// be swallowed. Upgrading an existing database stamps every bot read, since
+	// an upgrade is not new activity.
+	ReadAt time.Time `json:"readAt"`
+
+	// ModelValid is derived at read time, not stored: whether Model still
+	// resolves in the modelSelector roster. False means "repair me with PATCH".
+	ModelValid bool `json:"modelValid"`
+
+	// Version is derived at read time, not stored: an opaque hash of the
+	// AUTHORED fields (DisplayName, SystemPrompt, Model). A PATCH carrying it
+	// in If-Match fails with 412 when the bot was edited in between, so two
+	// clients editing a system prompt conflict instead of silently
+	// last-write-winning. Message traffic never moves it — list metadata is
+	// maintained, not authored — so chat cannot spuriously block an edit.
+	Version string `json:"version"`
 }
+
+// ── Segment ──────────────────────────────────────────────────────────────────
+// The one conversation is stored as a chain of segments. Exactly one segment is
+// open at a time (zero SealedAt) and new messages append to it. Compaction seals
+// the open segment and opens a fresh empty one.
+//
+// The summary is CUMULATIVE, and that is the load-bearing detail. Sealing
+// segment N folds the previous segment's Summary together with segment N's raw
+// messages into one new summary covering everything so far. The model context is
+// therefore SystemPrompt + the newest sealed Summary + the open segment's raw
+// messages — exactly one summary, never a growing pile of them, so context stays
+// constant-size however many times a bot is compacted. Older summaries are
+// retained as history for the UI and never sent to the model.
+//
+// Compaction never deletes messages: sealed segments keep their rows and stay
+// fully readable in the transcript, they just stop being sent to the model.
+// Compacting an open segment with no messages is a no-op — no empty sealed
+// segment is created.
+//
+// DECISION (compaction trigger): manual only. A Compact button in the details
+// panel, no automatic threshold, so nothing fires behind the user's back. An
+// automatic trigger can be layered on later without changing this shape, since
+// it would just call the same endpoint.
+//
+// OPEN (editable summaries): a cumulative summary is the bot's whole memory of
+// everything before the open segment, so a bad one poisons it permanently with
+// no way back. Decide whether Summary is user-editable and whether a seal can be
+// undone before building the panel.
+//
+// OPEN (what survives): this keeps only a text Summary. The intent is that
+// durable state lives outside the transcript entirely — memory, skills, files in
+// std_artifacts — with the transcript as scratchpad. That layer is not designed
+// yet and is deliberately not modelled here; Summary is the interim.
+type Segment struct {
+	ID       SegmentID `json:"id"`
+	BotID    BotID     `json:"botId"`
+	Index    int       `json:"index"` // 0-based position in the chain
+	OpenedAt time.Time `json:"openedAt"`
+	SealedAt time.Time `json:"sealedAt"` // zero while open
+	Summary  string    `json:"summary"`  // set when sealed; "" while open
+}
+
+// IsOpen reports whether this is the segment new messages append to.
+func (s Segment) IsOpen() bool { return s.SealedAt.IsZero() }
 
 // ── Message ───────────────────────────────────────────────────────────────────
 // Chat history, referenced by bot. The message is the sync/query unit.
+//
+// DECISION (identity): ids stay "msg_" + ULID rather than becoming UUIDv4. They
+// are already unique, so what a swap would actually buy is nothing, and ULID
+// additionally sorts by creation time. Note that the transcript's order comes
+// from the rowid, not the id — insertion order is the stronger guarantee, since
+// two ULIDs minted in the same millisecond are ordered by their random half
+// rather than by which was written first. What the sortable id buys is that a
+// client can order and diff messages locally, without a round trip, which
+// optimistic rendering needs. Lookup by id was the part genuinely missing, and
+// that is what got added.
+//
+// DECISION (ordering under async): a reply can never be appended after a later
+// user turn, so no explicit reply-to reference is needed and Message keeps the
+// shape below. Three things make it impossible rather than merely unlikely:
+// at most one awaiting message per bot is a storage invariant (a partial unique
+// index, not a convention); a send arriving while one is in flight is refused
+// rather than queued, so no second user turn can be interleaved; and the reply
+// is appended in the same transaction that settles the user turn, so the bot is
+// never observably free with its reply still missing. Queueing instead of
+// refusing would have broken this AND fed the model a prompt in which the second
+// user turn preceded the reply to the first.
+//
 // OPEN (topology): Role assumes user<->bot only. If bots talk to each OTHER,
 // replace Role with explicit From/To (BotID or a "user" sentinel). That is a
 // foundational change, not a bolt-on — decide before scaffolding.
 type Message struct {
-	ID      string    `json:"id"` // "msg_" + ULID → globally ordered
-	BotID   BotID     `json:"botId"`
-	Role    string    `json:"role"` // "user" | "bot" | "system"
-	Content string    `json:"content"`
-	SentAt  time.Time `json:"sentAt"`
+	ID        string        `json:"id"` // "msg_" + ULID → sortable by creation time
+	BotID     BotID         `json:"botId"`
+	SegmentID SegmentID     `json:"segmentId"`
+	Role      string        `json:"role"` // "user" | "bot" | "system"
+	Content   string        `json:"content"`
+	SentAt    time.Time     `json:"sentAt"`
+	Status    MessageStatus `json:"status"`
+	Error     string        `json:"error"` // set only when Status is StatusFailed
 }
+
+// MessageStatus distinguishes a user turn still awaiting a reply from one whose
+// model call failed, so a send in flight is visible and a stranded one is
+// retryable instead of the two looking identical.
+//
+// Sending is asynchronous: the request persists the user turn as StatusAwaiting
+// and returns immediately, and the model call runs in the background. Awaiting
+// is therefore a real, observable state that outlives a request, which is what
+// makes both of the invariants above necessary — and what makes a process death
+// mid-reply something the store has to recover from, since the goroutine that
+// would have settled the message dies with it.
+type MessageStatus string
+
+const (
+	StatusSent     MessageStatus = "sent"     // settled: a reply followed, or this is one
+	StatusAwaiting MessageStatus = "awaiting" // user turn, model call in flight
+	StatusFailed   MessageStatus = "failed"   // user turn, model call failed; Error is set
+)
 
 // ── PrivateBotNet ─────────────────────────────────────────────────────────────
 // Top-level owner: which bots exist. Shared resources (tools, membership) land
@@ -59,8 +179,43 @@ type PrivateBotNet struct {
 	Bots []BotID `json:"bots"`
 }
 
-// Shape: Net → Bots → Messages. Everything joins by ID reference, so each type
-// is an independent storage/sync/CRUD unit.
+// ── Prompt ────────────────────────────────────────────────────────────────────
+// The model context for one turn, assembled by the server and handed to the LLM.
+// Making it a type rather than a message slice is what keeps the cumulative-
+// summary invariant checkable: Summary is one string, so there is nowhere to put
+// a second one.
+type Prompt struct {
+	Bot      Bot       // SystemPrompt and Model come from here
+	Summary  string    // newest sealed segment's cumulative summary; "" if never compacted
+	Messages []Message // the OPEN segment's raw messages only
+}
+
+// DECISION (multi-client sync): built bespoke, borrowing JMAP's model and
+// vocabulary rather than adopting any protocol — reasoning, rule-outs and the
+// call-site oracle live in DESIGN-sync.md. What shipped, in order:
+//   - Single-writer lock: flock(2) sidecar taken in Open, released on Close
+//     (lock.go); cmd/botnetd binds its port before Open, matching botnetsvc.
+//     The startup sweep is unreachable while another process holds the DB.
+//   - Change feed: change_log table (AUTOINCREMENT seq, never bare rowid)
+//     populated by AFTER INSERT/UPDATE/DELETE triggers on bots/messages/
+//     segments, so capture is a schema property, not a Go convention. Read via
+//     GET /v1/changes?since={opaque token} → ids-only buckets + tombstones,
+//     coalesced (rules on ChangesSince); unknown/pruned cursor → 410
+//     cannotCalculateChanges; X-BotNet-State on collection GETs;
+//     GET /v1/messages?ids=… batch fetch. One global cursor with per-type
+//     buckets, not three tokens — per-type can layer on later.
+//   - Write-path hardening: optional client-supplied "msg_" ULID on POST makes
+//     sends idempotent (replay returns the stored row, no second turn; wrong
+//     bot → 409); If-Match with the derived Bot.Version on PATCH → 412.
+//   - Long-poll: ?wait=30s on /v1/changes, same endpoint, cursor and payload
+//     as the plain poll.
+//
+// DEFERRED (token streaming): sequenced BEHIND the feed, per DESIGN-sync.md
+// §7 — the feed says message M is awaiting, a token channel streams M, the
+// feed's settle is authoritative. Not started.
+
+// Shape: Net → Bots → Segments → Messages. Everything joins by ID reference, so
+// each type is an independent storage/sync/CRUD unit.
 //
 // DECISION (persistence): SQLite for everything. If performance degrades,
 // revisit and offload then — not before.

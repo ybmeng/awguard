@@ -3,7 +3,8 @@
 //
 // Usage:
 //
-//	stdd run -dir DIR [-interval D]   run all services in the foreground (what launchd executes)
+//	stdd run -dir DIR [-interval D] [-botnet-addr A] [-botnet-db F]
+//	                                  run all services in the foreground (what launchd executes)
 //	stdd insert -dir DIR FILE...      move files into a managed artifact dir, print its id
 //	stdd ls -dir DIR                  list managed dirs with their state-machine stage
 //	stdd cat -dir DIR ID NAME         stream one managed file (local or Drive fallback)
@@ -12,8 +13,10 @@
 // insert, ls and cat route through the installed mac service when it is
 // running (via the unix socket in the root dir), so the service stays the
 // store's single writer; without a running service they operate directly.
+//
 //	stdd verify                       fast self-check of every service, then exit
-//	stdd install -dir DIR             install + start the macOS LaunchAgent
+//	stdd install -dir DIR [-botnet-addr A] [-botnet-db F]
+//	                                  install + start the macOS LaunchAgent
 //	stdd uninstall                    stop + remove the LaunchAgent
 //	stdd start | stop | restart       control the installed service
 //	stdd status                       show launchd state for the service
@@ -36,6 +39,7 @@ import (
 
 	bgservices "stdtools/go/std/bg_services"
 	"stdtools/go/std/bg_services/artifacts"
+	"stdtools/go/std/bg_services/botnetsvc"
 	"stdtools/go/std/drive"
 )
 
@@ -55,17 +59,25 @@ Commands:
   install -dir DIR             install + start the macOS LaunchAgent
   uninstall                    stop + remove the LaunchAgent
   start | stop | restart       control the installed service
-  status                       show launchd state for the service`)
+  status                       show launchd state for the service
+
+Botnet flags (run, install):
+  -botnet-addr A               botnet listen address (default $BOTNET_ADDR, else 127.0.0.1:8730)
+  -botnet-db F                 botnet SQLite file (default $BOTNET_DB, else ~/.botnet/net.db)`)
 	os.Exit(2)
 }
 
 // services builds the full roster of std background services.
-func services(root string, interval time.Duration, syncer artifacts.Syncer) ([]bgservices.Service, error) {
+func services(root string, interval time.Duration, syncer artifacts.Syncer, bot botnetsvc.Config) ([]bgservices.Service, error) {
 	art, err := artifacts.New(artifacts.Config{Root: root, Interval: interval, Syncer: syncer})
 	if err != nil {
 		return nil, err
 	}
-	return []bgservices.Service{art}, nil
+	botSvc, err := botnetsvc.New(bot)
+	if err != nil {
+		return nil, err
+	}
+	return []bgservices.Service{art, botSvc}, nil
 }
 
 // loadSyncer builds the Google Drive syncer from the persisted auth config,
@@ -139,8 +151,18 @@ func runFlags(name string) (*flag.FlagSet, *string, *time.Duration) {
 	return fs, dir, interval
 }
 
+// botnetFlags registers the botnet service's flags on fs. Their defaults are
+// the env-resolved values, so BOTNET_ADDR / BOTNET_DB still win over the
+// built-in defaults and an explicit flag wins over both.
+func botnetFlags(fs *flag.FlagSet) (addr, db *string) {
+	addr = fs.String("botnet-addr", botnetsvc.DefaultAddr(), "botnet listen address")
+	db = fs.String("botnet-db", botnetsvc.DefaultDBPath(), "botnet SQLite file")
+	return addr, db
+}
+
 func cmdRun(args []string) error {
 	fs, dir, interval := runFlags("run")
+	botnetAddr, botnetDB := botnetFlags(fs)
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("-dir is required")
@@ -150,7 +172,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	svcs, err := services(*dir, *interval, syncer)
+	svcs, err := services(*dir, *interval, syncer, botnetsvc.Config{Addr: *botnetAddr, DBPath: *botnetDB})
 	if err != nil {
 		return err
 	}
@@ -184,7 +206,7 @@ func cmdVerify(args []string) error {
 	}
 	defer os.RemoveAll(tmp)
 
-	svcs, err := services(tmp, artifacts.DefaultInterval, artifacts.NopSyncer{})
+	svcs, err := services(tmp, artifacts.DefaultInterval, artifacts.NopSyncer{}, botnetsvc.Config{})
 	if err != nil {
 		return err
 	}
@@ -264,11 +286,12 @@ func cmdInsert(args []string) error {
 
 func cmdInstall(args []string) error {
 	fs, dir, interval := runFlags("install")
+	botnetAddr, botnetDB := botnetFlags(fs)
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("-dir is required")
 	}
-	return installService(*dir, *interval)
+	return installService(*dir, *interval, *botnetAddr, *botnetDB)
 }
 
 // cmdLs lists every managed dir with its state-machine stage, through the

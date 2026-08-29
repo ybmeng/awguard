@@ -11,6 +11,7 @@ package main
 
 import (
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +22,17 @@ import (
 
 func main() {
 	log.SetFlags(0)
+
+	// Bind before opening the store, matching botnetsvc: a botnetd that loses
+	// the race for the port must exit without having touched — and swept — the
+	// running server's database. The flock in Open enforces the same rule; this
+	// keeps the failure reading "address already in use" instead of "database
+	// locked" when the port is the real contention.
+	addr := env("BOTNET_ADDR", "127.0.0.1:8730")
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("botnetd: %v", err)
+	}
 
 	dbPath := env("BOTNET_DB", filepath.Join(home(), ".botnet", "net.db"))
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
@@ -42,9 +54,8 @@ func main() {
 	}
 	srv.ConfigureKeyPersistence(keyPath)
 
-	addr := env("BOTNET_ADDR", "127.0.0.1:8730")
 	log.Printf("botnetd: serving on http://%s  (db: %s)", addr, dbPath)
-	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
+	if err := http.Serve(ln, srv.Handler()); err != nil {
 		log.Fatalf("botnetd: %v", err)
 	}
 }

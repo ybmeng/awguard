@@ -10,6 +10,7 @@ verifiable.
 go/std/
   bg_services/            Service contract + supervisor loop
     artifacts/            std_artifacts: the managed artifact store
+    botnetsvc/            botnet: the PrivateBotNet HTTP server, hosted in-process
   drive/                  minimal stdlib-only Google Drive v3 client + syncer
   stdd/                   the service binary launchd runs, plus its control CLI
 ```
@@ -33,6 +34,9 @@ go build -o stdd ./go/std/stdd
 # Install + start as a LaunchAgent (runs at login, kept alive, logs to
 # ~/Library/Logs/stdd.log)
 ./stdd install -dir ~/artifacts
+
+# The botnet server's address and database can be pinned at install time
+./stdd install -dir ~/artifacts -botnet-addr 127.0.0.1:8730 -botnet-db ~/.botnet/net.db
 
 # Control it
 ./stdd status
@@ -153,6 +157,53 @@ replace content instead of duplicating it.
 
 From then on `stdd run` and `stdd insert` force-sync through Drive
 automatically.
+
+## botnet
+
+The PrivateBotNet server, hosted in-process by `stdd` instead of being started
+by hand. It owns all bot state in one SQLite file and makes the OpenRouter
+calls; the UI is a thin HTTP client. Installing the mac service means the API
+is up at login, restarted with backoff if it ever dies.
+
+| Setting | Flag (`run`, `install`) | Env | Default |
+| --- | --- | --- | --- |
+| Listen address | `-botnet-addr` | `BOTNET_ADDR` | `127.0.0.1:8730` |
+| SQLite file | `-botnet-db` | `BOTNET_DB` | `~/.botnet/net.db` |
+| OpenRouter key | — | `OPENROUTER_API_KEY` | `~/.config/botnet/openrouter.txt` |
+
+A flag beats the env var, which beats the default. The plist carries the flags
+because a LaunchAgent inherits none of your shell environment.
+
+No key is not a failure: the server starts, the UI works, and only chat calls
+fail. Set one at runtime with `POST /v1/config` (`{"openRouterKey": "..."}`) —
+the server persists it to the key file at 0600, so it survives a restart.
+
+Only one process can hold the port. Once installed, `stdd` owns
+`127.0.0.1:8730` from login onward, and `./botnetd` — still the standalone dev
+entry point, reading the same env vars and the same database — will fail to
+bind while the daemon runs. `stdd status` reports two independent facts,
+launchd's view of the agent and whether the port answers, so it stays useful
+even when the agent is not installed and a hand-run `botnetd` is the one
+holding it:
+
+```bash
+./stdd status
+# ...launchctl output...
+# stdd: botnet answering on http://127.0.0.1:8730 — that port is taken, so a
+# second listener (./botnetd by hand) cannot bind it
+```
+
+The service loses that race cleanly: it claims the port before it opens the
+database, so a `stdd` that cannot bind never touches `~/.botnet/net.db`, and
+`Supervise` retries it with backoff. The reason lands in
+`~/Library/Logs/stdd.log`, naming the address.
+
+Use `stdd stop` to hand the port back to `botnetd`, or `-botnet-addr` to move
+the daemon's copy aside.
+
+`Verify` builds a complete server — store, key-less LLM, routed handler — over
+a throwaway database and serves a real `GET /v1/bots` through it. It never
+touches your `~/.botnet` and needs no key or network.
 
 ## Adding a new service
 

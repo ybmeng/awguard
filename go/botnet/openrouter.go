@@ -13,17 +13,23 @@ import (
 	modelselector "stdtools/go/lib/modelSelector"
 )
 
-// LLM turns a bot plus its conversation into the next assistant reply. The
-// server depends on this interface, not on OpenRouter directly, so tests inject
-// a fake and the chat round-trip is verifiable offline.
+// LLM turns an assembled Prompt into the next assistant reply, and folds a
+// sealed segment into a cumulative summary. The server depends on this
+// interface, not on OpenRouter directly, so tests inject a fake and both the
+// chat round-trip and compaction are verifiable offline.
 type LLM interface {
-	Complete(ctx context.Context, bot Bot, history []Message) (string, error)
+	// Complete answers the next turn. The prompt carries at most ONE summary;
+	// that is the invariant compaction exists to preserve.
+	Complete(ctx context.Context, p Prompt) (string, error)
+	// Summarize folds previous (the summary of everything before this segment,
+	// "" the first time) together with this segment's raw messages into a single
+	// summary covering everything so far.
+	Summarize(ctx context.Context, bot Bot, previous string, msgs []Message) (string, error)
 }
 
 // OpenRouter is the production LLM: a stdlib-only OpenRouter chat-completions
-// client. No streaming, no compaction — the full history goes up each turn.
-// The key can be set at runtime (via the server's config endpoint), so access
-// to it is guarded.
+// client. No streaming. The key can be set at runtime (via the server's config
+// endpoint), so access to it is guarded.
 type OpenRouter struct {
 	mu     sync.RWMutex
 	apiKey string
@@ -55,20 +61,28 @@ func (o *OpenRouter) key() string {
 	return o.apiKey
 }
 
-func (o *OpenRouter) Complete(ctx context.Context, bot Bot, history []Message) (string, error) {
-	apiKey := o.key()
-	if apiKey == "" {
-		return "", fmt.Errorf("openrouter: no API key configured — set it in the app's Settings")
+// wireMsg is one chat-completions message.
+type wireMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// summaryPreamble introduces the one cumulative summary in the system turn. It
+// is labelled so the model treats it as recalled history rather than as
+// instructions from the user.
+const summaryPreamble = "Summary of the conversation so far (everything before the messages that follow):\n\n"
+
+func (o *OpenRouter) Complete(ctx context.Context, p Prompt) (string, error) {
+	msgs := make([]wireMsg, 0, len(p.Messages)+2)
+	if p.Bot.SystemPrompt != "" {
+		msgs = append(msgs, wireMsg{Role: "system", Content: p.Bot.SystemPrompt})
 	}
-	type wireMsg struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
+	// Exactly one summary, however many times this bot has been compacted:
+	// Prompt.Summary is a single string, so there is nowhere for a second to go.
+	if p.Summary != "" {
+		msgs = append(msgs, wireMsg{Role: "system", Content: summaryPreamble + p.Summary})
 	}
-	msgs := make([]wireMsg, 0, len(history)+1)
-	if bot.SystemPrompt != "" {
-		msgs = append(msgs, wireMsg{Role: "system", Content: bot.SystemPrompt})
-	}
-	for _, m := range history {
+	for _, m := range p.Messages {
 		switch m.Role {
 		case "user":
 			msgs = append(msgs, wireMsg{Role: "user", Content: m.Content})
@@ -78,9 +92,51 @@ func (o *OpenRouter) Complete(ctx context.Context, bot Bot, history []Message) (
 			// local status/error notes are never sent to the model
 		}
 	}
+	return o.chat(ctx, p.Bot.Model, msgs)
+}
 
+// compactInstruction asks for a replacement summary rather than an addendum —
+// the output must stand alone, because it is the only memory the bot keeps of
+// everything before the next segment.
+const compactInstruction = `You maintain a running summary of a long conversation.
+
+Rewrite the summary so it covers EVERYTHING so far: the previous summary and the new messages, folded into one. Do not append a section and do not refer to "the previous summary"; produce a single self-contained summary that replaces it.
+
+Keep what the conversation would be worse off forgetting: decisions and their reasons, facts about the user, open questions, commitments, names and identifiers. Drop pleasantries and anything already superseded. Write prose or terse bullets, no preamble, no sign-off.`
+
+func (o *OpenRouter) Summarize(ctx context.Context, bot Bot, previous string, msgs []Message) (string, error) {
+	var b strings.Builder
+	if previous != "" {
+		b.WriteString("PREVIOUS SUMMARY:\n")
+		b.WriteString(previous)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("NEW MESSAGES:\n")
+	for _, m := range msgs {
+		switch m.Role {
+		case "user":
+			b.WriteString("User: ")
+		case "bot":
+			b.WriteString("Assistant: ")
+		default:
+			continue
+		}
+		b.WriteString(m.Content)
+		b.WriteString("\n\n")
+	}
+	return o.chat(ctx, bot.Model, []wireMsg{
+		{Role: "system", Content: compactInstruction},
+		{Role: "user", Content: b.String()},
+	})
+}
+
+func (o *OpenRouter) chat(ctx context.Context, model modelselector.ModelID, msgs []wireMsg) (string, error) {
+	apiKey := o.key()
+	if apiKey == "" {
+		return "", fmt.Errorf("openrouter: no API key configured — set it in the app's Settings")
+	}
 	body, err := json.Marshal(map[string]any{
-		"model":    openRouterSlug(bot.Model),
+		"model":    openRouterSlug(model),
 		"messages": msgs,
 	})
 	if err != nil {

@@ -3,6 +3,7 @@ package botnet
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"strings"
 	"time"
 )
 
@@ -56,4 +57,21 @@ func newID(prefix string) string {
 	out[25] = crockford[buf[15]&31]
 
 	return prefix + string(out[:])
+}
+
+// validMessageID reports whether a client-supplied message id has exactly the
+// shape newID emits: "msg_" + 26 uppercase Crockford base32 characters. It is
+// client input reaching a primary key, so the check is strict — nothing
+// looser than what the server itself would mint.
+func validMessageID(id string) bool {
+	const prefix = "msg_"
+	if len(id) != len(prefix)+26 || !strings.HasPrefix(id, prefix) {
+		return false
+	}
+	for _, c := range id[len(prefix):] {
+		if !strings.ContainsRune(crockford, c) {
+			return false
+		}
+	}
+	return true
 }
