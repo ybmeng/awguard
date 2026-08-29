@@ -11,6 +11,9 @@ final class AppStore: ObservableObject {
     @Published private(set) var conversations: [String: [Message]] = [:] // botId → messages
     @Published private(set) var segments: [String: [Segment]] = [:]      // botId → chain
     @Published private(set) var models: [ModelOption] = ModelOption.roster
+    // nil until fetched, and stays nil on a server without the route, so the
+    // inspector simply omits its Tools section on an older botnetd.
+    @Published private(set) var tools: [ToolDefinition]?
     @Published var pendingBotIDs: Set<String> = []
     @Published var compactingBotIDs: Set<String> = []
     @Published var lastError: String?
@@ -108,6 +111,23 @@ final class AppStore: ObservableObject {
             lastError = error.localizedDescription
         }
     }
+
+    // The tool list is deploy-static — it changes only with the server binary —
+    // so one fetch per run is enough. A 404 pins tools nil for the run; a
+    // transient failure leaves it retryable on the next inspector appearance.
+    func loadTools() async {
+        guard tools == nil, !toolsUnavailable else { return }
+        do {
+            tools = try await api.listTools()
+        } catch {
+            guard !APIClient.isUnimplemented(error) else {
+                toolsUnavailable = true
+                return
+            }
+            lastError = error.localizedDescription
+        }
+    }
+    private var toolsUnavailable = false
 
     func compact(_ bot: Bot) async {
         guard !compactingBotIDs.contains(bot.id) else { return }

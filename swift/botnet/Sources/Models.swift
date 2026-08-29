@@ -108,6 +108,83 @@ struct Segment: Identifiable, Codable, Hashable {
     var isOpen: Bool { sealed == nil }
 }
 
+// Decoded from GET /v1/tools: the exact tool definitions the server sends the
+// model with every turn, in OpenAI function-calling shape
+// ({type, function: {name, description, parameters}}). Shown so the user can
+// read precisely what the model is told; nothing here is paraphrased.
+struct ToolDefinition: Identifiable, Decodable, Hashable {
+    var name: String
+    /// Multiline prose, kept verbatim — line breaks and all.
+    var description: String
+    /// The parameters JSON Schema, re-indented for display. Decoded opaquely
+    /// (the schema's shape will evolve), never into typed fields.
+    var parametersJSON: String
+
+    var id: String { name }
+
+    private enum CodingKeys: String, CodingKey { case function }
+    private enum FunctionKeys: String, CodingKey { case name, description, parameters }
+
+    init(from decoder: Decoder) throws {
+        let outer = try decoder.container(keyedBy: CodingKeys.self)
+        let fn = try outer.nestedContainer(keyedBy: FunctionKeys.self, forKey: .function)
+        name = try fn.decode(String.self, forKey: .name)
+        description = try fn.decode(String.self, forKey: .description)
+        parametersJSON = try fn.decode(JSONValue.self, forKey: .parameters).prettyPrinted
+    }
+}
+
+/// Arbitrary JSON decoded without a schema, for server fields whose shape is
+/// deliberately not part of the app's contract. Display-only: it re-serializes
+/// to indented text rather than offering typed access.
+enum JSONValue: Decodable, Hashable {
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case null
+
+    // Bool must be probed before Double: JSON true/false may otherwise bridge
+    // through NSNumber and decode as 1/0.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { self = .null }
+        else if let b = try? c.decode(Bool.self) { self = .bool(b) }
+        else if let n = try? c.decode(Double.self) { self = .number(n) }
+        else if let s = try? c.decode(String.self) { self = .string(s) }
+        else if let a = try? c.decode([JSONValue].self) { self = .array(a) }
+        else if let o = try? c.decode([String: JSONValue].self) { self = .object(o) }
+        else {
+            throw DecodingError.dataCorruptedError(
+                in: c, debugDescription: "unrecognized JSON value")
+        }
+    }
+
+    private var foundation: Any {
+        switch self {
+        case .object(let o): return o.mapValues(\.foundation)
+        case .array(let a): return a.map(\.foundation)
+        case .string(let s): return s
+        // Integral doubles go back out as integers so `"maxLength": 3` doesn't
+        // display as 3.0 after the round trip.
+        case .number(let n): return n == n.rounded() && abs(n) < 1e15 ? Int64(n) as Any : n
+        case .bool(let b): return b
+        case .null: return NSNull()
+        }
+    }
+
+    var prettyPrinted: String {
+        let obj = foundation
+        guard JSONSerialization.isValidJSONObject(obj),
+              let data = try? JSONSerialization.data(
+                withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
+              let text = String(data: data, encoding: .utf8)
+        else { return String(describing: obj) }
+        return text
+    }
+}
+
 // Decoded from GET /v1/models ({name, id}); mirrors go/lib/modelSelector.
 struct ModelOption: Identifiable, Codable, Hashable {
     var name: String

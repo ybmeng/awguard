@@ -98,6 +98,9 @@ enum TypeScale {
     /// Per-message metadata under a bubble: ids and status, deliberately small
     /// and monospaced so an id is readable and never competes with the message.
     static let messageMeta = Font.system(size: 10, design: .monospaced)
+    /// Verbatim machine text shown as a block (a tool's parameters schema):
+    /// monospaced, one step up from messageMeta so indentation stays legible.
+    static let codeBlock = Font.system(size: 11, design: .monospaced)
 }
 
 // MARK: - Avatar

@@ -24,6 +24,9 @@ struct Snapshot {
 
         let store = AppStore()
         await store.refresh()
+        // BotDetails fetches tools in a .task, but that would race the few
+        // run-loop turns the capture allows; fetch before rendering instead.
+        await store.loadTools()
 
         guard let bot = store.bots.first else {
             fail("no bots at \(ProcessInfo.processInfo.environment["BOTNET_API"] ?? "the default port") — is the demo server running?")

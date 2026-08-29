@@ -83,6 +83,48 @@ struct DecodeCheck {
             }
         }
 
+        // GET /v1/tools carries what the model is literally told: the multiline
+        // description must survive verbatim and the parameters schema — decoded
+        // opaquely, since its shape will evolve — must re-indent to real JSON.
+        let tools = Data("""
+        [{"type":"function","function":{"name":"memory","description":"Replace your memory document.\\n\\nWrite the full document each time; it is not appended.","parameters":{"type":"object","properties":{"content":{"type":"string","description":"the new memory document"}},"required":["content"],"maxLength":3}}}]
+        """.utf8)
+        await check("ToolDefinition: verbatim description, opaque pretty schema") {
+            let list = try decoder.decode([ToolDefinition].self, from: tools)
+            guard list.count == 1, let t = list.first,
+                  t.name == "memory",
+                  t.description == "Replace your memory document.\n\nWrite the full document each time; it is not appended."
+            else {
+                throw NSError(domain: "decode-check", code: 6, userInfo: [
+                    NSLocalizedDescriptionKey: "tool decoded wrong: \(list)",
+                ])
+            }
+            guard t.parametersJSON.contains("\"required\""),
+                  t.parametersJSON.contains("\n"),        // pretty-printed, not one line
+                  t.parametersJSON.contains("\"maxLength\""),
+                  !t.parametersJSON.contains("3.0")        // integral survives as 3
+            else {
+                throw NSError(domain: "decode-check", code: 7, userInfo: [
+                    NSLocalizedDescriptionKey: "schema not re-indented as expected: \(t.parametersJSON)",
+                ])
+            }
+        }
+        await check("empty tool list decodes") {
+            _ = try decoder.decode([ToolDefinition].self, from: Data("[]".utf8))
+        }
+        // The absent-route path: an older botnetd 404s /v1/tools, which the app
+        // must read as "hide the section", never as an error.
+        await check("404 maps to isUnimplemented") {
+            let err = APIClient.ServerError(message: "not found", status: 404, body: Data())
+            guard APIClient.isUnimplemented(err), !APIClient.isUnimplemented(
+                APIClient.ServerError(message: "boom", status: 500, body: Data()))
+            else {
+                throw NSError(domain: "decode-check", code: 8, userInfo: [
+                    NSLocalizedDescriptionKey: "isUnimplemented misclassifies statuses",
+                ])
+            }
+        }
+
         // A failed decode must say which endpoint produced it; the bare
         // DecodingError alert ("The data couldn't be read…") names nothing.
         await check("decode failure names the endpoint") {
@@ -107,6 +149,10 @@ struct DecodeCheck {
             let bots = try await api.listBots()
             print("PASS live GET /v1/bots (\(bots.count) bots)")
             await check("live GET /v1/models") { _ = try await api.listModels() }
+            await check("live GET /v1/tools (404 = older server, tolerated)") {
+                do { _ = try await api.listTools() }
+                catch let e where APIClient.isUnimplemented(e) {}
+            }
             await check("live GET /v1/config") { _ = try await api.hasKey() }
             for b in bots {
                 await check("live GET /v1/bots/\(b.id)/messages") {

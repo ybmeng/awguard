@@ -77,13 +77,23 @@ From `swift/botnet/`:
   on top so unchanged code stays byte-identical.
 - Match the existing comment voice: comments state constraints and reasons,
   not narration.
+- Opaque server JSON (e.g. a tool's parameters schema from /v1/tools): decode
+  through `JSONValue` in Models.swift and show its `prettyPrinted` text —
+  never type out an evolving schema's fields. Probe Bool before Double there
+  or true/false bridge to 1/0.
+- Snapshot.swift's capture window gives `.task` fetches no time to land; any
+  store data a view loads in `.task` must also be awaited explicitly in
+  Snapshot.main() before render (as refresh/loadConversation/loadTools are).
 
 ## Working with the orchestrator
 
 - Tasks arrive as memos with a fixed contract (exact JSON fields, routes,
   semantics). Build against the contract; don't wait for the server agent —
   but check the Go tree, the change often lands mid-task and you can verify
-  against the real server via seed-demo.
+  against the real server via seed-demo. Re-check right before verifying:
+  seed-demo rebuilds botnetd from the current tree, so a route that 404'd at
+  task start can be live by snapshot time (happened with /v1/tools) and the
+  real server beats any stub.
 - Directives get corrected mid-task. Check your inbox BEFORE writing the
   final report and before ending your turn — a correction was nearly missed
   this session. Acknowledge course changes explicitly in your reply.

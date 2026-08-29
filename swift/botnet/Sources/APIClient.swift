@@ -75,6 +75,12 @@ struct APIClient {
         try await get("/v1/models")
     }
 
+    /// 404 on servers that predate the route; callers go through
+    /// `isUnimplemented` and hide the feature rather than erroring.
+    func listTools() async throws -> [ToolDefinition] {
+        try await get("/v1/tools")
+    }
+
     func createBot(displayName: String, systemPrompt: String, model: String) async throws -> Bot {
         try await send("/v1/bots", method: "POST", body: [
             "displayName": displayName, "systemPrompt": systemPrompt, "model": model,

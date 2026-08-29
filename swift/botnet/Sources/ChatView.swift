@@ -317,6 +317,7 @@ struct BotDetails: View {
     @State private var editing = false
     @State private var draft = ""
     @State private var saving = false
+    @State private var toolsExpanded = true
 
     private var memory: String { bot.memory ?? "" }
 
@@ -328,12 +329,19 @@ struct BotDetails: View {
             if expanded {
                 if editing { editor } else { reader }
             }
+            // Absent entirely (not empty) until the server has answered; an
+            // older botnetd without the route keeps `tools` nil for the run.
+            if let tools = store.tools {
+                toolsHeader
+                if toolsExpanded { toolsBody(tools) }
+            }
             Spacer(minLength: 0)
         }
         .background(Palette.chrome)
         .navigationTitle("Details")
         // Switching bots must never carry one bot's unsaved draft to another.
         .onChange(of: bot.id) { editing = false }
+        .task { await store.loadTools() }
     }
 
     private var header: some View {
@@ -426,6 +434,81 @@ struct BotDetails: View {
             }
         }
         .padding(Metric.inspectorPad)
+    }
+
+    // Same disclosure idiom as the Memory header. The top hairline only draws
+    // when Memory's body is open above it — when Memory is collapsed its own
+    // bottom hairline already marks this boundary, and two would read heavy.
+    private var toolsHeader: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.12)) { toolsExpanded.toggle() }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Palette.secondaryText)
+                    .rotationEffect(.degrees(toolsExpanded ? 90 : 0))
+                Text("Tools")
+                    .font(TypeScale.headerTitle)
+                    .foregroundStyle(Palette.primaryText)
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(toolsExpanded ? "Collapse tools" : "Expand tools")
+        .padding(.horizontal, Metric.inspectorPad)
+        .frame(height: Metric.headerHeight)
+        .overlay(alignment: .top) {
+            if expanded {
+                Rectangle().fill(Palette.hairline).frame(height: 1)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Palette.hairline).frame(height: 1)
+        }
+    }
+
+    // What the model is told, verbatim: the description keeps its line breaks
+    // and the parameters schema is shown as re-indented JSON, never paraphrased.
+    // Read-only by design — these change only with the server binary.
+    private func toolsBody(_ tools: [ToolDefinition]) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Metric.inspectorPad) {
+                ForEach(tools) { tool in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(tool.name)
+                            .font(TypeScale.rowTitle)
+                            .foregroundStyle(Palette.primaryText)
+                            .textSelection(.enabled)
+                        Text(tool.description)
+                            .font(TypeScale.message)
+                            .foregroundStyle(Palette.primaryText)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(tool.parametersJSON)
+                            .font(TypeScale.codeBlock)
+                            .foregroundStyle(Palette.primaryText)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(6)
+                            .background(
+                                Palette.fieldFill,
+                                in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
+                            )
+                    }
+                }
+                if tools.isEmpty {
+                    Text("No tools")
+                        .font(TypeScale.message)
+                        .foregroundStyle(Palette.secondaryText)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(Metric.inspectorPad)
+        }
+        .frame(maxHeight: Metric.inspectorSectionMaxHeight)
     }
 
     private func save() {
