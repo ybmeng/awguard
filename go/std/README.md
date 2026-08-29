@@ -118,8 +118,12 @@ While the installed service is running it serves a local API on a unix
 socket inside the root dir (`<dir>/.artifacts.sock`). `stdd insert`, `ls`
 and `cat` detect it and route through it, so all id allocation and machine
 runs happen in the one service process — no cross-process races. Without a
-running service the same commands operate on the store directly. A second
-service pointed at a busy root refuses to start.
+running service the same commands operate on the store directly. Ownership
+of a root is an exclusive `flock` on `<dir>/.artifacts.lock`, held for the
+service's whole life (and released by the kernel if it crashes): a second
+service pointed at a busy root refuses to start before touching anything —
+it never unlinks the live socket, sweeps in-flight inserts, or drains the
+inbox.
 
 The remote stages are a pluggable `Syncer` interface — `CreateDir` (stage 2),
 `SyncFile` (stage 3), `Fetch` (serving fallback) — so the whole machine stays

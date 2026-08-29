@@ -120,12 +120,20 @@ func (s *Service) Open(ctx context.Context, id ID, name string) (io.ReadCloser, 
 // root's unix socket so other processes (stdd insert/ls/cat) route through
 // this single writer instead of racing it.
 //
-// As the store's single writer, Run also sweeps inserts left interrupted by
-// a dead process before doing anything else — the sweep is only safe from
-// the one process that owns the store.
+// Run acquires the root's exclusive lock before anything else: a losing
+// second service refuses to start without touching the winner's socket,
+// sweeping its in-flight inserts, or draining a single inbox file. As the
+// store's single writer, Run then sweeps inserts left interrupted by a dead
+// process before serving and watching the inbox.
 func (s *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	release, err := s.acquireLock()
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	if err := s.store.SweepInterrupted(); err != nil {
 		return err
@@ -135,7 +143,7 @@ func (s *Service) Run(ctx context.Context) error {
 	go func() { errCh <- s.serve(ctx) }()
 	go func() { errCh <- s.watchInbox(ctx) }()
 
-	err := <-errCh
+	err = <-errCh
 	cancel()
 	<-errCh
 	return err

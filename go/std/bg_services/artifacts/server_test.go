@@ -125,12 +125,17 @@ func TestServiceAPIEndToEnd(t *testing.T) {
 func TestSecondServiceRefusesBusyRoot(t *testing.T) {
 	root := shortRoot(t)
 	quiet := log.New(io.Discard, "", 0)
-	svc1, err := New(Config{Root: root, Logger: quiet})
+	// A huge interval keeps svc1 from re-draining the inbox after its
+	// initial (empty) scan, so anything appearing there later can only have
+	// been consumed by the losing service — which must never happen.
+	svc1, err := New(Config{Root: root, Interval: time.Hour, Logger: quiet})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cancel, _ := startService(t, svc1)
 	defer cancel()
+	time.Sleep(100 * time.Millisecond) // let svc1's initial empty drain finish
+	writeFile(t, filepath.Join(svc1.inbox, "later.txt"), "must stay put")
 
 	svc2, err := New(Config{Root: root, Logger: quiet})
 	if err != nil {
@@ -141,5 +146,20 @@ func TestSecondServiceRefusesBusyRoot(t *testing.T) {
 	err = svc2.Run(ctx)
 	if err == nil || !strings.Contains(err.Error(), "already serving") {
 		t.Errorf("second Run = %v, want already-serving refusal", err)
+	}
+
+	// The loser must not have unlinked the winner's live socket: a busy but
+	// healthy service keeps serving.
+	if c, err := Dial(context.Background(), root); err != nil {
+		t.Errorf("winner's socket unusable after losing Run: %v", err)
+	} else {
+		c.Close()
+	}
+	// And the loser must not have drained the inbox on its way out.
+	if _, err := os.Stat(filepath.Join(svc1.inbox, "later.txt")); err != nil {
+		t.Errorf("losing service consumed an inbox file: %v", err)
+	}
+	if statuses, err := svc1.Store().List(); err != nil || len(statuses) != 0 {
+		t.Errorf("losing service inserted into the store: %+v (err=%v)", statuses, err)
 	}
 }
