@@ -142,10 +142,12 @@ struct Citation: Codable, Hashable {
 // One recorded tool invocation behind a bot reply — mirrors go/botnet/schema.go's
 // ToolCall, the shared audit shape. `name` is the tool ("web_search", "memory"),
 // `arguments` the raw JSON the model sent, `result` the string fed back to it
-// (truncated server-side for a large search dump). `backend` and `results` ride
-// only on a web_search call, so both are Optional; `at` is display-optional too,
-// so a fixture that omits it still decodes. The transcript's tool-call list
-// decodes these; nothing here is a real value on an old server (the key is
+// (truncated server-side for a large search dump). `backend`, `results`, and
+// `requestId` ride only on a web_search call, so all are Optional; `at` is
+// display-optional too, so a fixture that omits it still decodes. `requestId` is
+// the provider's request/response id (empty for memory and providers exposing
+// none) — surfaced in the expanded row for debugging. The transcript's tool-call
+// list decodes these; nothing here is a real value on an old server (the key is
 // absent there), per the Models header rule.
 struct ToolCall: Codable, Hashable {
     var name: String
@@ -153,6 +155,7 @@ struct ToolCall: Codable, Hashable {
     var result: String
     var backend: String?
     var results: [Citation]?
+    var requestId: String?
     var at: Date?
 
     /// The web_search query, pulled from the raw arguments JSON. Nil when the

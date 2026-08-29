@@ -22,9 +22,10 @@ import (
 // fakeBackend is a SearchBackend that returns canned results (or an error) and
 // records every query and options it was asked for.
 type fakeBackend struct {
-	name    string
-	results []SearchResult
-	err     error
+	name      string
+	results   []SearchResult
+	requestID string
+	err       error
 
 	mu      sync.Mutex
 	queries []string
@@ -33,12 +34,12 @@ type fakeBackend struct {
 
 func (f *fakeBackend) Name() string { return f.name }
 
-func (f *fakeBackend) Search(_ context.Context, query string, opts SearchOpts) ([]SearchResult, error) {
+func (f *fakeBackend) Search(_ context.Context, query string, opts SearchOpts) (SearchResponse, error) {
 	f.mu.Lock()
 	f.queries = append(f.queries, query)
 	f.opts = append(f.opts, opts)
 	f.mu.Unlock()
-	return f.results, f.err
+	return SearchResponse{Results: f.results, RequestID: f.requestID}, f.err
 }
 
 func (f *fakeBackend) lastQuery(t *testing.T) (string, SearchOpts) {
@@ -64,18 +65,23 @@ func TestMockBackendDeterministic(t *testing.T) {
 		t.Fatalf("search: %v", err)
 	}
 	second, _ := b.Search(context.Background(), "anything", SearchOpts{})
-	if len(first) != len(second) || len(first) == 0 {
-		t.Fatalf("mock is not deterministic: %d vs %d", len(first), len(second))
+	if len(first.Results) != len(second.Results) || len(first.Results) == 0 {
+		t.Fatalf("mock is not deterministic: %d vs %d", len(first.Results), len(second.Results))
 	}
-	for i := range first {
-		if first[i] != second[i] {
-			t.Errorf("result %d differs across calls: %+v vs %+v", i, first[i], second[i])
+	for i := range first.Results {
+		if first.Results[i] != second.Results[i] {
+			t.Errorf("result %d differs across calls: %+v vs %+v", i, first.Results[i], second.Results[i])
 		}
+	}
+	// The synthetic request id is present and stable across calls — the provenance
+	// field is exercised end-to-end with no real provider.
+	if first.RequestID == "" || first.RequestID != second.RequestID {
+		t.Errorf("mock request id = %q / %q, want a stable non-empty synthetic id", first.RequestID, second.RequestID)
 	}
 	// Every result has a non-empty title and url (the contract), and one title is
 	// a bare host — the titleless→host-fallback the UI renders.
 	sawHost := false
-	for _, r := range first {
+	for _, r := range first.Results {
 		if r.Title == "" || r.URL == "" {
 			t.Errorf("result missing title/url: %+v", r)
 		}
@@ -87,8 +93,8 @@ func TestMockBackendDeterministic(t *testing.T) {
 		t.Error("no host-fallback title present; the UI's titleless path is not exercised")
 	}
 	// num_results clamps the set.
-	if got, _ := b.Search(context.Background(), "q", SearchOpts{NumResults: 2}); len(got) != 2 {
-		t.Errorf("num_results=2 returned %d results, want 2", len(got))
+	if got, _ := b.Search(context.Background(), "q", SearchOpts{NumResults: 2}); len(got.Results) != 2 {
+		t.Errorf("num_results=2 returned %d results, want 2", len(got.Results))
 	}
 }
 
@@ -194,7 +200,7 @@ func TestExaBackendWire(t *testing.T) {
 	b := NewExaBackend("exa-key")
 	aimAt(b.http, srv.URL)
 
-	results, err := b.Search(context.Background(), "go 1.24", SearchOpts{NumResults: 3})
+	sr, err := b.Search(context.Background(), "go 1.24", SearchOpts{NumResults: 3})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -211,6 +217,11 @@ func TestExaBackendWire(t *testing.T) {
 	if sent["query"] != "go 1.24" || sent["numResults"].(float64) != 3 {
 		t.Errorf("sent body = %v, want query+numResults", sent)
 	}
+	// The top-level requestId is captured as the call's provenance id.
+	if sr.RequestID != "r1" {
+		t.Errorf("request id = %q, want r1 from the response body", sr.RequestID)
+	}
+	results := sr.Results
 	if len(results) != 2 {
 		t.Fatalf("results = %d, want 2", len(results))
 	}
@@ -238,7 +249,7 @@ func TestBraveBackendWire(t *testing.T) {
 	b := NewBraveBackend("brave-key")
 	aimAt(b.http, srv.URL)
 
-	results, err := b.Search(context.Background(), "machine learning", SearchOpts{NumResults: 4})
+	sr, err := b.Search(context.Background(), "machine learning", SearchOpts{NumResults: 4})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -251,6 +262,11 @@ func TestBraveBackendWire(t *testing.T) {
 	if !strings.Contains(rec.query, "count=4") || !strings.Contains(rec.query, "text_decorations=false") {
 		t.Errorf("query = %q, want count and text_decorations", rec.query)
 	}
+	// Brave exposes no request id in the body, so it stays empty.
+	if sr.RequestID != "" {
+		t.Errorf("request id = %q, want empty for Brave", sr.RequestID)
+	}
+	results := sr.Results
 	if len(results) != 2 {
 		t.Fatalf("results = %d, want 2", len(results))
 	}
@@ -268,6 +284,7 @@ func TestBraveBackendWire(t *testing.T) {
 func TestTavilyBackendWire(t *testing.T) {
 	const resp = `{
 		"query":"leo messi",
+		"response_id":"tav-abc123",
 		"results":[
 			{"title":"Lionel Messi","url":"https://britannica.example/messi","content":"Argentine footballer.","score":0.8},
 			{"title":"Messi news","url":"https://news.example/messi","content":"Latest.","published_date":"Wed, 27 Aug 2025 12:34:56 GMT"}
@@ -278,7 +295,7 @@ func TestTavilyBackendWire(t *testing.T) {
 	b := NewTavilyBackend("tavily-key")
 	aimAt(b.http, srv.URL)
 
-	results, err := b.Search(context.Background(), "leo messi", SearchOpts{})
+	result, err := b.Search(context.Background(), "leo messi", SearchOpts{})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -296,6 +313,11 @@ func TestTavilyBackendWire(t *testing.T) {
 	if sent["max_results"].(float64) != float64(defaultSearchResults) {
 		t.Errorf("max_results = %v, want the default %d", sent["max_results"], defaultSearchResults)
 	}
+	// The top-level response_id is captured as the call's provenance id.
+	if result.RequestID != "tav-abc123" {
+		t.Errorf("request id = %q, want tav-abc123 from response_id", result.RequestID)
+	}
+	results := result.Results
 	if len(results) != 2 {
 		t.Fatalf("results = %d, want 2", len(results))
 	}
@@ -391,7 +413,7 @@ func TestWebSearchToolLoopRecordsAudit(t *testing.T) {
 		t.Fatalf("seed user turn: %v", err)
 	}
 
-	backend := &fakeBackend{name: "fake", results: []SearchResult{
+	backend := &fakeBackend{name: "fake", requestID: "req-xyz789", results: []SearchResult{
 		{Title: "Go 1.24", URL: "https://go.dev/1", Snippet: "generics", PublishedAt: "2025-02-11"},
 		{Title: "Release notes", URL: "https://go.dev/2", Snippet: "notes"},
 	}}
@@ -435,6 +457,9 @@ func TestWebSearchToolLoopRecordsAudit(t *testing.T) {
 	if ws.Name != webSearchFuncName || ws.Backend != "fake" || len(ws.Results) != 2 {
 		t.Errorf("web_search audit = %+v, want name, backend and 2 results", ws)
 	}
+	if ws.RequestID != "req-xyz789" {
+		t.Errorf("web_search request id = %q, want the backend's provider id captured", ws.RequestID)
+	}
 	if !strings.Contains(ws.Arguments, "go release news") {
 		t.Errorf("web_search arguments = %q, want the query recoverable", ws.Arguments)
 	}
@@ -442,7 +467,7 @@ func TestWebSearchToolLoopRecordsAudit(t *testing.T) {
 		t.Errorf("web_search result text = %q, want the rendered list", ws.Result)
 	}
 	mem := comp.ToolCalls[1]
-	if mem.Name != memoryToolName || mem.Result != "memory saved" || mem.Backend != "" || mem.Results != nil {
+	if mem.Name != memoryToolName || mem.Result != "memory saved" || mem.Backend != "" || mem.RequestID != "" || mem.Results != nil {
 		t.Errorf("memory audit = %+v, want a bare memory record", mem)
 	}
 
@@ -458,8 +483,9 @@ func TestWebSearchToolLoopRecordsAudit(t *testing.T) {
 	if len(got.Citations) != 2 {
 		t.Errorf("reloaded citations = %d, want 2", len(got.Citations))
 	}
-	if len(got.ToolCalls) != 2 || got.ToolCalls[0].Backend != "fake" || len(got.ToolCalls[0].Results) != 2 {
-		t.Errorf("reloaded tool_calls = %+v, want the audit trail kept", got.ToolCalls)
+	if len(got.ToolCalls) != 2 || got.ToolCalls[0].Backend != "fake" ||
+		got.ToolCalls[0].RequestID != "req-xyz789" || len(got.ToolCalls[0].Results) != 2 {
+		t.Errorf("reloaded tool_calls = %+v, want the audit trail (with request id) kept", got.ToolCalls)
 	}
 }
 

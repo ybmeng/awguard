@@ -466,7 +466,13 @@ private struct ToolCallRow: View {
     @State private var expanded = false
 
     private var isWebSearch: Bool { call.name == "web_search" }
-    private var hasDetail: Bool { !call.citations.isEmpty || !call.result.isEmpty }
+    private var requestId: String? {
+        guard isWebSearch, let rid = call.requestId, !rid.isEmpty else { return nil }
+        return rid
+    }
+    private var hasDetail: Bool {
+        !call.citations.isEmpty || !call.result.isEmpty || requestId != nil
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -517,8 +523,16 @@ private struct ToolCallRow: View {
         case "web_search":
             let n = call.citations.count
             let query = Text(call.query ?? "search").foregroundColor(Palette.botBubbleText)
-            let count = Text("  \(n) result\(n == 1 ? "" : "s")").foregroundColor(Palette.secondaryText)
-            return Text("Web search  ").foregroundColor(Palette.secondaryText) + query + count
+            let countText = "\(n) result\(n == 1 ? "" : "s")"
+            // With a known backend the tail names it between dots (· exa · 4
+            // results); older records without one keep the bare count.
+            let tail: Text
+            if let backend = call.backend, !backend.isEmpty {
+                tail = Text(" · \(backend) · \(countText)").foregroundColor(Palette.secondaryText)
+            } else {
+                tail = Text("  \(countText)").foregroundColor(Palette.secondaryText)
+            }
+            return Text("Web search  ").foregroundColor(Palette.secondaryText) + query + tail
         case "memory":
             let command = Text(call.command ?? "—").foregroundColor(Palette.botBubbleText)
             return Text("Memory  ").foregroundColor(Palette.secondaryText) + command
@@ -528,19 +542,32 @@ private struct ToolCallRow: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if isWebSearch, !call.citations.isEmpty {
-            VStack(alignment: .leading, spacing: 3) {
-                ForEach(Array(call.citations.enumerated()), id: \.offset) { index, citation in
-                    SourceLink(number: index + 1, citation: citation)
+        VStack(alignment: .leading, spacing: 4) {
+            if isWebSearch, !call.citations.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(call.citations.enumerated()), id: \.offset) { index, citation in
+                        SourceLink(number: index + 1, citation: citation)
+                    }
                 }
+            } else if !call.result.isEmpty {
+                // Every non-search tool (and a search that returned no sources)
+                // reveals the exact string it handed back to the model.
+                MachineText(text: call.result)
             }
-            .padding(.top, 1)
-        } else if !call.result.isEmpty {
-            // Every non-search tool (and a search that returned no sources)
-            // reveals the exact string it handed back to the model.
-            MachineText(text: call.result)
-                .padding(.top, 1)
+            // Provider request id, for debugging — subtle monospace, selectable
+            // in full even when truncated; only on a search that recorded one.
+            if let rid = requestId {
+                let prefix = (call.backend.map { $0.isEmpty ? "" : "\($0) · " } ?? "")
+                Text("\(prefix)\(rid)")
+                    .font(TypeScale.codeBlock)
+                    .foregroundStyle(Palette.secondaryText)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help("Provider request id")
+            }
         }
+        .padding(.top, 1)
     }
 }
 

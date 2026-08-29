@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
@@ -80,7 +81,7 @@ func NewExaBackend(key string) *ExaBackend {
 
 func (b *ExaBackend) Name() string { return "exa" }
 
-func (b *ExaBackend) Search(ctx context.Context, query string, opts SearchOpts) ([]SearchResult, error) {
+func (b *ExaBackend) Search(ctx context.Context, query string, opts SearchOpts) (SearchResponse, error) {
 	reqBody, err := json.Marshal(map[string]any{
 		"query":      query,
 		"numResults": clampResults(opts.NumResults),
@@ -91,11 +92,11 @@ func (b *ExaBackend) Search(ctx context.Context, query string, opts SearchOpts) 
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("exa: encode: %w", err)
+		return SearchResponse{}, fmt.Errorf("exa: encode: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.exa.ai/search", bytes.NewReader(reqBody))
 	if err != nil {
-		return nil, fmt.Errorf("exa: request: %w", err)
+		return SearchResponse{}, fmt.Errorf("exa: request: %w", err)
 	}
 	req.Header.Set("x-api-key", b.key)
 	req.Header.Set("Content-Type", "application/json")
@@ -103,15 +104,17 @@ func (b *ExaBackend) Search(ctx context.Context, query string, opts SearchOpts) 
 
 	body, err := doSearch(b.http, req, "exa")
 	if err != nil {
-		return nil, err
+		return SearchResponse{}, err
 	}
 	return parseExa(body)
 }
 
-// parseExa maps an Exa /search response body to []SearchResult.
-func parseExa(body []byte) ([]SearchResult, error) {
+// parseExa maps an Exa /search response body to a SearchResponse. Exa carries a
+// top-level requestId, which becomes the call's provenance id.
+func parseExa(body []byte) (SearchResponse, error) {
 	var out struct {
-		Results []struct {
+		RequestID string `json:"requestId"`
+		Results   []struct {
 			Title         string   `json:"title"`
 			URL           string   `json:"url"`
 			PublishedDate string   `json:"publishedDate"`
@@ -120,7 +123,7 @@ func parseExa(body []byte) ([]SearchResult, error) {
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("exa: decode: %w", err)
+		return SearchResponse{}, fmt.Errorf("exa: decode: %w", err)
 	}
 	results := make([]SearchResult, 0, len(out.Results))
 	for _, r := range out.Results {
@@ -136,7 +139,7 @@ func parseExa(body []byte) ([]SearchResult, error) {
 			PublishedAt: r.PublishedDate,
 		})
 	}
-	return results, nil
+	return SearchResponse{Results: results, RequestID: out.RequestID}, nil
 }
 
 // ── Brave ─────────────────────────────────────────────────────────────────────
@@ -157,7 +160,7 @@ func NewBraveBackend(key string) *BraveBackend {
 
 func (b *BraveBackend) Name() string { return "brave" }
 
-func (b *BraveBackend) Search(ctx context.Context, query string, opts SearchOpts) ([]SearchResult, error) {
+func (b *BraveBackend) Search(ctx context.Context, query string, opts SearchOpts) (SearchResponse, error) {
 	q := url.Values{}
 	q.Set("q", query)
 	q.Set("count", strconv.Itoa(clampResults(opts.NumResults)))
@@ -166,20 +169,22 @@ func (b *BraveBackend) Search(ctx context.Context, query string, opts SearchOpts
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("brave: request: %w", err)
+		return SearchResponse{}, fmt.Errorf("brave: request: %w", err)
 	}
 	req.Header.Set("X-Subscription-Token", b.key)
 	req.Header.Set("Accept", "application/json")
 
 	body, err := doSearch(b.http, req, "brave")
 	if err != nil {
-		return nil, err
+		return SearchResponse{}, err
 	}
 	return parseBrave(body)
 }
 
-// parseBrave maps a Brave web-search response body to []SearchResult.
-func parseBrave(body []byte) ([]SearchResult, error) {
+// parseBrave maps a Brave web-search response body to a SearchResponse. Brave
+// exposes no request id in the body (only a response header we do not plumb), so
+// RequestID stays "".
+func parseBrave(body []byte) (SearchResponse, error) {
 	var out struct {
 		Web struct {
 			Results []struct {
@@ -192,7 +197,7 @@ func parseBrave(body []byte) ([]SearchResult, error) {
 		} `json:"web"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("brave: decode: %w", err)
+		return SearchResponse{}, fmt.Errorf("brave: decode: %w", err)
 	}
 	results := make([]SearchResult, 0, len(out.Web.Results))
 	for _, r := range out.Web.Results {
@@ -203,7 +208,7 @@ func parseBrave(body []byte) ([]SearchResult, error) {
 			PublishedAt: firstNonEmpty(r.PageAge, r.Age),
 		})
 	}
-	return results, nil
+	return SearchResponse{Results: results}, nil
 }
 
 // ── Tavily ────────────────────────────────────────────────────────────────────
@@ -224,17 +229,17 @@ func NewTavilyBackend(key string) *TavilyBackend {
 
 func (b *TavilyBackend) Name() string { return "tavily" }
 
-func (b *TavilyBackend) Search(ctx context.Context, query string, opts SearchOpts) ([]SearchResult, error) {
+func (b *TavilyBackend) Search(ctx context.Context, query string, opts SearchOpts) (SearchResponse, error) {
 	reqBody, err := json.Marshal(map[string]any{
 		"query":       query,
 		"max_results": clampResults(opts.NumResults),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("tavily: encode: %w", err)
+		return SearchResponse{}, fmt.Errorf("tavily: encode: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.tavily.com/search", bytes.NewReader(reqBody))
 	if err != nil {
-		return nil, fmt.Errorf("tavily: request: %w", err)
+		return SearchResponse{}, fmt.Errorf("tavily: request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+b.key)
 	req.Header.Set("Content-Type", "application/json")
@@ -242,15 +247,17 @@ func (b *TavilyBackend) Search(ctx context.Context, query string, opts SearchOpt
 
 	body, err := doSearch(b.http, req, "tavily")
 	if err != nil {
-		return nil, err
+		return SearchResponse{}, err
 	}
 	return parseTavily(body)
 }
 
-// parseTavily maps a Tavily /search response body to []SearchResult.
-func parseTavily(body []byte) ([]SearchResult, error) {
+// parseTavily maps a Tavily /search response body to a SearchResponse. Tavily
+// carries a top-level response_id, which becomes the call's provenance id.
+func parseTavily(body []byte) (SearchResponse, error) {
 	var out struct {
-		Results []struct {
+		ResponseID string `json:"response_id"`
+		Results    []struct {
 			Title         string `json:"title"`
 			URL           string `json:"url"`
 			Content       string `json:"content"`
@@ -258,7 +265,7 @@ func parseTavily(body []byte) ([]SearchResult, error) {
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("tavily: decode: %w", err)
+		return SearchResponse{}, fmt.Errorf("tavily: decode: %w", err)
 	}
 	results := make([]SearchResult, 0, len(out.Results))
 	for _, r := range out.Results {
@@ -269,7 +276,7 @@ func parseTavily(body []byte) ([]SearchResult, error) {
 			PublishedAt: r.PublishedDate,
 		})
 	}
-	return results, nil
+	return SearchResponse{Results: results, RequestID: out.ResponseID}, nil
 }
 
 // ── Mock ──────────────────────────────────────────────────────────────────────
@@ -292,7 +299,7 @@ func NewMockBackend() MockBackend { return MockBackend{} }
 
 func (MockBackend) Name() string { return "mock" }
 
-func (MockBackend) Search(_ context.Context, query string, opts SearchOpts) ([]SearchResult, error) {
+func (MockBackend) Search(_ context.Context, query string, opts SearchOpts) (SearchResponse, error) {
 	// Deterministic given the query. The third entry has no provider title, so
 	// its Title is the URL host — exercising the same fallback the real backends
 	// apply, which is what the UI's host-fallback path renders.
@@ -326,7 +333,17 @@ func (MockBackend) Search(_ context.Context, query string, opts SearchOpts) ([]S
 	if n > len(all) {
 		n = len(all)
 	}
-	return all[:n], nil
+	// Synthesize a deterministic request id from the query, so the requestId
+	// provenance field is always exercised end-to-end with no real provider.
+	return SearchResponse{Results: all[:n], RequestID: mockRequestID(query)}, nil
+}
+
+// mockRequestID is the mock backend's deterministic synthetic provider id for a
+// query: mock- plus a short hash, stable across calls.
+func mockRequestID(query string) string {
+	h := fnv.New32a()
+	h.Write([]byte(query))
+	return fmt.Sprintf("mock-%08x", h.Sum32())
 }
 
 // doSearch runs one search request and returns the response body, turning a

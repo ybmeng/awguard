@@ -217,15 +217,23 @@ type Message struct {
 
 // ToolCall is one tool invocation recorded on a bot reply — the audit record the
 // UI decodes. Name and Arguments are what the model sent; Result is the text fed
-// back to it (truncated for storage). Backend and Results are set for web_search
-// only: which backend ran the query and its normalized sources. At is when it ran.
+// back to it (truncated for storage). Backend, RequestID and Results are set for
+// web_search only: which backend ran the query, the provider's request/response
+// id for debugging, and the normalized sources. At is when it ran.
+//
+// DECISION (requestId rides the tool_calls JSON column): it is one more field on
+// this struct, so it persists and re-serves through the EXISTING tool_calls
+// column with no new DB column and no new write path — the change_log oracle is
+// untouched. omitempty because memory calls and providers that expose no id
+// leave it "".
 type ToolCall struct {
-	Name      string     `json:"name"`              // "web_search" | "memory"
-	Arguments string     `json:"arguments"`         // raw JSON args the model sent
-	Result    string     `json:"result"`            // string result fed back (may be truncated)
-	Backend   string     `json:"backend,omitempty"` // web_search only: the backend that ran it
-	Results   []Citation `json:"results,omitempty"` // web_search only: its structured sources
-	At        time.Time  `json:"at"`                // when it ran
+	Name      string     `json:"name"`                // "web_search" | "memory"
+	Arguments string     `json:"arguments"`           // raw JSON args the model sent
+	Result    string     `json:"result"`              // string result fed back (may be truncated)
+	Backend   string     `json:"backend,omitempty"`   // web_search only: the backend that ran it
+	RequestID string     `json:"requestId,omitempty"` // web_search only: provider request/response id, "" when none
+	Results   []Citation `json:"results,omitempty"`   // web_search only: its structured sources
+	At        time.Time  `json:"at"`                  // when it ran
 }
 
 // Citation is one web source behind a bot's reply — the shared shape the UI

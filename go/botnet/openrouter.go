@@ -252,6 +252,7 @@ func (o *OpenRouter) Complete(ctx context.Context, p Prompt) (Completion, error)
 				Arguments: tc.Function.Arguments,
 				Result:    truncateResult(res.text),
 				Backend:   res.backend,
+				RequestID: res.requestID,
 				Results:   res.results,
 				At:        time.Now().UTC(),
 			})

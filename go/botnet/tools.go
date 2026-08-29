@@ -185,11 +185,12 @@ func toolWireDefs(search *Router) []any {
 // toolResult is what a tool handler produces: the text handed back to the model,
 // plus — for web_search only — the backend that ran and the structured sources,
 // which the loop folds into the turn's ToolCall audit record and the reply's
-// aggregate citations. Memory handlers leave backend and results zero.
+// aggregate citations. Memory handlers leave backend, requestID and results zero.
 type toolResult struct {
-	text    string
-	backend string
-	results []Citation
+	text      string
+	backend   string
+	requestID string // web_search only: provider request/response id, "" when none
+	results   []Citation
 }
 
 // BotToolbox binds the tool surface to one bot in one store — what runTurn hands
@@ -300,18 +301,23 @@ func (tb *BotToolbox) runWebSearch(ctx context.Context, args json.RawMessage) (t
 		return toolResult{text: "error: missing 'query' — provide a search query string"}, nil
 	}
 	backend := tb.search.Active()
-	results, err := backend.Search(ctx, in.Query, SearchOpts{NumResults: in.NumResults})
+	resp, err := backend.Search(ctx, in.Query, SearchOpts{NumResults: in.NumResults})
 	if err != nil {
 		// Fail soft: a transient search failure answers the model with an
 		// instructive error it can proceed past, and the call is still audited
 		// (backend named, no results) rather than failing the turn.
 		return toolResult{text: fmt.Sprintf("error: web search failed: %v", err), backend: backend.Name()}, nil
 	}
-	cites := make([]Citation, 0, len(results))
-	for _, r := range results {
+	cites := make([]Citation, 0, len(resp.Results))
+	for _, r := range resp.Results {
 		cites = append(cites, Citation{URL: r.URL, Title: r.Title, Snippet: r.Snippet})
 	}
-	return toolResult{text: renderSearchResults(in.Query, backend.Name(), results), backend: backend.Name(), results: cites}, nil
+	return toolResult{
+		text:      renderSearchResults(in.Query, backend.Name(), resp.Results),
+		backend:   backend.Name(),
+		requestID: resp.RequestID,
+		results:   cites,
+	}, nil
 }
 
 // renderSearchResults formats the backend's results as the compact numbered

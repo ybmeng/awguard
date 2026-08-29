@@ -38,11 +38,21 @@ type SearchOpts struct {
 	NumResults int
 }
 
+// SearchResponse is one backend's normalized answer: the results plus the
+// provider's request/response id when it exposes one (""); the tool loop records
+// RequestID on the ToolCall audit for debugging. Returning it as a struct (not a
+// second string) keeps the interface open to more per-search provenance later
+// without touching every backend again.
+type SearchResponse struct {
+	Results   []SearchResult
+	RequestID string
+}
+
 // SearchBackend is one web-search provider. Search makes a network call, so it
 // takes a context — the tool loop threads the turn's context through to here.
 type SearchBackend interface {
 	Name() string
-	Search(ctx context.Context, query string, opts SearchOpts) ([]SearchResult, error)
+	Search(ctx context.Context, query string, opts SearchOpts) (SearchResponse, error)
 }
 
 // Router holds the available backends in preference order and the active
