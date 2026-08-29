@@ -76,8 +76,11 @@ type Store struct {
 	last ID
 }
 
-// NewStore creates dir if needed, recovers the ID counter, and sweeps any
-// dir left mid-flight by a dead process into the terminal ERR state.
+// NewStore creates dir if needed and recovers the ID counter. It never
+// mutates existing managed dirs: sweeping interrupted inserts is the job of
+// the one process that owns the store (see SweepInterrupted), so read-path
+// stores (stdd ls/cat/insert in direct mode) cannot damage a live service's
+// in-flight work.
 func NewStore(dir string, syncer Syncer, logger *log.Logger) (*Store, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("artifacts: managed directory is required")
@@ -98,9 +101,6 @@ func NewStore(dir string, syncer Syncer, logger *log.Logger) (*Store, error) {
 
 	st := &Store{dir: abs, syncer: syncer, logger: logger}
 	if err := st.recoverLastID(); err != nil {
-		return nil, err
-	}
-	if err := st.sweepInterrupted(); err != nil {
 		return nil, err
 	}
 	return st, nil
@@ -130,13 +130,18 @@ func (st *Store) recoverLastID() error {
 	return nil
 }
 
-// sweepInterrupted converts dirs still tagged WIP by a previous process into
+// SweepInterrupted converts dirs still tagged WIP by a previous process into
 // ERR: an interrupted insert is a failure, and failures are irrecoverable
 // for now. The one exception is a dir interrupted between REFS and COMPLETE:
 // every stage already succeeded and the static refs are on disk, so the sweep
 // finishes the machine's last step (remove the WIP tag) instead of burning
 // the insert.
-func (st *Store) sweepInterrupted() error {
+//
+// Only the process that exclusively owns the store (the running service) may
+// call this: a WIP marker is indistinguishable from another process's live
+// insert, so sweeping from a casually constructed Store would convert
+// in-flight work into terminal ERR.
+func (st *Store) SweepInterrupted() error {
 	ids, err := st.ids()
 	if err != nil {
 		return err

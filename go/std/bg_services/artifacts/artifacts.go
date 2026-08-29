@@ -119,9 +119,17 @@ func (s *Service) Open(ctx context.Context, id ID, name string) (io.ReadCloser, 
 // inserting every file that appears there, and serves the store's API on the
 // root's unix socket so other processes (stdd insert/ls/cat) route through
 // this single writer instead of racing it.
+//
+// As the store's single writer, Run also sweeps inserts left interrupted by
+// a dead process before doing anything else — the sweep is only safe from
+// the one process that owns the store.
 func (s *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	if err := s.store.SweepInterrupted(); err != nil {
+		return err
+	}
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- s.serve(ctx) }()

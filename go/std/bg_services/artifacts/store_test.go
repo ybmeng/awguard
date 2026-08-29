@@ -222,6 +222,9 @@ func TestSweepInterruptedWIPToErr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	if err := st.SweepInterrupted(); err != nil {
+		t.Fatalf("SweepInterrupted: %v", err)
+	}
 	status, err := st.Status(5)
 	if err != nil || status.Stage != StageErr {
 		t.Fatalf("Status = %+v (err=%v), want swept to ERR", status, err)
@@ -266,6 +269,9 @@ func TestSweepPromotesRefsStageWIPToComplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	if err := st.SweepInterrupted(); err != nil {
+		t.Fatalf("SweepInterrupted: %v", err)
+	}
 	status, err := st.Status(3)
 	if err != nil || status.Stage != StageComplete {
 		t.Fatalf("Status = %+v (err=%v), want promoted to COMPLETE", status, err)
@@ -303,9 +309,42 @@ func TestSweepDoesNotPromoteRefsStageWithBadRefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	if err := st.SweepInterrupted(); err != nil {
+		t.Fatalf("SweepInterrupted: %v", err)
+	}
 	status, err := st.Status(4)
 	if err != nil || status.Stage != StageErr {
 		t.Fatalf("Status = %+v (err=%v), want swept to ERR", status, err)
+	}
+}
+
+func TestNewStoreDoesNotSweepInFlightWIP(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ManagedDir)
+
+	// A live service is mid-insert: managed/9 is tagged WIP at stage synced.
+	inFlight := filepath.Join(dir, "9")
+	if err := os.MkdirAll(inFlight, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(inFlight, wipMarker), marker{Stage: StageSynced}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A read-path Store (what stdd ls/cat/insert build in direct mode) must
+	// leave the marker untouched.
+	st, err := NewStore(dir, newFakeSyncer(), log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(inFlight, wipMarker)); err != nil {
+		t.Errorf(".wip must survive NewStore: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(inFlight, errMarker)); !os.IsNotExist(err) {
+		t.Errorf(".err must not appear from NewStore alone: %v", err)
+	}
+	status, err := st.Status(9)
+	if err != nil || status.Stage != StageSynced {
+		t.Fatalf("Status = %+v (err=%v), want in-flight stage synced", status, err)
 	}
 }
 
