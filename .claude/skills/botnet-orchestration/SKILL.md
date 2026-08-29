@@ -58,8 +58,31 @@ long-lived teammate agents with disjoint territories.
   poison and shape mismatches.
 - **Verify the RUNNING process is the new binary** (print build timestamps —
   checkpoint.sh does).
-- **Two agents, one file = clobber.** Stagger writes to shared spec files
-  (schema.go); one installer, ever.
+- **Two agents, one file = clobber — including you.** Stagger writes to shared
+  spec files (schema.go); one installer, ever. This session the ORCHESTRATOR
+  became the second writer: a stale grep said a mock backend was missing, so it
+  started adding one while the assigned agent was building the same thing. Never
+  edit an assigned agent's package on a point-in-time grep — its edits land
+  late and concurrently. Message the agent to do it, or wait until it is idle,
+  then re-grep. If you must add a small dropped item yourself, confirm the agent
+  is stopped first.
+- **Accept against the PRODUCTION path, not the standalone daemon.** Agents test
+  `cmd/botnetd` (via seed-demo/e2e), but the app talks to `bg_services/botnetsvc`
+  under `stdd`. Env-driven wiring (a router, keys) can be present in one and
+  missing in the other — verify the capability on the live :8730 server AFTER
+  checkpoint, not just in an agent's scratch daemon. This caught a router wired
+  only into `cmd/botnetd`.
+- **Keyless mock = keyless acceptance.** For a feature that routes to a paid
+  external provider, have the server ship a keyless `mock` backend and run the
+  E2E acceptance through it (real model turn, `SEARCH_BACKEND=mock`), so
+  acceptance needs no user key and the user can try it before providing one.
+  When the real key arrives, validate it directly (a provider curl) and confirm
+  the router flips to it on `/v1/tools` — no need to spend the user's real bots.
+- **Seed residue keeps slipping past "tree clean."** Snapshot seed hacks
+  (`_seedCitationsForSnapshot`, `--seed-*` flags) reappeared in tracked source
+  three times after agents reported clean. Grep the whole tree for seed/TEMP/mock
+  residue yourself before every checkpoint and reject it; the sanctioned seed is
+  `sqlite3` on the demo DB, which touches no source.
 
 ## Skill upkeep
 

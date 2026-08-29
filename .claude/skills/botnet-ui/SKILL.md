@@ -90,6 +90,27 @@ From `swift/botnet/`:
 - Snapshot.swift's capture window gives `.task` fetches no time to land; any
   store data a view loads in `.task` must also be awaited explicitly in
   Snapshot.main() before render (as refresh/loadConversation/loadTools are).
+- Seed snapshots via the demo scratch DB with `sqlite3`, NEVER via source
+  hacks. To render a state that needs data (citations, tool_calls), `UPDATE`
+  the demo DB's column directly — botnetd migrates new columns in on serve, so
+  a plain `sqlite3 build/demo.db "UPDATE messages SET tool_calls=… WHERE id=…"`
+  then a snapshot renders the real APIClient decoding real persisted data. Do
+  NOT add debug seed methods to `Store.swift` or `--seed-*` flags to
+  `Snapshot.swift` — that residue was left in the tree three times this session
+  after "tree clean" reports. If you must touch source to seed, grep for your
+  residue before reporting; the orchestrator greps and rejects it.
+- The snapshot captures the TOP of the transcript, not the newest turn (no
+  reliable scroll-to-bottom offscreen). To snapshot a specific message's UI,
+  seed it onto an EARLY message (the first bot reply) or point at a
+  short-history bot — a reply appended at the end won't be in frame.
+- A `/v1/tools` entry can be a bare server tool (`{type:"openrouter:web_search"}`,
+  no `function`). `ToolDefinition` must decode `function` as optional and render
+  an unknown/functionless type gracefully (humanize the `type`), or the whole
+  `[ToolDefinition]` decode throws and the Tools inspector breaks.
+- Markdown in bot bubbles: `Text(String)` renders literally — parse with
+  `AttributedString(markdown:options:)` at `.inlineOnlyPreservingWhitespace`
+  (keeps single newlines, leaves block syntax literal), raw-text fallback on
+  throw. Bot bubbles only; user bubbles stay literal (a typed `*x*` is verbatim).
 
 ## Working with the orchestrator
 
