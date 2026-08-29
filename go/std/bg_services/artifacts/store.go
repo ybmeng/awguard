@@ -132,7 +132,10 @@ func (st *Store) recoverLastID() error {
 
 // sweepInterrupted converts dirs still tagged WIP by a previous process into
 // ERR: an interrupted insert is a failure, and failures are irrecoverable
-// for now.
+// for now. The one exception is a dir interrupted between REFS and COMPLETE:
+// every stage already succeeded and the static refs are on disk, so the sweep
+// finishes the machine's last step (remove the WIP tag) instead of burning
+// the insert.
 func (st *Store) sweepInterrupted() error {
 	ids, err := st.ids()
 	if err != nil {
@@ -148,6 +151,13 @@ func (st *Store) sweepInterrupted() error {
 		if err != nil {
 			m = marker{Stage: StageInit, StartedAt: time.Now().UTC()}
 		}
+		if m.Stage == StageRefs && validRefs(filepath.Join(dir, refsFile), id) {
+			if err := os.Remove(wip); err != nil {
+				return fmt.Errorf("artifacts: sweep %s: %w", dir, err)
+			}
+			st.logger.Printf("std_artifacts: promoted interrupted managed/%s to COMPLETE (refs were already written)", id)
+			continue
+		}
 		m.Error = fmt.Sprintf("interrupted: process exited during stage %s", m.Stage)
 		m.UpdatedAt = time.Now().UTC()
 		if err := writeJSONAtomic(filepath.Join(dir, errMarker), m); err != nil {
@@ -159,6 +169,17 @@ func (st *Store) sweepInterrupted() error {
 		st.logger.Printf("std_artifacts: swept interrupted managed/%s to ERR (was at stage %s)", id, m.Stage)
 	}
 	return nil
+}
+
+// validRefs reports whether path holds a parseable stage-4 refs file for id —
+// the proof that every stage of the insert succeeded.
+func validRefs(path string, id ID) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var refs Refs
+	return json.Unmarshal(b, &refs) == nil && refs.ID == id
 }
 
 // ids lists the numeric managed subdirectories in ascending order.

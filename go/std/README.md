@@ -85,7 +85,9 @@ INIT ──1──> MOVED ──2──> REMOTE_DIR ──3──> SYNCED ──
 - **ERR** — any failure renames `.wip` to `.err` recording the stage that
   died and why. Terminal: nothing retries, the dir stays for inspection,
   its id is burned. An insert left mid-WIP by a dead process is swept to
-  ERR on the next startup.
+  ERR on the next startup — except one interrupted between REFS and
+  COMPLETE: its refs are already on disk, so the sweep finishes the last
+  step and promotes it to COMPLETE.
 
 Serving: `Open(id, name)` refuses non-COMPLETE dirs, serves from local
 storage when present, and otherwise fetches from Drive by the static

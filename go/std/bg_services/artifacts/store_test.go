@@ -239,6 +239,76 @@ func TestSweepInterruptedWIPToErr(t *testing.T) {
 	}
 }
 
+func TestSweepPromotesRefsStageWIPToComplete(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ManagedDir)
+	quiet := log.New(io.Discard, "", 0)
+
+	// Simulate a process that died between stage REFS and COMPLETE of insert
+	// 3: every stage succeeded, .refs.json is valid, only the WIP tag removal
+	// never ran.
+	interrupted := filepath.Join(dir, "3")
+	if err := os.MkdirAll(interrupted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(interrupted, "a.txt"), "alpha")
+	if err := writeJSONAtomic(filepath.Join(interrupted, refsFile), Refs{
+		ID:        3,
+		RemoteDir: "rdir-3",
+		Files:     []FileRef{{Name: "a.txt", RemoteID: "rid-3", Size: 5, SHA256: "ab"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(interrupted, wipMarker), marker{Stage: StageRefs}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := NewStore(dir, newFakeSyncer(), quiet)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	status, err := st.Status(3)
+	if err != nil || status.Stage != StageComplete {
+		t.Fatalf("Status = %+v (err=%v), want promoted to COMPLETE", status, err)
+	}
+	if _, err := os.Stat(filepath.Join(interrupted, wipMarker)); !os.IsNotExist(err) {
+		t.Errorf(".wip should be gone after promotion: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(interrupted, errMarker)); !os.IsNotExist(err) {
+		t.Errorf(".err should not exist after promotion: %v", err)
+	}
+	// The promoted dir is fully servable.
+	r, err := st.Open(context.Background(), 3, "a.txt")
+	if err != nil {
+		t.Fatalf("Open promoted dir: %v", err)
+	}
+	defer r.Close()
+	if got, _ := io.ReadAll(r); string(got) != "alpha" {
+		t.Errorf("content = %q, want alpha", got)
+	}
+}
+
+func TestSweepDoesNotPromoteRefsStageWithBadRefs(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ManagedDir)
+	interrupted := filepath.Join(dir, "4")
+	if err := os.MkdirAll(interrupted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// WIP says refs, but the refs file is corrupt: not provably complete.
+	writeFile(t, filepath.Join(interrupted, refsFile), "{not json")
+	if err := writeJSONAtomic(filepath.Join(interrupted, wipMarker), marker{Stage: StageRefs}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := NewStore(dir, newFakeSyncer(), log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	status, err := st.Status(4)
+	if err != nil || status.Stage != StageErr {
+		t.Fatalf("Status = %+v (err=%v), want swept to ERR", status, err)
+	}
+}
+
 func TestListReportsAllDirs(t *testing.T) {
 	syncer := newFakeSyncer()
 	st := newTestStore(t, syncer)
