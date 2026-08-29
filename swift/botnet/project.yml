@@ -16,3 +16,19 @@ targets:
         SWIFT_VERSION: "5.9"
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: UF6JUCLS78
+  # Renders the real views to PNG offscreen (dev/snapshot.sh) so UI changes can
+  # be reviewed without screen-recording permission. Shares Sources with the
+  # app, minus its @main.
+  Snapshot:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources
+        excludes: [BotNetApp.swift]
+      - path: dev/Snapshot
+    settings:
+      base:
+        PRODUCT_NAME: snapshot
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: UF6JUCLS78
