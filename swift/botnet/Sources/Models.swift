@@ -193,6 +193,36 @@ struct Segment: Identifiable, Codable, Hashable {
     var isOpen: Bool { sealed == nil }
 }
 
+// One calendar entry — mirrors go/botnet/schema.go's Event. The server sends
+// location and notes with omitempty, so an unset one is absent from the JSON
+// rather than "": both are Optional here and read as empty either way. Events
+// are not If-Match versioned; calendar edits are last-write-wins like memory.
+struct Event: Identifiable, Codable, Hashable {
+    var id: String            // "evt_" + ULID, sortable
+    var title: String
+    var startsAt: Date
+    var endsAt: Date
+    var location: String?
+    var notes: String?
+    /// The bot id that created it, or `Event.userAuthor` for one made in the UI.
+    var createdBy: String
+    var createdAt: Date
+    var updatedAt: Date
+
+    /// The server's marker for an event the user made rather than a bot; it is
+    /// not a bot id, so nothing may look it up in the bot list.
+    static let userAuthor = "user"
+
+    var isUserCreated: Bool { createdBy == Self.userAuthor }
+
+    /// The day the event is filed under. Grouping keys off the start, so an
+    /// event running past midnight still lists on the day it begins.
+    var day: Date { Calendar.current.startOfDay(for: startsAt) }
+
+    var hasLocation: Bool { !(location ?? "").isEmpty }
+    var hasNotes: Bool { !(notes ?? "").isEmpty }
+}
+
 // Decoded from GET /v1/tools: the exact tools the server sends the model each
 // turn. The list is heterogeneous — a function tool is
 // {type:"function", function:{name, description, parameters}} (OpenAI shape),

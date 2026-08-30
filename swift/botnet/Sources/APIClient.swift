@@ -43,6 +43,11 @@ struct APIClient {
     }()
     private static let isoPlain = ISO8601DateFormatter()
 
+    /// The RFC3339 form the server parses on the way in. Whole seconds in UTC:
+    /// a calendar time is chosen by the user to the minute, and the fractional
+    /// part would only be noise in a query string.
+    static func wireTime(_ date: Date) -> String { isoPlain.string(from: date) }
+
     var decoder: JSONDecoder {
         let d = JSONDecoder()
         d.dateDecodingStrategy = .custom { decoder in
@@ -79,6 +84,51 @@ struct APIClient {
     /// `isUnimplemented` and hide the feature rather than erroring.
     func listTools() async throws -> [ToolDefinition] {
         try await get("/v1/tools")
+    }
+
+    // MARK: calendar
+    //
+    // The calendar is the first service with its own collection. Events are not
+    // versioned, so an update is a plain PATCH of whatever fields changed;
+    // 404 on all four routes means a botnetd that predates the service, which
+    // callers hide rather than report.
+
+    /// Ascending by start. The optional window filters by overlap server-side
+    /// (endsAt > from AND startsAt < to); omitting both asks for everything.
+    func listEvents(from: Date? = nil, to: Date? = nil) async throws -> [Event] {
+        var query: [String] = []
+        if let from { query.append("from=" + escaped(Self.wireTime(from))) }
+        if let to { query.append("to=" + escaped(Self.wireTime(to))) }
+        let suffix = query.isEmpty ? "" : "?" + query.joined(separator: "&")
+        return try await get("/v1/events" + suffix)
+    }
+
+    /// createdBy is the server's call, not ours: an event posted here is "user".
+    func createEvent(title: String, startsAt: Date, endsAt: Date,
+                     location: String, notes: String) async throws -> Event {
+        var body = [
+            "title": title,
+            "startsAt": Self.wireTime(startsAt),
+            "endsAt": Self.wireTime(endsAt),
+        ]
+        // Absent rather than "" so a create matches the wire shape a bot's tool
+        // call produces; the server treats both as unset anyway.
+        if !location.isEmpty { body["location"] = location }
+        if !notes.isEmpty { body["notes"] = notes }
+        return try await send("/v1/events", method: "POST", body: body)
+    }
+
+    /// `fields` is any subset of the create body; an empty string clears a field.
+    func updateEvent(_ id: String, fields: [String: String]) async throws -> Event {
+        try await send("/v1/events/\(id)", method: "PATCH", body: fields)
+    }
+
+    func deleteEvent(_ id: String) async throws {
+        _ = try await raw("/v1/events/\(id)", method: "DELETE", body: nil)
+    }
+
+    private func escaped(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? value
     }
 
     func createBot(displayName: String, systemPrompt: String, model: String) async throws -> Bot {
@@ -125,8 +175,7 @@ struct APIClient {
     /// Only what follows `cursor`. A 404 means the cursor is unknown to this bot
     /// and the caller must resync rather than keep polling a dead id.
     func messages(_ botID: String, after cursor: String) async throws -> [Message] {
-        let encoded = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? cursor
-        return try await get("/v1/bots/\(botID)/messages?after=\(encoded)")
+        return try await get("/v1/bots/\(botID)/messages?after=\(escaped(cursor))")
     }
 
     /// True when the server has no such route, which is how this build tells an

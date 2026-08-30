@@ -14,6 +14,10 @@ final class AppStore: ObservableObject {
     // nil until fetched, and stays nil on a server without the route, so the
     // inspector simply omits its Tools section on an older botnetd.
     @Published private(set) var tools: [ToolDefinition]?
+    // The calendar service's events, ascending by start as the server sorts
+    // them. Empty on a botnetd without the routes, which reads as an empty
+    // calendar rather than an error the user can do nothing about.
+    @Published private(set) var events: [Event] = []
     @Published var pendingBotIDs: Set<String> = []
     @Published var compactingBotIDs: Set<String> = []
     @Published var lastError: String?
@@ -32,6 +36,7 @@ final class AppStore: ObservableObject {
             return
         }
         await prefetchConversations()
+        await refreshEvents()
     }
 
     // A server that denormalizes the preview onto the bot has already told us
@@ -128,6 +133,78 @@ final class AppStore: ObservableObject {
         }
     }
     private var toolsUnavailable = false
+
+    // MARK: calendar
+    //
+    // The server owns the events exactly as it owns the bots; these calls cache
+    // its answers and nothing else. A mutation splices the returned Event into
+    // the cache rather than refetching the collection: the response IS the
+    // server's new row, so a refetch would only cost a round trip.
+
+    func refreshEvents() async {
+        do {
+            events = try await api.listEvents()
+        } catch {
+            guard !APIClient.isUnimplemented(error) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Returns whether the create landed, so the sheet can stay open with the
+    /// draft intact when it didn't.
+    @discardableResult
+    func createEvent(title: String, startsAt: Date, endsAt: Date,
+                     location: String, notes: String) async -> Bool {
+        do {
+            let created = try await api.createEvent(
+                title: title, startsAt: startsAt, endsAt: endsAt,
+                location: location, notes: notes)
+            merge(created)
+            return true
+        } catch {
+            lastError = calendarError(error, verb: "add an event")
+            return false
+        }
+    }
+
+    /// `fields` carries only what the editor changed, so a bot's concurrent
+    /// write to another field survives the save.
+    @discardableResult
+    func updateEvent(_ event: Event, fields: [String: String]) async -> Bool {
+        guard !fields.isEmpty else { return true }
+        do {
+            merge(try await api.updateEvent(event.id, fields: fields))
+            return true
+        } catch {
+            lastError = calendarError(error, verb: "edit an event")
+            return false
+        }
+    }
+
+    func deleteEvent(_ event: Event) async {
+        do {
+            try await api.deleteEvent(event.id)
+            events.removeAll { $0.id == event.id }
+        } catch {
+            lastError = calendarError(error, verb: "delete an event")
+        }
+    }
+
+    // Keeps the cache in the server's own order (startsAt ascending, id as the
+    // tiebreak) so an edited event moves to its new day without a refetch.
+    private func merge(_ event: Event) {
+        events.removeAll { $0.id == event.id }
+        let at = events.firstIndex {
+            ($0.startsAt, $0.id) > (event.startsAt, event.id)
+        } ?? events.endIndex
+        events.insert(event, at: at)
+    }
+
+    private func calendarError(_ error: Error, verb: String) -> String {
+        APIClient.isUnimplemented(error)
+            ? "This botnetd is too old to \(verb) — restart it from the current build."
+            : error.localizedDescription
+    }
 
     func compact(_ bot: Bot) async {
         guard !compactingBotIDs.contains(bot.id) else { return }
@@ -239,6 +316,10 @@ final class AppStore: ObservableObject {
                 appendMissing(reply, in: botID)
             }
             await refreshBotList()
+            // A reply can have run the calendar tool mid-turn, which leaves the
+            // cached events as stale as the sidebar preview and for the same
+            // reason: the server wrote and nobody told the client.
+            await refreshEvents()
             return
         }
     }

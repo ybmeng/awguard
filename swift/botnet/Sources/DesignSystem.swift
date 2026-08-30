@@ -90,6 +90,19 @@ enum Metric {
     /// Fixed width for a tool-call row's leading icon, so the summaries line up
     /// down the list even though each tool's glyph is a different width.
     static let toolIconWidth: CGFloat = 15
+
+    /// The calendar's leading time column. Wide enough for "12:00 AM +1" at
+    /// rowMeta, so every title in the list starts at the same x.
+    static let eventTimeWidth: CGFloat = 76
+    /// The event list stops growing here for the same reason a bubble does: the
+    /// author sitting at the row's trailing edge has to stay next to the title,
+    /// not a window's width away from it.
+    static let calendarListWidth: CGFloat = 680
+    /// Between two events on the same day.
+    static let eventRowGap: CGFloat = 2
+    /// Between one day's group and the next — large enough that the day headers
+    /// read as the structure of the list.
+    static let dayGroupGap: CGFloat = 18
 }
 
 enum TypeScale {
@@ -107,6 +120,13 @@ enum TypeScale {
     static let codeBlock = Font.system(size: 11, design: .monospaced)
     /// The rotating disclosure chevron on an inspector section header.
     static let sectionChevron = Font.system(size: 9, weight: .semibold)
+    /// A group label over a short list ("Services") — quiet enough that it
+    /// organizes the rows without competing with them.
+    static let sectionLabel = Font.system(size: 10.5, weight: .semibold)
+    /// A service row's leading glyph, sized to sit beside rowTitle text.
+    static let serviceIcon = Font.system(size: 14)
+    /// A day heading in the calendar list.
+    static let dayHeader = Font.system(size: 12, weight: .semibold)
 }
 
 // MARK: - Avatar

@@ -40,7 +40,17 @@ From `swift/botnet/`:
    instead. Read the PNGs yourself and look at them critically.
 5. Wire-contract proof: `BOTNET_API=http://127.0.0.1:8731 ./dev/decode-check.sh`
    compiles Models+APIClient against captured fixtures and live GETs. When you
-   add a decoded field, add a fixture case (present AND absent).
+   add a decoded field, add a fixture case (present AND absent). Keep it
+   READ-ONLY: it defaults to the user's live daemon, so a write probe there
+   would mutate real data. To prove a POST/PATCH/DELETE, compile a throwaway
+   `swiftc Sources/Models.swift Sources/APIClient.swift scratch.swift` in your
+   scratchpad and point it at the demo server — real client, no tree residue.
+6. Other agents run demo servers too, and 8731 is the port they all reach for.
+   Take an odd one (`DEMO_ADDR=127.0.0.1:8793`), and if a request suddenly
+   fails oddly — a 501 with an HTML body was a Python `http.server` that had
+   grabbed the port after botnetd died — re-check `lsof -nP -iTCP:<port>` before
+   believing the failure. Stop your own daemon by that pid, never `pkill -f
+   botnetd`: another agent's server is usually running too.
 
 ## Codebase map (Sources/, ~1600 lines total — read what you touch)
 
@@ -54,7 +64,13 @@ From `swift/botnet/`:
   line); verify mixed open/closed states with `snapshot --details
   --collapse-memory`. State that must survive collapse (drafts) lives on
   BotDetails, not inside the content closure — collapse destroys content.
-- `SidebarView.swift` — bot list, search, delete context menu.
+- `SidebarView.swift` — the Services section, bot list, search, delete context
+  menu. Owns `SidebarSelection` (`.bot(id)` | `.service(kind)`) and
+  `ServiceKind`; ContentView switches the detail pane on that enum, so a new
+  service is a case plus a pane, never a sentinel id.
+- `CalendarView.swift` — the Calendar service's pane: events grouped by day
+  (upcoming, then "Earlier"), each row showing its author. Grouping lives in
+  `EventGroups`/`EventDay` in the same file, not in the view body.
 - `Store.swift` — AppStore, thin @MainActor client over botnetd; caches server
   responses, owns no durable state. `awaitReply` polls a sent turn until it
   settles, then `refreshBotList()` — that refetch is what live-updates
@@ -64,8 +80,9 @@ From `swift/botnet/`:
 - `Models.swift` — Swift mirror of go/botnet/schema.go.
 - `DesignSystem.swift` — Palette / TypeScale / Metric + BotAvatar. Views never
   hardcode a color, font, or magic dimension: add a token if none fits.
-- `Transcript.swift`, `Sheets.swift` — turn/bubble grouping; new-bot and
-  settings sheets.
+- `Transcript.swift`, `Sheets.swift` — turn/bubble grouping; new-bot, settings
+  and event sheets (`EventSheet` + `EventTarget`). New sheets go here, not into
+  the pane that presents them.
 
 ## House patterns
 
@@ -90,6 +107,12 @@ From `swift/botnet/`:
 - Snapshot.swift's capture window gives `.task` fetches no time to land; any
   store data a view loads in `.task` must also be awaited explicitly in
   Snapshot.main() before render (as refresh/loadConversation/loadTools are).
+- Snapshot renders one pane beside the sidebar; pick it with a flag
+  (`--calendar`, `--event-sheet [--new-event]`) — a rendering mode is not the
+  banned `--seed-*` flag. A sheet has to be drawn flat, at its own
+  `.frame(width:height:)`, and its NavigationStack toolbar (Cancel/Save) will
+  NOT appear — the toolbar needs a real window, same as `.inspector`. Verify
+  those buttons by reading the code, not the PNG.
 - Seed snapshots via the demo scratch DB with `sqlite3`, NEVER via source
   hacks. To render a state that needs data (citations, tool_calls), `UPDATE`
   the demo DB's column directly — botnetd migrates new columns in on serve, so
@@ -107,6 +130,15 @@ From `swift/botnet/`:
   no `function`). `ToolDefinition` must decode `function` as optional and render
   an unknown/functionless type gracefully (humanize the `type`), or the whole
   `[ToolDefinition]` decode throws and the Tools inspector breaks.
+- A macOS `Form` puts a TextField's *placeholder* in the label slot, so
+  `Section("Title") { TextField("e.g. Lunch…") }` prints the field's name twice
+  the moment it has a value ("e.g. Lunch with Alex" | "Chase sign-in call").
+  Label the field (`TextField("Title", …)`) and keep a section header only for
+  a multiline field whose label would sit oddly beside a tall box.
+- A pane that fills the window pushes a row's trailing column (an author, a
+  stamp) to the far edge, a hand's width from the content it belongs to. Cap
+  the list's own width the way `Metric.bubbleWidthFraction` caps a bubble —
+  `Metric.calendarListWidth` is the calendar's version — and left-align it.
 - Markdown in bot bubbles: `Text(String)` renders literally — parse with
   `AttributedString(markdown:options:)` at `.inlineOnlyPreservingWhitespace`
   (keeps single newlines, leaves block syntax literal), raw-text fallback on

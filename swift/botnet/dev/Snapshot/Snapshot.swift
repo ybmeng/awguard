@@ -3,12 +3,23 @@
 // a human driving the app.
 //
 //   ./dev/snapshot.sh                       # light + dark into build/snapshots
+//   snapshot --calendar                     # the Calendar service panel
+//   snapshot --event-sheet [--new-event]    # the event editor, rendered flat
 //
 // It talks to whatever BOTNET_API points at, so point it at the demo server
 // from dev/seed-demo.sh rather than the real ~/.botnet/net.db.
 
 import AppKit
 import SwiftUI
+
+/// Which surface the capture puts beside the sidebar.
+private enum Pane {
+    case chat
+    case calendar
+    /// The event editor. The app presents it as a sheet; offscreen it is drawn
+    /// flat, like BotDetails, because a sheet needs a real window to present.
+    case eventSheet(EventTarget)
+}
 
 @main
 struct Snapshot {
@@ -30,34 +41,70 @@ struct Snapshot {
         // BotDetails fetches tools in a .task, but that would race the few
         // run-loop turns the capture allows; fetch before rendering instead.
         await store.loadTools()
+        // Same for CalendarView's events: store.refresh() has already loaded
+        // them, but the dependency belongs here where the capture can see it.
+        await store.refreshEvents()
 
         guard let bot = store.bots.first else {
             fail("no bots at \(ProcessInfo.processInfo.environment["BOTNET_API"] ?? "the default port") — is the demo server running?")
         }
         await store.loadConversation(bot.id)
 
-        render(store: store, bot: bot, dark: dark, details: details,
+        render(store: store, bot: bot, pane: pane(store), dark: dark, details: details,
                collapseMemory: collapseMemory,
                size: CGSize(width: width, height: height), to: out)
     }
 
     @MainActor
-    private static func render(store: AppStore, bot: Bot, dark: Bool, details: Bool,
+    private static func pane(_ store: AppStore) -> Pane {
+        let flags = CommandLine.arguments
+        guard flags.contains("--event-sheet") else {
+            return flags.contains("--calendar") ? .calendar : .chat
+        }
+        // Editing an existing event is the interesting case; fall back to the
+        // blank form when the calendar is empty rather than failing the run.
+        guard !flags.contains("--new-event"), let event = store.events.first else {
+            return .eventSheet(.new)
+        }
+        return .eventSheet(.existing(event))
+    }
+
+    @MainActor
+    private static func render(store: AppStore, bot: Bot, pane: Pane, dark: Bool, details: Bool,
                                collapseMemory: Bool, size: CGSize, to path: String) {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
 
+        let selection: SidebarSelection = {
+            if case .chat = pane { return .bot(bot.id) }
+            return .service(.calendar)
+        }()
+
         let content = HStack(spacing: 0) {
-            SidebarView(selectedBotID: .constant(bot.id), showNewBot: .constant(false))
+            SidebarView(selection: .constant(selection), showNewBot: .constant(false))
                 .frame(width: Metric.sidebarWidth)
             Rectangle().fill(Palette.hairline).frame(width: 1)
-            ChatView(bot: bot, showDetails: .constant(details))
-            // The real app presents BotDetails as an .inspector, which needs a
-            // window toolbar to render; a plain third column previews the same
-            // content offscreen.
-            if details {
-                Rectangle().fill(Palette.hairline).frame(width: 1)
-                BotDetails(bot: bot, expanded: .constant(!collapseMemory))
-                    .frame(width: 300)
+            switch pane {
+            case .chat:
+                ChatView(bot: bot, showDetails: .constant(details))
+                // The real app presents BotDetails as an .inspector, which needs
+                // a window toolbar to render; a plain third column previews the
+                // same content offscreen.
+                if details {
+                    Rectangle().fill(Palette.hairline).frame(width: 1)
+                    BotDetails(bot: bot, expanded: .constant(!collapseMemory))
+                        .frame(width: 300)
+                }
+            case .calendar:
+                CalendarView()
+            case .eventSheet(let target):
+                // Held at the sheet's own size on the pane's ground, so the
+                // capture reads like the presented sheet rather than a form
+                // stretched across the window. Its toolbar (Cancel/Save) needs
+                // a real window and does not appear in a flat render.
+                EventSheet(target: target)
+                    .frame(width: 460, height: 440)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Palette.chrome)
             }
         }
         .environmentObject(store)

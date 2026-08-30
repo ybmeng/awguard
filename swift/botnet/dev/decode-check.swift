@@ -195,6 +195,46 @@ struct DecodeCheck {
                 ])
             }
         }
+        // Calendar events. location and notes are omitempty on the wire, so the
+        // same build has to decode a bot's fully-populated event and a bare
+        // user-created one with both keys absent.
+        let fullEvent = Data("""
+        {"id":"evt_01M1A0000000000000000001","title":"Lunch with Alex","startsAt":"2026-08-31T12:00:00Z","endsAt":"2026-08-31T13:00:00Z","location":"Blue Bottle","notes":"bring the lease","createdBy":"bot_01M16K3W6TZ0EHQFPKZ490BDX2","createdAt":"2026-08-30T09:12:44.31Z","updatedAt":"2026-08-30T09:12:44.31Z"}
+        """.utf8)
+        let bareEvent = Data("""
+        {"id":"evt_01M1A0000000000000000002","title":"Standup","startsAt":"2026-08-31T09:00:00Z","endsAt":"2026-08-31T09:15:00Z","createdBy":"user","createdAt":"2026-08-30T09:12:44Z","updatedAt":"2026-08-30T09:12:44Z"}
+        """.utf8)
+        await check("Event decodes with location/notes present and absent") {
+            let full = try decoder.decode(Event.self, from: fullEvent)
+            let bare = try decoder.decode(Event.self, from: bareEvent)
+            guard full.location == "Blue Bottle", full.hasNotes, !full.isUserCreated,
+                  bare.location == nil, bare.notes == nil, !bare.hasLocation, bare.isUserCreated
+            else {
+                throw NSError(domain: "decode-check", code: 12, userInfo: [
+                    NSLocalizedDescriptionKey: "event optionals decoded wrong: \(full) / \(bare)",
+                ])
+            }
+        }
+        await check("empty event list decodes") {
+            _ = try decoder.decode([Event].self, from: Data("[]".utf8))
+        }
+
+        // The times the app sends back must be the RFC3339 form the server
+        // parses, and must survive a round trip through its own decoder.
+        await check("wireTime round-trips through the decoder") {
+            let sent = Data("""
+            {"id":"evt_x","title":"t","startsAt":"\(APIClient.wireTime(Date(timeIntervalSince1970: 1_790_000_000)))","endsAt":"\(APIClient.wireTime(Date(timeIntervalSince1970: 1_790_003_600)))","createdBy":"user","createdAt":"2026-08-30T09:12:44Z","updatedAt":"2026-08-30T09:12:44Z"}
+            """.utf8)
+            let event = try decoder.decode(Event.self, from: sent)
+            guard Int(event.startsAt.timeIntervalSince1970) == 1_790_000_000,
+                  event.endsAt.timeIntervalSince(event.startsAt) == 3600
+            else {
+                throw NSError(domain: "decode-check", code: 13, userInfo: [
+                    NSLocalizedDescriptionKey: "wireTime round trip drifted: \(event)",
+                ])
+            }
+        }
+
         // The absent-route path: an older botnetd 404s /v1/tools, which the app
         // must read as "hide the section", never as an error.
         await check("404 maps to isUnimplemented") {
@@ -237,6 +277,15 @@ struct DecodeCheck {
                 catch let e where APIClient.isUnimplemented(e) {}
             }
             await check("live GET /v1/config") { _ = try await api.hasKey() }
+            await check("live GET /v1/events (404 = older server, tolerated)") {
+                do { _ = try await api.listEvents() }
+                catch let e where APIClient.isUnimplemented(e) {}
+            }
+            await check("live GET /v1/events?from=&to= (404 tolerated)") {
+                let now = Date()
+                do { _ = try await api.listEvents(from: now, to: now.addingTimeInterval(86_400)) }
+                catch let e where APIClient.isUnimplemented(e) {}
+            }
             for b in bots {
                 await check("live GET /v1/bots/\(b.id)/messages") {
                     _ = try await api.messages(b.id)
