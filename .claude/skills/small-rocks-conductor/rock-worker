@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Transport to a cheap OpenRouter model. Reads a prompt on stdin, prints the
+model's reply on stdout. Owns nothing but the wire call: the rock subagent
+composes the prompt and is the trusted party that applies and verifies the
+reply. Key resolves like botnetd (OPENROUTER_API_KEY else
+~/.config/botnet/openrouter.txt), so no new secret path.
+
+Usage: rock-worker [-m model] < prompt.txt
+Model default deepseek/deepseek-chat; override with -m or ROCK_WORKER_MODEL."""
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def resolve_key():
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if key:
+        return key
+    path = os.path.join(os.path.expanduser("~"), ".config", "botnet", "openrouter.txt")
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def main():
+    model = os.environ.get("ROCK_WORKER_MODEL", "deepseek/deepseek-chat")
+    args = sys.argv[1:]
+    if args and args[0] == "-m":
+        if len(args) < 2:
+            sys.exit("rock-worker: -m needs a model")
+        model = args[1]
+
+    key = resolve_key()
+    if not key:
+        sys.exit("rock-worker: no OpenRouter key (OPENROUTER_API_KEY or ~/.config/botnet/openrouter.txt)")
+
+    prompt = sys.stdin.read()
+    if not prompt.strip():
+        sys.exit("rock-worker: empty prompt on stdin")
+
+    body = json.dumps({
+        "model": model,
+        "temperature": 0.2,
+        "max_tokens": 8000,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+
+    req = urllib.request.Request(
+        ENDPOINT,
+        data=body,
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        sys.exit("rock-worker: HTTP %d %s" % (e.code, e.read().decode(errors="replace")[:500]))
+    except urllib.error.URLError as e:
+        sys.exit("rock-worker: %s" % e.reason)
+
+    try:
+        sys.stdout.write(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError):
+        sys.exit("rock-worker: unexpected response shape: %s" % json.dumps(data)[:500])
+
+
+if __name__ == "__main__":
+    main()
