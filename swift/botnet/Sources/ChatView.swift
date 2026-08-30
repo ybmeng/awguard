@@ -12,6 +12,9 @@ struct ChatView: View {
     @Binding var showDetails: Bool
 
     @State private var draft = ""
+    @State private var renaming = false
+    @State private var renameDraft = ""
+    @FocusState private var renameFocused: Bool
 
     private var messages: [Message] { store.messages(for: bot.id) }
     private var turns: [ChatTurn] { ChatTurn.build(from: messages) }
@@ -29,14 +32,40 @@ struct ChatView: View {
         }
         .background(Palette.chrome)
         .task(id: bot.id) { await store.loadConversation(bot.id) }
+        // An in-progress rename must never carry one bot's draft to another.
+        .onChange(of: bot.id) {
+            renaming = false
+            renameDraft = ""
+        }
     }
 
     private var header: some View {
         HStack(spacing: 8) {
             BotAvatar(botID: bot.id, size: Metric.avatarSmall)
-            Text(bot.displayName)
-                .font(TypeScale.headerTitle)
-                .foregroundStyle(Palette.primaryText)
+            if renaming {
+                TextField("", text: $renameDraft)
+                    .font(TypeScale.headerTitle)
+                    .foregroundStyle(Palette.primaryText)
+                    .textFieldStyle(.plain)
+                    .focused($renameFocused)
+                    .onSubmit(commitRename)
+                    .onExitCommand { renaming = false }
+                    .onAppear { renameFocused = true }
+            } else {
+                Text(bot.displayName)
+                    .font(TypeScale.headerTitle)
+                    .foregroundStyle(Palette.primaryText)
+                Button {
+                    renameDraft = bot.displayName
+                    renaming = true
+                } label: {
+                    Image(systemName: "pencil")
+                        .foregroundStyle(Palette.secondaryText)
+                }
+                .buttonStyle(.borderless)
+                .help("Rename bot")
+                .accessibilityIdentifier("renameBotButton")
+            }
             Spacer()
             actionsMenu
             Button { showDetails.toggle() } label: {
@@ -158,6 +187,22 @@ struct ChatView: View {
     }
 
     private var circleDiameter: CGFloat { Metric.composerMinHeight - 20 }
+
+    // A failed save keeps the field open so the name isn't lost; the error
+    // itself surfaces through the store's alert. An empty or unchanged name
+    // just ends the edit — no patch to send.
+    private func commitRename() {
+        let trimmed = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != bot.displayName else {
+            renaming = false
+            return
+        }
+        Task {
+            if await store.updateBot(bot, fields: ["displayName": trimmed]) {
+                renaming = false
+            }
+        }
+    }
 
     private func sendDraft() {
         let text = draft
