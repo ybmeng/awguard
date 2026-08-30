@@ -83,6 +83,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/bots/{id}/compact", s.compact)
 	mux.HandleFunc("GET /v1/messages/{id}", s.getMessage)
 	mux.HandleFunc("GET /v1/messages", s.batchMessages)
+	mux.HandleFunc("GET /v1/events", s.listEvents)
+	mux.HandleFunc("POST /v1/events", s.createEvent)
+	mux.HandleFunc("PATCH /v1/events/{id}", s.patchEvent)
+	mux.HandleFunc("DELETE /v1/events/{id}", s.deleteEvent)
 	mux.HandleFunc("GET /v1/changes", s.getChanges)
 	return mux
 }
@@ -460,6 +464,157 @@ func (s *Server) writeChain(w http.ResponseWriter, botID BotID, code int) {
 		segs = []Segment{}
 	}
 	writeJSON(w, code, segs)
+}
+
+// ── Events ────────────────────────────────────────────────────────────────────
+// The calendar's REST face: the user's half of the service whose other half is
+// the bot's calendar tool. Both write the same table, so an event a bot booked
+// and one the user typed are indistinguishable afterwards except by createdBy.
+//
+// There is no If-Match here and no version on the wire — event edits are
+// last-write-wins by decision, not by omission (see Event in schema.go).
+
+// eventInput is the wire body for POST and PATCH. Times arrive as STRINGS
+// rather than as time.Time so a malformed one answers `startsAt "tomorrow" is
+// not an RFC3339 time...` instead of encoding/json's message about a Go type.
+// Every field is a pointer, which is what makes PATCH partial: absent leaves the
+// field alone, and "" is a real value that clears a location or a note.
+type eventInput struct {
+	Title    *string `json:"title"`
+	StartsAt *string `json:"startsAt"`
+	EndsAt   *string `json:"endsAt"`
+	Location *string `json:"location"`
+	Notes    *string `json:"notes"`
+}
+
+// eventTime parses one RFC3339 field from the wire, naming the field so a 400
+// says which one was wrong.
+func eventTime(field, raw string) (time.Time, error) {
+	t, err := parseEventTime(raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%s %q is not an RFC3339 time like 2026-08-31T15:00:00Z", field, raw)
+	}
+	return t, nil
+}
+
+// queryEventTime reads an optional RFC3339 query parameter; absent is the zero
+// time, which ListEvents reads as an unbounded end of the window.
+func queryEventTime(r *http.Request, name string) (time.Time, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	return eventTime(name, raw)
+}
+
+// listEvents returns the calendar in start order, optionally windowed by
+// ?from=&to= (RFC3339). The window is an overlap test — an event already in
+// progress when the window opens is in it — so "what's on today" includes the
+// meeting that started yesterday evening. Carries X-BotNet-State like the other
+// collection GETs, so a client can start syncing from this call.
+func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
+	from, err := queryEventTime(r, "from")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	to, err := queryEventTime(r, "to")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.stateHeader(w)
+	events, err := s.store.ListEvents(from, to)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	if events == nil {
+		events = []Event{}
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+// createEvent books an event from the UI. createdBy is the "user" sentinel and
+// is never taken from the body — the caller does not get to choose an author.
+func (s *Server) createEvent(w http.ResponseWriter, r *http.Request) {
+	var in eventInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if in.Title == nil || in.StartsAt == nil || in.EndsAt == nil {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Errorf("title, startsAt and endsAt are required"))
+		return
+	}
+	starts, err := eventTime("startsAt", *in.StartsAt)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	ends, err := eventTime("endsAt", *in.EndsAt)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	ev := Event{Title: *in.Title, StartsAt: starts, EndsAt: ends}
+	if in.Location != nil {
+		ev.Location = *in.Location
+	}
+	if in.Notes != nil {
+		ev.Notes = *in.Notes
+	}
+	// The remaining rules (empty title, an end before its start) live in the
+	// store, so the tool path enforces exactly the same ones; ErrInvalid maps
+	// to 400 through writeStatus.
+	stored, err := s.store.CreateEvent(ev, userAuthor)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, stored)
+}
+
+// patchEvent changes any subset of an event's authored fields. createdBy and the
+// timestamps are not patchable: they are the write path's to stamp.
+func (s *Server) patchEvent(w http.ResponseWriter, r *http.Request) {
+	var in eventInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	p := EventPatch{Title: in.Title, Location: in.Location, Notes: in.Notes}
+	if in.StartsAt != nil {
+		t, err := eventTime("startsAt", *in.StartsAt)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		p.StartsAt = &t
+	}
+	if in.EndsAt != nil {
+		t, err := eventTime("endsAt", *in.EndsAt)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		p.EndsAt = &t
+	}
+	ev, err := s.store.UpdateEvent(EventID(r.PathValue("id")), p)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ev)
+}
+
+func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteEvent(EventID(r.PathValue("id"))); err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // sendMessage persists the user's turn and returns 202 immediately, WITHOUT

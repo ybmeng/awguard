@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // The model's memory tool, tested at the wire: a scripted fake OpenRouter
@@ -146,13 +147,17 @@ func TestToolLoopReadReplaceAnswer(t *testing.T) {
 
 	// Request 0 advertised the memory FUNCTION tool — flat schema with the strict
 	// command enum and a description spelling out the commands — alongside the
-	// web_search SERVER tool (its own shape is pinned in websearch_test.go).
+	// calendar function tool (pinned in calendar_test.go) and the web_search
+	// SERVER tool (its own shape is pinned in websearch_test.go).
 	first := sc.request(t, 0)
-	if len(first.Tools) != 2 || first.Tools[0].Function.Name != "memory" {
-		t.Fatalf("tools advertised = %+v, want memory then web_search", first.Tools)
+	if len(first.Tools) != 3 || first.Tools[0].Function.Name != "memory" {
+		t.Fatalf("tools advertised = %+v, want memory, calendar, web_search", first.Tools)
 	}
-	if first.Tools[1].Type != webSearchToolName {
-		t.Errorf("second tool type = %q, want %q", first.Tools[1].Type, webSearchToolName)
+	if first.Tools[1].Function.Name != calendarToolName {
+		t.Errorf("second tool = %q, want %q", first.Tools[1].Function.Name, calendarToolName)
+	}
+	if first.Tools[2].Type != webSearchToolName {
+		t.Errorf("third tool type = %q, want %q", first.Tools[2].Type, webSearchToolName)
 	}
 	fn := first.Tools[0].Function
 	props, _ := fn.Parameters["properties"].(map[string]any)
@@ -292,7 +297,7 @@ func TestMemoryToolValidation(t *testing.T) {
 
 	cases := []struct{ name, tool, args, want string }{
 		{"unknown tool", "launch_missiles", `{}`,
-			"error: unknown tool 'launch_missiles' — valid: memory, web_search"},
+			"error: unknown tool 'launch_missiles' — valid: memory, calendar, web_search"},
 		{"bad json", "memory", `not json`,
 			`error: arguments must be a JSON object like {"command": "read"}`},
 		{"missing command", "memory", `{}`,
@@ -354,8 +359,9 @@ func TestToolLoopCap(t *testing.T) {
 	}
 }
 
-// TestPromptContextOrder pins the settled context order: system prompt, then
-// the memory block, then the ONE summary, then the open segment's messages.
+// TestPromptContextOrder pins the settled context order: system prompt, the
+// current date-time line, the memory block, the ONE summary, then the open
+// segment's messages.
 func TestPromptContextOrder(t *testing.T) {
 	msgs := promptContext(Prompt{
 		Bot:      Bot{SystemPrompt: "sys"},
@@ -363,25 +369,62 @@ func TestPromptContextOrder(t *testing.T) {
 		Summary:  "sum",
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	})
-	if len(msgs) != 4 {
-		t.Fatalf("context = %d turns, want 4: %+v", len(msgs), msgs)
+	if len(msgs) != 5 {
+		t.Fatalf("context = %d turns, want 5: %+v", len(msgs), msgs)
 	}
 	if msgs[0].Content != "sys" {
 		t.Errorf("turn 0 = %q, want the system prompt first", msgs[0].Content)
 	}
-	if !strings.HasPrefix(msgs[1].Content, memoryPreamble) || !strings.HasSuffix(msgs[1].Content, "mem") {
-		t.Errorf("turn 1 = %q, want the framed memory block", msgs[1].Content)
+	if !strings.HasPrefix(msgs[1].Content, "Current date and time: ") {
+		t.Errorf("turn 1 = %q, want the current date-time line", msgs[1].Content)
 	}
-	if !strings.HasPrefix(msgs[2].Content, summaryPreamble) {
-		t.Errorf("turn 2 = %q, want the summary block", msgs[2].Content)
+	if !strings.HasPrefix(msgs[2].Content, memoryPreamble) || !strings.HasSuffix(msgs[2].Content, "mem") {
+		t.Errorf("turn 2 = %q, want the framed memory block", msgs[2].Content)
 	}
-	if msgs[3].Role != "user" || msgs[3].Content != "hi" {
-		t.Errorf("turn 3 = %+v, want the user message", msgs[3])
+	if !strings.HasPrefix(msgs[3].Content, summaryPreamble) {
+		t.Errorf("turn 3 = %q, want the summary block", msgs[3].Content)
 	}
-	for i, m := range msgs[:3] {
+	if msgs[4].Role != "user" || msgs[4].Content != "hi" {
+		t.Errorf("turn 4 = %+v, want the user message", msgs[4])
+	}
+	for i, m := range msgs[:4] {
 		if m.Role != "system" {
 			t.Errorf("turn %d role = %q, want system", i, m.Role)
 		}
+	}
+}
+
+// TestPromptAlwaysCarriesTheCurrentTime: unlike memory and the summary, the
+// date-time line is unconditional — a bot with no system prompt, no memory and
+// no history still gets it, because the calendar tool is useless to a model
+// that does not know today's date. It parses as RFC3339 and it is one line.
+func TestPromptAlwaysCarriesTheCurrentTime(t *testing.T) {
+	msgs := promptContext(Prompt{})
+	if len(msgs) != 1 {
+		t.Fatalf("empty prompt = %d turns, want just the date-time line: %+v", len(msgs), msgs)
+	}
+	line := msgs[0].Content
+	if msgs[0].Role != "system" {
+		t.Errorf("date-time turn role = %q, want system", msgs[0].Role)
+	}
+	if strings.Contains(line, "\n") {
+		t.Errorf("date-time turn is %d lines, want one: %q", strings.Count(line, "\n")+1, line)
+	}
+	stamp, ok := strings.CutPrefix(line, "Current date and time: ")
+	if !ok {
+		t.Fatalf("date-time line = %q, want the settled prefix", line)
+	}
+	stamp, _, _ = strings.Cut(stamp, " (")
+	got, err := time.Parse(time.RFC3339, stamp)
+	if err != nil {
+		t.Fatalf("date-time line carries %q, which is not RFC3339: %v", stamp, err)
+	}
+	if d := time.Since(got); d < -time.Minute || d > time.Minute {
+		t.Errorf("date-time line says %s, which is %v from now", got, d)
+	}
+	// The weekday spelled out is what makes "next Tuesday" resolvable.
+	if !strings.Contains(line, got.Format("Monday")) {
+		t.Errorf("date-time line %q does not name the weekday", line)
 	}
 }
 
@@ -407,8 +450,8 @@ func TestToollessRequestOmitsTools(t *testing.T) {
 			t.Errorf("empty memory injected a block: %q", m.Content)
 		}
 	}
-	if len(req.Messages) != 2 { // system prompt + user turn
-		t.Errorf("request carried %d turns, want 2: %+v", len(req.Messages), req.Messages)
+	if len(req.Messages) != 3 { // system prompt + the date-time line + user turn
+		t.Errorf("request carried %d turns, want 3: %+v", len(req.Messages), req.Messages)
 	}
 }
 

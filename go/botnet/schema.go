@@ -18,6 +18,7 @@ import (
 // with no coordinator, self-describing in logs. e.g. "bot_01J9X..." .
 type BotID string     // "bot_" + ULID
 type SegmentID string // "seg_" + ULID
+type EventID string   // "evt_" + ULID
 
 // ── Bot ──────────────────────────────────────────────────────────────────────
 // Minimal v0: a bot is a system prompt pointed at a model. That's enough to
@@ -45,6 +46,12 @@ type SegmentID string // "seg_" + ULID
 // operations are planned) is one appended entry. A malformed call gets an
 // instructive tool-result error to self-correct from rather than failing the
 // turn. Executions run server-side mid-turn as plain store writes, no If-Match.
+// DECISION (that shape generalized, and the surface grew): the command-registry
+// pattern above is now how EVERY stateful tool is declared, and "memory" is one
+// of several. web_search came first (see Message.Citations), and "calendar" —
+// the Event service below — is the second: same flat schema, same command enum
+// derived from its own registry, same instructive tool-result errors. Whatever
+// the surface, it is a table of commands, never a nested union.
 type Bot struct {
 	ID           BotID                 `json:"id"`
 	DisplayName  string                `json:"displayName"`
@@ -266,6 +273,64 @@ const (
 	StatusAwaiting MessageStatus = "awaiting" // user turn, model call in flight
 	StatusFailed   MessageStatus = "failed"   // user turn, model call failed; Error is set
 )
+
+// ── Event ─────────────────────────────────────────────────────────────────────
+// The calendar: the first SERVICE, as opposed to a property of a bot. An Event
+// is owned by the net rather than by any one bot, because the point of it is
+// that the user and every bot look at the SAME calendar — a bot books a lunch,
+// the user sees it in the Calendar panel, another bot lists it next turn.
+//
+// DECISION (native, not an integration): events live in the server's own SQLite
+// beside bots and messages. That makes the calendar a fourth trigger-captured
+// table and therefore a first-class sync citizen for free; an external provider
+// (CalDAV, Google) would be a syncing peer of this table later, not a
+// replacement for it.
+//
+// DECISION (no If-Match): events are NOT version-checked the way a bot's
+// authored fields are. Calendar edits are low-contention — one user and a
+// handful of bots, rarely on the same event in the same second — so a PATCH is
+// last-write-wins, matching the call already made for Bot.Memory. There is no
+// derived Version field here at all, so there is nothing for a client to send.
+//
+// DECISION (CreatedBy is a BotID or the "user" sentinel): a plain string, not a
+// BotID, because the user is not a bot and inventing a bot row for them would
+// leak into the sidebar. The UI reads it as "a bot if it resolves in the bot
+// list, otherwise you". This is the same shape Message.Role already uses to
+// mean user-vs-bot, and it inherits the same OPEN (topology): if bots ever
+// address each other, both places want one explicit actor type.
+//
+// DECISION (storage format): times are stored as FIXED-WIDTH RFC3339 UTC to the
+// second — not the RFC3339Nano the other tables use. ListEvents' overlap filter
+// is a string comparison in SQL, and RFC3339Nano drops trailing zeros from the
+// fractional part, so "12:00:00Z" would sort after "12:00:00.5Z". Fixed width
+// makes lexicographic order agree with chronological order by construction, and
+// second precision is all a calendar means.
+//
+// OPEN (recurrence, all-day, invitees, reminders): v0 is a flat interval with a
+// title. Recurrence in particular is NOT a bolt-on — an RRULE turns one row into
+// an expansion at read time, which changes what ListEvents even is — so decide
+// it before the calendar has data worth migrating.
+type Event struct {
+	ID       EventID   `json:"id"`
+	Title    string    `json:"title"`
+	StartsAt time.Time `json:"startsAt"`
+	EndsAt   time.Time `json:"endsAt"` // must not precede StartsAt
+	Location string    `json:"location,omitempty"`
+	Notes    string    `json:"notes,omitempty"`
+
+	// CreatedBy is the BotID that created the event, or "user" for one created
+	// in the UI. It is set by the write path, never by the caller: a tool write
+	// stamps the calling bot, the REST write stamps "user", so an event can
+	// never claim an author it did not have.
+	CreatedBy string `json:"createdBy"`
+
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// userAuthor is the CreatedBy sentinel for an event the user created in the UI,
+// as opposed to one a bot booked with the calendar tool.
+const userAuthor = "user"
 
 // ── PrivateBotNet ─────────────────────────────────────────────────────────────
 // Top-level owner: which bots exist. Shared resources (tools, membership) land

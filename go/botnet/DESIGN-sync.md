@@ -543,6 +543,37 @@ unversioned, and outside the change feed.
 
 ---
 
+## 14. The calendar: a fourth synced entity (added 2026-08-30)
+
+The calendar service (`events`, `Event`) is the first entity added since the feed shipped,
+so it is also the test of whether the shape generalizes. It did, with no change to the
+protocol: a table, three `chg_event_*` triggers, one `ChangedIDs` bucket, and one `bucket()`
+case. `GET /v1/changes` grows an `events` bucket with tombstones; the cursor, the coalescing
+rules and the 410 resync path are untouched.
+
+Two things are genuinely new, and both are about **entity ownership**:
+
+- **Events belong to the net, not to a bot.** `DeleteBot` cascades to that bot's messages
+  and segments; it deliberately does NOT touch events. An event a departed bot booked is
+  still on the user's calendar, and deleting it silently would be data loss disguised as
+  cleanup. `Event.CreatedBy` therefore names a bot that may no longer exist — the UI reads
+  an unresolvable id as "a bot that is gone", exactly as it already reads an unresolvable
+  `Bot.Model`.
+- **Two writers, one row, no version.** The REST path (the user's Calendar panel) and the
+  `calendar` tool (a bot, mid-turn) write the same table. Events are NOT `If-Match`
+  versioned: calendar edits are low-contention, so a PATCH is last-write-wins, matching the
+  call already made for `Bot.Memory`. `UpdateEvent` still does its read and its write in one
+  transaction, because last-write-wins is about which *value* survives, not about letting a
+  concurrent patch clobber a field it never named.
+
+One storage detail the feed does not care about but a reader will: event times are stored as
+**fixed-width RFC3339 UTC to the second**, not the `RFC3339Nano` every other table uses.
+`ListEvents`' overlap filter is a TEXT comparison, and `RFC3339Nano` drops trailing zeros
+from the fraction, so `12:00:00Z` would sort after `12:00:00.5Z`. Fixed width makes
+lexicographic order agree with chronological order by construction.
+
+---
+
 ## Appendix: store/tx-layer facts the implementation will need
 
 Recorded here so this survives outside any one session's context.
@@ -584,6 +615,9 @@ mutation.
 | `Seal` | segment | updated (sealed) + created (next segment) |
 | `failInterruptedSends` (startup sweep) | messages | updated |
 | `markExistingBotsRead` (one-shot backfill) | bots | updated |
+| `CreateEvent` | event | created (both writers: `POST /v1/events` and the `calendar` tool) |
+| `UpdateEvent` | event | updated (a field-only patch still emits — row trigger) |
+| `DeleteEvent` | event | destroyed (tombstone) |
 
 Note `AppendMessage` also updates `bots.last_message_at`/`last_message_text`, so it emits
 **two** change rows (message created, bot updated). Easy to miss; the sidebar depends on it.
@@ -616,6 +650,6 @@ AUTOINCREMENT` — see §3.
 - The startup sweep is safe **only** at startup, because nothing is in flight in a process
   that has not begun serving. Called from `migrate`, which is called only from `Open`.
 
-**Test suite:** 26 tests, `go test ./go/botnet/...` ≈0.4s, full gate (build + vet + test)
-≈2.3s, `-race -count=3` ≈5s. No network, no external fixtures; migration tests build their
+**Test suite:** 97 tests, `go test ./go/botnet/...` ≈1.4s, full gate (build + vet + test)
+≈2.3s, `-race -count=1` ≈9s. No network, no external fixtures; migration tests build their
 own in `t.TempDir()`.

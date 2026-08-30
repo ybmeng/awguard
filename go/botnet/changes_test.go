@@ -170,6 +170,35 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 		{"segment", string(seg1.ID), "created"},
 	}, "Seal")
 
+	// The calendar service. Events are owned by the net, not by the bot, so
+	// they survive DeleteBot below — but each of the three writes must emit,
+	// or a second client's Calendar panel goes stale.
+	mark = topSeq(t, s)
+	ev, err := s.CreateEvent(Event{
+		Title:    "Lunch with Alex",
+		StartsAt: time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC),
+		EndsAt:   time.Date(2026, 8, 31, 13, 0, 0, 0, time.UTC),
+	}, string(bot.ID))
+	if err != nil {
+		t.Fatalf("create event: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark), []changeRow{{"event", string(ev.ID), "created"}}, "CreateEvent")
+
+	// A field-only UPDATE still fires the row trigger — the same property the
+	// memory write above relies on.
+	mark = topSeq(t, s)
+	where := "the good taco place"
+	if _, err := s.UpdateEvent(ev.ID, EventPatch{Location: &where}); err != nil {
+		t.Fatalf("update event: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark), []changeRow{{"event", string(ev.ID), "updated"}}, "UpdateEvent")
+
+	mark = topSeq(t, s)
+	if err := s.DeleteEvent(ev.ID); err != nil {
+		t.Fatalf("delete event: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark), []changeRow{{"event", string(ev.ID), "destroyed"}}, "DeleteEvent")
+
 	// DeleteBot tombstones everything the bot owned: both messages, both
 	// segments, then the bot itself.
 	mark = topSeq(t, s)

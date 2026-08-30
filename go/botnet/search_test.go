@@ -379,8 +379,8 @@ func TestClientWebSearchToolOffered(t *testing.T) {
 	if err := json.Unmarshal(sc.requests[0], &payload); err != nil {
 		t.Fatalf("decode request: %v", err)
 	}
-	if len(payload.Tools) != 2 {
-		t.Fatalf("offered %d tools, want 2 (memory, web_search)", len(payload.Tools))
+	if len(payload.Tools) != 3 {
+		t.Fatalf("offered %d tools, want 3 (memory, calendar, web_search)", len(payload.Tools))
 	}
 	var searchTool struct {
 		Type     string `json:"type"`
@@ -388,11 +388,13 @@ func TestClientWebSearchToolOffered(t *testing.T) {
 			Name string `json:"name"`
 		} `json:"function"`
 	}
-	if err := json.Unmarshal(payload.Tools[1], &searchTool); err != nil {
+	// Search is always the LAST entry — the store-backed tools come first.
+	last := payload.Tools[len(payload.Tools)-1]
+	if err := json.Unmarshal(last, &searchTool); err != nil {
 		t.Fatalf("decode web_search tool: %v", err)
 	}
 	if searchTool.Type != "function" || searchTool.Function.Name != webSearchFuncName {
-		t.Errorf("tool 1 = %s, want the web_search function tool", payload.Tools[1])
+		t.Errorf("last tool = %s, want the web_search function tool", last)
 	}
 }
 
@@ -578,13 +580,14 @@ func TestToolResultTruncatedInAudit(t *testing.T) {
 func TestToolsEndpointReflectsConfiguredSearch(t *testing.T) {
 	// No backend configured: the fallback server tool.
 	h := newHarness(t, &fakeLLM{})
-	if got := toolNamesFromEndpoint(t, h.ts.URL+"/v1/tools"); got != memoryToolName+","+webSearchToolName {
+	storeTools := memoryToolName + "," + calendarToolName // ungated; always offered
+	if got := toolNamesFromEndpoint(t, h.ts.URL+"/v1/tools"); got != storeTools+","+webSearchToolName {
 		t.Errorf("no-backend /v1/tools = %q, want the OpenRouter server tool fallback", got)
 	}
 
 	// A backend configured: the client function tool.
 	h.srv.ConfigureSearch(NewRouter([]SearchBackend{&fakeBackend{name: "fake"}}, ""))
-	if got := toolNamesFromEndpoint(t, h.ts.URL+"/v1/tools"); got != memoryToolName+","+webSearchFuncName {
+	if got := toolNamesFromEndpoint(t, h.ts.URL+"/v1/tools"); got != storeTools+","+webSearchFuncName {
 		t.Errorf("with-backend /v1/tools = %q, want the client web_search function tool", got)
 	}
 }

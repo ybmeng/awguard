@@ -176,14 +176,26 @@ const summaryPreamble = "Summary of the conversation so far (everything before t
 // the user's instructions.
 const memoryPreamble = "## Your memory\n\nYour persistent memory, editable with the memory tools:\n\n"
 
+// nowLine is the turn's ground truth for "when is now". It is ONE line and it
+// is ALWAYS present, unlike the memory and summary blocks: a model that does
+// not know today's date cannot resolve "tomorrow at 3", which makes the
+// calendar tool useless and makes it guess rather than ask. Local zone with its
+// offset, matching what the calendar tool's listings print, so the model never
+// has to convert. The weekday is spelled out because "next Tuesday" is a far
+// more common way to book something than a date is.
+func nowLine(t time.Time) string {
+	return "Current date and time: " + t.Format(time.RFC3339) + " (" + t.Format("Monday, 2 January 2006") + ")"
+}
+
 // promptContext assembles the wire messages for one turn, in the settled
-// order: system prompt, memory (when non-empty), the ONE summary, then the
-// open segment's raw messages.
+// order: system prompt, the current date-time line, memory (when non-empty),
+// the ONE summary, then the open segment's raw messages.
 func promptContext(p Prompt) []wireMsg {
-	msgs := make([]wireMsg, 0, len(p.Messages)+3)
+	msgs := make([]wireMsg, 0, len(p.Messages)+4)
 	if p.Bot.SystemPrompt != "" {
 		msgs = append(msgs, wireMsg{Role: "system", Content: p.Bot.SystemPrompt})
 	}
+	msgs = append(msgs, wireMsg{Role: "system", Content: nowLine(time.Now())})
 	if p.Memory != "" {
 		msgs = append(msgs, wireMsg{Role: "system", Content: memoryPreamble + p.Memory})
 	}

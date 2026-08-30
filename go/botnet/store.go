@@ -111,6 +111,20 @@ func parseTime(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
 }
 
+// Event times are the one exception to the format above: fixed-width RFC3339
+// UTC to the second, because ListEvents filters a range with a TEXT comparison
+// and RFC3339Nano's variable-length fraction does not sort chronologically —
+// see the storage DECISION on Event. Everything an Event holds goes through
+// here, timestamps included, so one table never mixes two encodings.
+
+func fmtEventTime(t time.Time) string {
+	return t.UTC().Truncate(time.Second).Format(time.RFC3339)
+}
+
+func parseEventTime(s string) (time.Time, error) {
+	return time.Parse(time.RFC3339, s)
+}
+
 // migrate creates the tables if absent and brings older databases up to the
 // current shape. Idempotent — safe on every Open. Every step is guarded by the
 // state it produces, so a second run changes nothing: no second segment 0, no
@@ -149,6 +163,24 @@ CREATE TABLE IF NOT EXISTS segments (
 -- One segment per position per bot: the structural guard that a re-run of the
 -- backfill cannot produce a second segment 0.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_segments_bot_idx ON segments(bot_id, idx);
+-- The calendar service. Owned by the net, not by a bot: the user and every bot
+-- read and write the SAME calendar, which is the whole point of it being a
+-- service rather than a per-bot field. Times are fixed-width RFC3339 UTC to the
+-- second so the range filter below can compare them as text — see the storage
+-- DECISION on Event.
+CREATE TABLE IF NOT EXISTS events (
+    id         TEXT PRIMARY KEY,
+    title      TEXT NOT NULL,
+    starts_at  TEXT NOT NULL,
+    ends_at    TEXT NOT NULL,
+    location   TEXT NOT NULL DEFAULT '',
+    notes      TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+-- The calendar is read as a time range far more than by id.
+CREATE INDEX IF NOT EXISTS idx_events_starts ON events(starts_at);
 -- Bookkeeping for one-shot migration steps; see once().
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -162,7 +194,7 @@ CREATE TABLE IF NOT EXISTS meta (
 -- cursor silently resolve to the wrong place instead of failing.
 CREATE TABLE IF NOT EXISTS change_log (
     seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity    TEXT NOT NULL, -- 'bot' | 'message' | 'segment'
+    entity    TEXT NOT NULL, -- 'bot' | 'message' | 'segment' | 'event'
     entity_id TEXT NOT NULL,
     op        TEXT NOT NULL  -- 'created' | 'updated' | 'destroyed'
 );
@@ -192,6 +224,15 @@ CREATE TRIGGER IF NOT EXISTS chg_segment_updated AFTER UPDATE ON segments BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS chg_segment_destroyed AFTER DELETE ON segments BEGIN
     INSERT INTO change_log (entity, entity_id, op) VALUES ('segment', OLD.id, 'destroyed');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_event_created AFTER INSERT ON events BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('event', NEW.id, 'created');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_event_updated AFTER UPDATE ON events BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('event', NEW.id, 'updated');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_event_destroyed AFTER DELETE ON events BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('event', OLD.id, 'destroyed');
 END;
 `
 	if _, err := s.db.Exec(schema); err != nil {
@@ -1078,6 +1119,207 @@ func getBot(q dbtx, id BotID) (Bot, error) {
 		return Bot{}, fmt.Errorf("get bot: %w", err)
 	}
 	return b, nil
+}
+
+// ── Events ────────────────────────────────────────────────────────────────────
+// The calendar service. Events belong to the net rather than to a bot, so the
+// REST path (the user's Calendar panel) and the calendar tool (a bot, mid-turn)
+// are two writers on ONE table — which is the whole point of a service. Every
+// write here is an ordinary INSERT/UPDATE/DELETE, so the chg_event_* triggers
+// capture it into change_log with no Go code remembering to.
+
+const eventColumns = `id, title, starts_at, ends_at, location, notes, created_by, created_at, updated_at`
+
+func scanEvent(sc interface{ Scan(...any) error }) (Event, error) {
+	var e Event
+	var startsAt, endsAt, createdAt, updatedAt string
+	if err := sc.Scan(&e.ID, &e.Title, &startsAt, &endsAt, &e.Location, &e.Notes,
+		&e.CreatedBy, &createdAt, &updatedAt); err != nil {
+		return Event{}, err
+	}
+	for _, f := range []struct {
+		raw  string
+		name string
+		into *time.Time
+	}{
+		{startsAt, "starts_at", &e.StartsAt},
+		{endsAt, "ends_at", &e.EndsAt},
+		{createdAt, "created_at", &e.CreatedAt},
+		{updatedAt, "updated_at", &e.UpdatedAt},
+	} {
+		t, err := parseEventTime(f.raw)
+		if err != nil {
+			return Event{}, fmt.Errorf("parse %s: %w", f.name, err)
+		}
+		*f.into = t
+	}
+	return e, nil
+}
+
+// EventPatch is the set of fields an update may change; a nil field is left
+// alone. There is no version to condition on — event edits are last-write-wins
+// (the no-If-Match DECISION on Event) — and neither CreatedBy nor the
+// timestamps are patchable, because they are the write path's to stamp.
+type EventPatch struct {
+	Title    *string    `json:"title"`
+	StartsAt *time.Time `json:"startsAt"`
+	EndsAt   *time.Time `json:"endsAt"`
+	Location *string    `json:"location"`
+	Notes    *string    `json:"notes"`
+}
+
+// validateEvent is the ONE place an event's own rules live, so the REST handler
+// and the bot's calendar tool cannot end up enforcing different ones. It runs
+// on the event as it would be STORED, so a patch is checked against the merged
+// result rather than against the fields it happened to carry.
+func validateEvent(e Event) error {
+	if strings.TrimSpace(e.Title) == "" {
+		return fmt.Errorf("%w: title must not be empty", ErrInvalid)
+	}
+	if e.StartsAt.IsZero() || e.EndsAt.IsZero() {
+		return fmt.Errorf("%w: startsAt and endsAt are required", ErrInvalid)
+	}
+	if e.EndsAt.Before(e.StartsAt) {
+		return fmt.Errorf("%w: endsAt %s precedes startsAt %s",
+			ErrInvalid, fmtEventTime(e.EndsAt), fmtEventTime(e.StartsAt))
+	}
+	return nil
+}
+
+// CreateEvent stores one event and returns it as stored. The caller authors
+// title, times, location and notes; the id, the author and both timestamps are
+// stamped HERE, so an event can never claim an author or a creation time it did
+// not have. createdBy is a BotID for a tool write and "user" for a UI one.
+func (s *Store) CreateEvent(e Event, createdBy string) (Event, error) {
+	now := time.Now().UTC().Truncate(time.Second)
+	e.ID = EventID(newID("evt_"))
+	e.CreatedBy = createdBy
+	e.CreatedAt, e.UpdatedAt = now, now
+	e.StartsAt = e.StartsAt.UTC().Truncate(time.Second)
+	e.EndsAt = e.EndsAt.UTC().Truncate(time.Second)
+	if err := validateEvent(e); err != nil {
+		return Event{}, err
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO events (`+eventColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
+		e.CreatedBy, fmtEventTime(e.CreatedAt), fmtEventTime(e.UpdatedAt)); err != nil {
+		return Event{}, fmt.Errorf("create event: %w", err)
+	}
+	return e, nil
+}
+
+// GetEvent loads one event by id.
+func (s *Store) GetEvent(id EventID) (Event, error) { return getEvent(s.db, id) }
+
+func getEvent(q dbtx, id EventID) (Event, error) {
+	e, err := scanEvent(q.QueryRow(`SELECT `+eventColumns+` FROM events WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Event{}, ErrNotFound
+	}
+	if err != nil {
+		return Event{}, fmt.Errorf("get event: %w", err)
+	}
+	return e, nil
+}
+
+// UpdateEvent applies a partial patch and returns the event as stored. The read
+// and the write share a transaction so a concurrent patch cannot be merged into
+// a stale copy — last-write-wins is about which VALUE survives, not about
+// letting one writer lose a field it never touched.
+func (s *Store) UpdateEvent(id EventID, p EventPatch) (Event, error) {
+	var e Event
+	err := s.tx(func(q dbtx) error {
+		var err error
+		if e, err = getEvent(q, id); err != nil {
+			return err
+		}
+		if p.Title != nil {
+			e.Title = *p.Title
+		}
+		if p.StartsAt != nil {
+			e.StartsAt = p.StartsAt.UTC().Truncate(time.Second)
+		}
+		if p.EndsAt != nil {
+			e.EndsAt = p.EndsAt.UTC().Truncate(time.Second)
+		}
+		if p.Location != nil {
+			e.Location = *p.Location
+		}
+		if p.Notes != nil {
+			e.Notes = *p.Notes
+		}
+		if err := validateEvent(e); err != nil {
+			return err
+		}
+		e.UpdatedAt = time.Now().UTC().Truncate(time.Second)
+		if _, err := q.Exec(
+			`UPDATE events SET title = ?, starts_at = ?, ends_at = ?, location = ?, notes = ?, updated_at = ? WHERE id = ?`,
+			e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
+			fmtEventTime(e.UpdatedAt), id); err != nil {
+			return fmt.Errorf("update event: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return Event{}, err
+	}
+	return e, nil
+}
+
+// DeleteEvent removes one event, or reports ErrNotFound if there was none. The
+// tombstone a client learns it by comes from the trigger, not from here.
+func (s *Store) DeleteEvent(id EventID) error {
+	res, err := s.db.Exec(`DELETE FROM events WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete event: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListEvents returns the calendar in start order, optionally windowed to
+// [from, to). The window is an OVERLAP test, not a containment one — an event
+// that began before the window and is still running belongs in it, which is
+// what makes "what's on today" answer correctly for a meeting that started
+// yesterday. A zero bound is unbounded, so ListEvents(zero, zero) is the whole
+// calendar.
+//
+// The comparison is TEXT, which is only correct because every stored time is
+// fixed-width RFC3339 UTC — see the storage DECISION on Event.
+func (s *Store) ListEvents(from, to time.Time) ([]Event, error) {
+	where := []string{}
+	var args []any
+	if !from.IsZero() {
+		where = append(where, `ends_at > ?`)
+		args = append(args, fmtEventTime(from))
+	}
+	if !to.IsZero() {
+		where = append(where, `starts_at < ?`)
+		args = append(args, fmtEventTime(to))
+	}
+	query := `SELECT ` + eventColumns + ` FROM events`
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, ` AND `)
+	}
+	// id breaks ties so a page is deterministic; evt_ ULIDs sort by creation.
+	query += ` ORDER BY starts_at, id`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list events: %w", err)
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // GetNet loads a net and populates its Bots membership from the bots table.

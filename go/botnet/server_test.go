@@ -930,8 +930,8 @@ func TestOpenRouterSendsOneSummary(t *testing.T) {
 	if summaries != 1 {
 		t.Errorf("request carried %d summary turns, want exactly 1: %+v", summaries, got.Messages)
 	}
-	if len(got.Messages) != 4 { // system prompt, summary, user, assistant
-		t.Errorf("request carried %d turns, want 4: %+v", len(got.Messages), got.Messages)
+	if len(got.Messages) != 5 { // system prompt, date-time line, summary, user, assistant
+		t.Errorf("request carried %d turns, want 5: %+v", len(got.Messages), got.Messages)
 	}
 }
 

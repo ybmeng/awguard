@@ -41,6 +41,7 @@ type ChangedIDs struct {
 	Bots     ChangeBucket `json:"bots"`
 	Messages ChangeBucket `json:"messages"`
 	Segments ChangeBucket `json:"segments"`
+	Events   ChangeBucket `json:"events"`
 }
 
 // ChangeBucket lists what happened to one entity type since the client's
@@ -214,7 +215,7 @@ func emptyChangedIDs() ChangedIDs {
 	empty := func() ChangeBucket {
 		return ChangeBucket{Created: []string{}, Updated: []string{}, Destroyed: []string{}}
 	}
-	return ChangedIDs{Bots: empty(), Messages: empty(), Segments: empty()}
+	return ChangedIDs{Bots: empty(), Messages: empty(), Segments: empty(), Events: empty()}
 }
 
 func (c *ChangedIDs) bucket(entity string) *ChangeBucket {
@@ -225,6 +226,8 @@ func (c *ChangedIDs) bucket(entity string) *ChangeBucket {
 		return &c.Messages
 	case "segment":
 		return &c.Segments
+	case "event":
+		return &c.Events
 	}
 	return nil
 }
@@ -232,7 +235,7 @@ func (c *ChangedIDs) bucket(entity string) *ChangeBucket {
 // sortAll orders every id list so a page is deterministic — map iteration must
 // not leak into the API.
 func (c *ChangedIDs) sortAll() {
-	for _, b := range []*ChangeBucket{&c.Bots, &c.Messages, &c.Segments} {
+	for _, b := range []*ChangeBucket{&c.Bots, &c.Messages, &c.Segments, &c.Events} {
 		sort.Strings(b.Created)
 		sort.Strings(b.Updated)
 		sort.Strings(b.Destroyed)

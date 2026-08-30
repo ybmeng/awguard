@@ -58,8 +58,8 @@ func TestWebSearchToolOfferedWithCorrectShape(t *testing.T) {
 	if err := json.Unmarshal(sc.requests[0], &payload); err != nil {
 		t.Fatalf("decode request: %v", err)
 	}
-	if len(payload.Tools) != 2 {
-		t.Fatalf("offered %d tools, want 2 (memory, web_search): %s", len(payload.Tools), sc.requests[0])
+	if len(payload.Tools) != 3 {
+		t.Fatalf("offered %d tools, want 3 (memory, calendar, web_search): %s", len(payload.Tools), sc.requests[0])
 	}
 
 	// The memory tool is a function tool.
@@ -76,16 +76,18 @@ func TestWebSearchToolOfferedWithCorrectShape(t *testing.T) {
 		t.Errorf("tool 0 = %s, want the memory function tool", payload.Tools[0])
 	}
 
-	// The web_search tool is the server tool: exactly type, and no function key.
+	// The web_search tool is the server tool, and it is always last: exactly
+	// type, and no function key.
+	searchDef := payload.Tools[len(payload.Tools)-1]
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(payload.Tools[1], &fields); err != nil {
+	if err := json.Unmarshal(searchDef, &fields); err != nil {
 		t.Fatalf("decode web_search tool: %v", err)
 	}
 	if got := string(fields["type"]); got != jsonString(webSearchToolName) {
 		t.Errorf("web_search type = %s, want %q", got, webSearchToolName)
 	}
 	if _, leaked := fields["function"]; leaked {
-		t.Errorf("web_search tool leaked a function key: %s", payload.Tools[1])
+		t.Errorf("web_search tool leaked a function key: %s", searchDef)
 	}
 	if len(fields) != 1 {
 		t.Errorf("web_search tool has fields %v, want only type", keysOf(fields))
@@ -220,18 +222,19 @@ func TestToolsEndpointIncludesWebSearch(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&tools); err != nil {
 		t.Fatalf("decode tools: %v", err)
 	}
-	if len(tools) != 2 {
-		t.Fatalf("/v1/tools served %d tools, want 2", len(tools))
+	if len(tools) != 3 {
+		t.Fatalf("/v1/tools served %d tools, want 3 (memory, calendar, web_search)", len(tools))
 	}
+	searchDef := tools[len(tools)-1]
 	var last map[string]json.RawMessage
-	if err := json.Unmarshal(tools[1], &last); err != nil {
+	if err := json.Unmarshal(searchDef, &last); err != nil {
 		t.Fatalf("decode web_search tool: %v", err)
 	}
 	if string(last["type"]) != jsonString(webSearchToolName) {
 		t.Errorf("/v1/tools web_search type = %s, want %q", last["type"], webSearchToolName)
 	}
 	if _, leaked := last["function"]; leaked {
-		t.Errorf("/v1/tools web_search leaked a function key: %s", tools[1])
+		t.Errorf("/v1/tools web_search leaked a function key: %s", searchDef)
 	}
 }
 
