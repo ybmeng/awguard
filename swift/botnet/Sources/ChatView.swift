@@ -636,14 +636,15 @@ private struct ThinkingBubble: View {
     }
 }
 
-// One collapsible inspector section: a header that is the toggle (rotating
-// chevron + title, with an optional trailing accessory that stays clickable on
-// its own), and a body shown only while expanded. Hairlines are self-contained
-// so N sections stack cleanly with no knowledge of their neighbors: the header
-// draws one bottom hairline, and an open section draws one more under its
-// body. Collapsing removes the content view — state that must survive a
-// collapse/expand round-trip (like Memory's draft) belongs to the caller, not
-// inside the content closure.
+// One collapsible inspector section, drawn as a rounded card: a header that is
+// the toggle (rotating chevron + title, with an optional trailing accessory
+// that stays clickable on its own), and a body shown only while expanded, with
+// one hairline between the two. The card treatment — radius, border, clip —
+// lives entirely here so restyling every section is a one-place edit; neighbors
+// are separated by the caller's stack spacing, not by hairlines. Collapsing
+// removes the content view — state that must survive a collapse/expand
+// round-trip (like Memory's draft) belongs to the caller, not inside the
+// content closure.
 struct InspectorSection<Content: View, Accessory: View>: View {
     let title: String
     @Binding var expanded: Bool
@@ -654,9 +655,14 @@ struct InspectorSection<Content: View, Accessory: View>: View {
         VStack(spacing: 0) {
             header
             if expanded {
-                content()
                 hairline
+                content()
             }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: Metric.inspectorCardRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Metric.inspectorCardRadius, style: .continuous)
+                .strokeBorder(Palette.fieldStroke, lineWidth: 1)
         }
     }
 
@@ -683,7 +689,6 @@ struct InspectorSection<Content: View, Accessory: View>: View {
         }
         .padding(.horizontal, Metric.inspectorPad)
         .frame(height: Metric.headerHeight)
-        .overlay(alignment: .bottom) { hairline }
     }
 
     private var hairline: some View {
@@ -713,7 +718,7 @@ struct BotDetails: View {
     private var memory: String { bot.memory ?? "" }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: Metric.inspectorCardSpacing) {
             // Collapsing only hides the body; `editing` and `draft` live on
             // this view, not in the section content, so expanding again lands
             // back in the untouched editor.
@@ -741,6 +746,7 @@ struct BotDetails: View {
             }
             Spacer(minLength: 0)
         }
+        .padding(Metric.inspectorCardInset)
         .background(Palette.chrome)
         .navigationTitle("Details")
         // Switching bots must never carry one bot's unsaved draft to another.
