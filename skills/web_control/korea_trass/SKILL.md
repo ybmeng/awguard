@@ -67,6 +67,20 @@ https://tradedata.go.kr → /cts/index.do (SPA, URL never changes). Anonymous qu
   HS10 child × month. `hsSgnWhrCol=HS8_SGN` with an 8-digit code returns 0 (HS8 filter col not
   populated) — filter at HS6 or HS10 only. `korePrlstNm` is EMPTY in grouped responses; fetch names
   via single-code queries (whr=HS10). First item of items[] is a paging stub; data rows have priodTitle.
+- **Monthly HS10 × COUNTRY (free, verified 2026-08-31)**: same retrieveTrade.do with
+  `tradeKind=ETS_MNK_1020000E` (품목별 국가별). Extra params: `selectPaging=1&subHsSgn=` and
+  `cntyNm=` comma-separated KOREAN names (미국,중국,대만…; empty = all countries); hsSgn accepts
+  a comma list of HS10 codes. REQUIRES a session cookie: GET /cts/index.do first (cookie jar),
+  plus Referer header — cookie-less POST returns an EUC-KR "access blocked" page. Rows add cntyNm.
+  tradeKind family (from menu JS ETS0100019Q.js): A=품목별 D=국가별 E=품목별국가별 F/G=성질별국가별
+  H=대륙별 I=경제권별 J=세관별 K=거래종류별 L=항구별. ~5yr max range per query.
+  Sample: 2026.07 DRAM exports → 중국 9,979,070 / 베트남 1,948,783 / 홍콩 262,606 / 대만 180,701 /
+  미국 64,081 (천$). Raw snapshot: data/memory_by_country_raw.json.
+- **10-day per-HSK exists NOWHERE public** (subagent sweep 2026-08-31): KCS tentative endpoint is a
+  fixed top-10-category layout (반도체 = one column, statsKind A=품목 B=국가 only); 산업부 1~20
+  release is MTI-coded aggregates; CEIC/Bloomberg/Refinitiv mirror aggregates only; Comtrade is HS6
+  (854232 lumps DRAM+MCP+Flash). Sub-monthly per-HSK = TRASS only (free top-1-country row, or
+  ₩33k/mo 정회원 선택형 for full tables). data.go.kr API exists but signup is 내국인+phone-gated.
 - Memory universe under HS6 854232 (7 HS10 codes): 8542321010 디램 DRAM / 8542321020 에스램 SRAM /
   8542321030 플래시 Flash / 8542321090 기타 / 8542322000 하이브리드 / 8542323000 복합구조칩 MCP /
   8542324000 복합부품 MCOs.
@@ -111,6 +125,29 @@ MCP Jun 12,682,181 / Jul 10,085,845; Flash Jun 2,486,161 / Jul 1,780,647.
   weight (tons) + balance. Source: tradedata.go.kr API (raw: memory_monthly_raw.json).
 - `provisional_categories_2026.csv` — TRASS 잠정치조회 free grid: 2026 exports by 10-day cumulative
   period (01~10/01~20/01~end) × top-20 categories (전체, 반도체, …), 천$. Aug = through 08-20.
+
+## TRASS paid tiers (researched 2026-08-31)
+
+- Free-tier per-HSK 잠정치 query returns TOP-1 COUNTRY ROW ONLY (server-side truncation; notice:
+  "정회원 종합형/선택형 서비스 신청 시 전체 데이터가 출력 됩니다"). Captcha is per-session, not
+  per-query — one human click then multiple queries. Country dropdown accepts a specific country,
+  so targeted queries (품목 × 국가=대만 etc.) get exact rows free.
+- 정회원 선택형 ₩33,000/30d VAT incl. (pick 잠정치조회 as one of 3 services) = full by-country
+  tables. 종합형 ₩55,000. One-off extracts ₩205k/month-of-data (confirmed stats only).
+  Institutional provisional feed (BIG FINANCE) ₩1.0–1.25M/mo.
+- Purchase wall: web flow needs Korean SMS 본인인증 (free 준회원 first) + Korean-PG card
+  auto-billing. US path: negotiate via statistics@ktspi.or.kr (+82-2-2140-0735, 09:00–17:30 KST)
+  or a Korean proxy signup. Fee pages: support.do?command=firstGuide&viewCode=SUP00501/2/3,
+  charge.do?PNAME=charge1|charge3.
+
+## Full 10-day per-HSK by-country: SKIPPED — behind Korea-required paywall
+
+Placeholder (2026-08-31): the complete 10-day per-HSK country tables need TRASS 정회원 선택형
+(₩33k/30d), which requires Korean SMS + Korean card. No reseller exists (TRASS is the sole
+distributor; terminals carry aggregates only). Unblock paths when wanted: Korean friend does
+signup+payment (per-account license caveat), or email statistics@ktspi.or.kr for a direct
+foreign-purchase arrangement. Until then: free targeted queries (captcha/session + 국가=specific
+country) cover individual rows.
 
 ## Status / route chosen
 
