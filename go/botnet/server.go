@@ -83,6 +83,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/bots/{id}/compact", s.compact)
 	mux.HandleFunc("GET /v1/messages/{id}", s.getMessage)
 	mux.HandleFunc("GET /v1/messages", s.batchMessages)
+	mux.HandleFunc("GET /v1/calendars", s.listCalendars)
+	mux.HandleFunc("POST /v1/calendars", s.createCalendar)
+	mux.HandleFunc("PATCH /v1/calendars/{id}", s.patchCalendar)
+	mux.HandleFunc("DELETE /v1/calendars/{id}", s.deleteCalendar)
 	mux.HandleFunc("GET /v1/events", s.listEvents)
 	mux.HandleFunc("POST /v1/events", s.createEvent)
 	mux.HandleFunc("PATCH /v1/events/{id}", s.patchEvent)
@@ -466,6 +470,87 @@ func (s *Server) writeChain(w http.ResponseWriter, botID BotID, code int) {
 	writeJSON(w, code, segs)
 }
 
+// ── Calendars ─────────────────────────────────────────────────────────────────
+// The named-calendar REST face. Like events there is no If-Match and no
+// version; unlike events, DELETE here CASCADES to the calendar's events — the
+// UI confirms with the user first, and the wire call itself is unconditional
+// (the tool's delete_calendar is the path that refuses; see the DECISION on
+// Calendar in schema.go).
+
+// calendarInput is the wire body for POST and PATCH. Pointers make PATCH
+// partial: absent leaves a field alone.
+type calendarInput struct {
+	Name  *string `json:"name"`
+	Color *string `json:"color"`
+}
+
+// listCalendars returns every calendar, oldest first, with the sync token the
+// other collection GETs carry. It deliberately does NOT ensure "Personal" — an
+// empty list is a valid answer, and a read must not create state.
+func (s *Server) listCalendars(w http.ResponseWriter, _ *http.Request) {
+	s.stateHeader(w)
+	cals, err := s.store.ListCalendars()
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	if cals == nil {
+		cals = []Calendar{}
+	}
+	writeJSON(w, http.StatusOK, cals)
+}
+
+// createCalendar adds a calendar from the UI. createdBy is the "user" sentinel,
+// never taken from the body; an omitted color is assigned by the store. A
+// duplicate name or an unknown color is ErrInvalid, which maps to a 400 in the
+// existing error shape.
+func (s *Server) createCalendar(w http.ResponseWriter, r *http.Request) {
+	var in calendarInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if in.Name == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("name is required"))
+		return
+	}
+	color := ""
+	if in.Color != nil {
+		color = *in.Color
+	}
+	cal, err := s.store.CreateCalendar(*in.Name, color, userAuthor)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cal)
+}
+
+// patchCalendar renames or recolors a calendar; omitted fields are left alone.
+func (s *Server) patchCalendar(w http.ResponseWriter, r *http.Request) {
+	var in calendarInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	cal, err := s.store.UpdateCalendar(CalendarID(r.PathValue("id")), CalendarPatch{Name: in.Name, Color: in.Color})
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cal)
+}
+
+// deleteCalendar removes the calendar AND its events — real tombstones for all
+// of them reach the change feed. The UI has already confirmed the cascade.
+func (s *Server) deleteCalendar(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteCalendar(CalendarID(r.PathValue("id"))); err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ── Events ────────────────────────────────────────────────────────────────────
 // The calendar's REST face: the user's half of the service whose other half is
 // the bot's calendar tool. Both write the same table, so an event a bot booked
@@ -480,11 +565,12 @@ func (s *Server) writeChain(w http.ResponseWriter, botID BotID, code int) {
 // Every field is a pointer, which is what makes PATCH partial: absent leaves the
 // field alone, and "" is a real value that clears a location or a note.
 type eventInput struct {
-	Title    *string `json:"title"`
-	StartsAt *string `json:"startsAt"`
-	EndsAt   *string `json:"endsAt"`
-	Location *string `json:"location"`
-	Notes    *string `json:"notes"`
+	Title      *string `json:"title"`
+	StartsAt   *string `json:"startsAt"`
+	EndsAt     *string `json:"endsAt"`
+	Location   *string `json:"location"`
+	Notes      *string `json:"notes"`
+	CalendarID *string `json:"calendarId"` // absent on POST → the Personal ensure; unknown → 400
 }
 
 // eventTime parses one RFC3339 field from the wire, naming the field so a 400
@@ -565,6 +651,11 @@ func (s *Server) createEvent(w http.ResponseWriter, r *http.Request) {
 	if in.Notes != nil {
 		ev.Notes = *in.Notes
 	}
+	// A zero CalendarID gets the Personal ensure in the store; a supplied one
+	// must resolve or the create is a 400.
+	if in.CalendarID != nil {
+		ev.CalendarID = CalendarID(*in.CalendarID)
+	}
 	// The remaining rules (empty title, an end before its start) live in the
 	// store, so the tool path enforces exactly the same ones; ErrInvalid maps
 	// to 400 through writeStatus.
@@ -585,6 +676,10 @@ func (s *Server) patchEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := EventPatch{Title: in.Title, Location: in.Location, Notes: in.Notes}
+	if in.CalendarID != nil {
+		id := CalendarID(*in.CalendarID)
+		p.CalendarID = &id
+	}
 	if in.StartsAt != nil {
 		t, err := eventTime("startsAt", *in.StartsAt)
 		if err != nil {

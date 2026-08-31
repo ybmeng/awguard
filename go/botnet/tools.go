@@ -160,6 +160,9 @@ type calendarArgs struct {
 	Notes    *string `json:"notes"`
 	From     *string `json:"from"`
 	To       *string `json:"to"`
+	Calendar *string `json:"calendar"` // an existing calendar, by name
+	Name     *string `json:"name"`     // a calendar's (new) name, for the *_calendar commands
+	Color    *string `json:"color"`    // a calendar color, for the *_calendar commands
 }
 
 // field returns one flat field by its wire name, and whether it was supplied
@@ -187,6 +190,12 @@ func (a calendarArgs) field(name string) (string, bool) {
 		p = a.From
 	case "to":
 		p = a.To
+	case "calendar":
+		p = a.Calendar
+	case "name":
+		p = a.Name
+	case "color":
+		p = a.Color
 	}
 	if p == nil || *p == "" {
 		return "", false
@@ -208,13 +217,15 @@ var calendarCommands = []calendarCommand{
 		name:     "create",
 		requires: []string{"title", "start"},
 		doc: `"create": books an event. Requires "title" and "start"; optional "end" ` +
-			`(defaults to one hour after the start), "location" and "notes".`,
+			`(defaults to one hour after the start), "location", "notes" and "calendar" ` +
+			`(a calendar name; defaults to "Personal").`,
 		run: runCalendarCreate,
 	},
 	{
 		name: "list",
 		doc: `"list": shows the calendar. Optional "from" and "to" bound the window; ` +
-			`it defaults to the next 14 days. The first line is always the current time, ` +
+			`it defaults to the next 14 days. Optional "calendar" (a calendar name) shows ` +
+			`only that calendar. The first line is always the current time, ` +
 			`so use it to resolve "today", "tomorrow" and "next week".`,
 		run: runCalendarList,
 	},
@@ -222,7 +233,8 @@ var calendarCommands = []calendarCommand{
 		name:     "update",
 		requires: []string{"event_id"},
 		doc: `"update": changes an existing event. Requires "event_id" (from "list") plus ` +
-			`any of "title", "start", "end", "location", "notes" — omitted fields are left alone.`,
+			`any of "title", "start", "end", "location", "notes", "calendar" (moves it to ` +
+			`that calendar) — omitted fields are left alone.`,
 		run: runCalendarUpdate,
 	},
 	{
@@ -230,6 +242,32 @@ var calendarCommands = []calendarCommand{
 		requires: []string{"event_id"},
 		doc:      `"delete": cancels an event. Requires "event_id" (from "list").`,
 		run:      runCalendarDelete,
+	},
+	{
+		name:     "create_calendar",
+		requires: []string{"name"},
+		doc: `"create_calendar": adds a named calendar. Requires "name"; optional "color" ` +
+			`(one of ` + strings.Join(calendarColors, ", ") + ` — assigned automatically when omitted).`,
+		run: runCalendarCreateCalendar,
+	},
+	{
+		name: "list_calendars",
+		doc:  `"list_calendars": shows every calendar with its color and event count.`,
+		run:  runCalendarListCalendars,
+	},
+	{
+		name:     "rename_calendar",
+		requires: []string{"calendar"},
+		doc: `"rename_calendar": renames or recolors a calendar. Requires "calendar" (its ` +
+			`current name) plus "name" (the new name) and/or "color".`,
+		run: runCalendarRenameCalendar,
+	},
+	{
+		name:     "delete_calendar",
+		requires: []string{"calendar"},
+		doc: `"delete_calendar": removes an EMPTY calendar. Requires "calendar" (its name). ` +
+			`A calendar that still has events is refused — delete or move them first.`,
+		run: runCalendarDeleteCalendar,
 	},
 }
 
@@ -246,7 +284,8 @@ func calendarCommandNames() []string {
 // way memoryToolDef does: prose per command, one strict enum, flat strings.
 func calendarToolDef() wireTool {
 	lines := []string{
-		"Read and write the shared calendar. You, the user and the other bots all see the same events. " +
+		"Read and write the shared calendar. You, the user and the other bots all see the same events, " +
+			"organized into named calendars (e.g. \"Personal\", \"Company Earnings\"). " +
 			"All times are RFC3339 (e.g. 2026-08-31T15:00:00Z or 2026-08-31T15:00:00-07:00). Commands:",
 	}
 	for _, c := range calendarCommands {
@@ -274,6 +313,9 @@ func calendarToolDef() wireTool {
 				"notes":    str(`Anything else worth keeping on the event. Optional.`),
 				"from":     str(`Start of the window to list, RFC3339. Optional; defaults to now.`),
 				"to":       str(`End of the window to list, RFC3339. Optional; defaults to 14 days out.`),
+				"calendar": str(`A calendar, by name (case-insensitive). Optional filter/target for "create", "update" and "list"; the current name for "rename_calendar" and "delete_calendar".`),
+				"name":     str(`A calendar's name: the new calendar for "create_calendar", the new name for "rename_calendar".`),
+				"color":    str(`A calendar color, one of ` + strings.Join(calendarColors, ", ") + `, for "create_calendar" and "rename_calendar". Optional.`),
 			},
 			"required": []string{"command"},
 		},
@@ -288,6 +330,34 @@ func calendarTime(field, raw string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("error: '%s' value %q is not an RFC3339 time like 2026-08-31T15:00:00Z", field, raw)
 	}
 	return t, nil
+}
+
+// calendarNamed resolves the "calendar" name arg. An unknown name answers with
+// the instructive error listing the calendars that DO exist — deliberately not
+// auto-creating, because a typo must not spawn a calendar. The three returns
+// are the tool-handler split: a calendar, an instructive error text for the
+// model, or a real store failure.
+func calendarNamed(s *Store, name string) (Calendar, string, error) {
+	cal, err := s.CalendarByName(name)
+	if err == nil {
+		return cal, "", nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return Calendar{}, "", err
+	}
+	cals, err := s.ListCalendars()
+	if err != nil {
+		return Calendar{}, "", err
+	}
+	if len(cals) == 0 {
+		return Calendar{}, fmt.Sprintf("error: no calendar named %q — none exist yet; create_calendar makes one", name), nil
+	}
+	names := make([]string, len(cals))
+	for i, c := range cals {
+		names[i] = c.Name
+	}
+	return Calendar{}, fmt.Sprintf("error: no calendar named %q — existing calendars: %s",
+		name, strings.Join(names, ", ")), nil
 }
 
 func runCalendarCreate(s *Store, botID BotID, a calendarArgs) (string, error) {
@@ -305,10 +375,24 @@ func runCalendarCreate(s *Store, botID BotID, a calendarArgs) (string, error) {
 	}
 	location, _ := a.field("location")
 	notes, _ := a.field("notes")
+	// A zero CalendarID gets the store's Personal ensure, so an unqualified
+	// booking lands exactly where an unqualified REST create does.
+	var calID CalendarID
+	if name, ok := a.field("calendar"); ok {
+		cal, errText, err := calendarNamed(s, name)
+		if err != nil {
+			return "", err
+		}
+		if errText != "" {
+			return errText, nil
+		}
+		calID = cal.ID
+	}
 	// createdBy is the CALLING bot, stamped by the store — the model cannot
 	// name an author, so an event always says who really booked it.
 	ev, err := s.CreateEvent(Event{
 		Title: title, StartsAt: start, EndsAt: end, Location: location, Notes: notes,
+		CalendarID: calID,
 	}, string(botID))
 	if err != nil {
 		return calendarStoreError(err)
@@ -333,11 +417,126 @@ func runCalendarList(s *Store, _ BotID, a calendarArgs) (string, error) {
 		}
 		to = t
 	}
+	var only *Calendar
+	if name, ok := a.field("calendar"); ok {
+		cal, errText, err := calendarNamed(s, name)
+		if err != nil {
+			return "", err
+		}
+		if errText != "" {
+			return errText, nil
+		}
+		only = &cal
+	}
 	events, err := s.ListEvents(from, to)
 	if err != nil {
 		return calendarStoreError(err)
 	}
-	return renderCalendar(now, from, to, events), nil
+	if only != nil {
+		kept := events[:0]
+		for _, e := range events {
+			if e.CalendarID == only.ID {
+				kept = append(kept, e)
+			}
+		}
+		events = kept
+	}
+	// Annotate each event with its calendar's name whenever there is more than
+	// one calendar to tell apart — a single-calendar net reads as before.
+	cals, err := s.ListCalendars()
+	if err != nil {
+		return "", err
+	}
+	var names map[CalendarID]string
+	if len(cals) > 1 {
+		names = make(map[CalendarID]string, len(cals))
+		for _, c := range cals {
+			names[c.ID] = c.Name
+		}
+	}
+	return renderCalendar(now, from, to, events, names), nil
+}
+
+func runCalendarCreateCalendar(s *Store, botID BotID, a calendarArgs) (string, error) {
+	name, _ := a.field("name")
+	color, _ := a.field("color")
+	// createdBy is the calling bot, exactly as event creates stamp it.
+	cal, err := s.CreateCalendar(name, color, string(botID))
+	if err != nil {
+		return calendarStoreError(err)
+	}
+	return fmt.Sprintf("created calendar %q (%s)", cal.Name, cal.Color), nil
+}
+
+func runCalendarListCalendars(s *Store, _ BotID, _ calendarArgs) (string, error) {
+	cals, err := s.ListCalendars()
+	if err != nil {
+		return "", err
+	}
+	if len(cals) == 0 {
+		return "(no calendars yet — create_calendar makes one)", nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d calendar(s):\n", len(cals))
+	for i, c := range cals {
+		n, err := s.EventCount(c.ID)
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "%d. %s (%s) — %d event(s)\n", i+1, c.Name, c.Color, n)
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+func runCalendarRenameCalendar(s *Store, _ BotID, a calendarArgs) (string, error) {
+	current, _ := a.field("calendar")
+	cal, errText, err := calendarNamed(s, current)
+	if err != nil {
+		return "", err
+	}
+	if errText != "" {
+		return errText, nil
+	}
+	var p CalendarPatch
+	if v, ok := a.field("name"); ok {
+		p.Name = &v
+	}
+	if v, ok := a.field("color"); ok {
+		p.Color = &v
+	}
+	if p.Name == nil && p.Color == nil {
+		return "error: 'rename_calendar' needs a 'name' (the new name) or a 'color' to change", nil
+	}
+	updated, err := s.UpdateCalendar(cal.ID, p)
+	if err != nil {
+		return calendarStoreError(err)
+	}
+	return fmt.Sprintf("updated calendar %q (%s)", updated.Name, updated.Color), nil
+}
+
+// runCalendarDeleteCalendar refuses a non-empty calendar BY DECISION (see
+// Calendar in schema.go): the destructive cascade is the UI's, behind a
+// confirmation; a model gets it one event at a time or not at all.
+func runCalendarDeleteCalendar(s *Store, _ BotID, a calendarArgs) (string, error) {
+	name, _ := a.field("calendar")
+	cal, errText, err := calendarNamed(s, name)
+	if err != nil {
+		return "", err
+	}
+	if errText != "" {
+		return errText, nil
+	}
+	n, err := s.EventCount(cal.ID)
+	if err != nil {
+		return "", err
+	}
+	if n > 0 {
+		return fmt.Sprintf("error: calendar %q has %d event(s); delete or move them first", cal.Name, n), nil
+	}
+	if err := s.DeleteCalendar(cal.ID); err != nil {
+		return calendarStoreError(err)
+	}
+	return fmt.Sprintf("deleted calendar %q", cal.Name), nil
 }
 
 func runCalendarUpdate(s *Store, _ BotID, a calendarArgs) (string, error) {
@@ -374,8 +573,19 @@ func runCalendarUpdate(s *Store, _ BotID, a calendarArgs) (string, error) {
 		f.set(t)
 		changed = true
 	}
+	if name, ok := a.field("calendar"); ok {
+		cal, errText, err := calendarNamed(s, name)
+		if err != nil {
+			return "", err
+		}
+		if errText != "" {
+			return errText, nil
+		}
+		p.CalendarID = &cal.ID
+		changed = true
+	}
 	if !changed {
-		return "error: 'update' needs at least one of title, start, end, location, notes to change", nil
+		return "error: 'update' needs at least one of title, start, end, location, notes, calendar to change", nil
 	}
 	ev, err := s.UpdateEvent(EventID(a.EventID), p)
 	if err != nil {
@@ -415,8 +625,10 @@ func localRFC3339(t time.Time) string {
 
 // renderCalendar formats a listing: the current time FIRST, always, then a
 // compact numbered line per event. The now line is what makes the tool usable
-// at all — without it "book lunch tomorrow" has no anchor.
-func renderCalendar(now, from, to time.Time, events []Event) string {
+// at all — without it "book lunch tomorrow" has no anchor. A non-nil names map
+// annotates each event with its calendar — the caller passes one exactly when
+// more than one calendar exists, so a single-calendar net stays uncluttered.
+func renderCalendar(now, from, to time.Time, events []Event, names map[CalendarID]string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "now: %s\n", localRFC3339(now))
 	if len(events) == 0 {
@@ -427,6 +639,9 @@ func renderCalendar(now, from, to time.Time, events []Event) string {
 	for i, e := range events {
 		fmt.Fprintf(&b, "%d. %s  %s → %s  %s", i+1, e.ID,
 			localRFC3339(e.StartsAt), localRFC3339(e.EndsAt), e.Title)
+		if name, ok := names[e.CalendarID]; ok {
+			fmt.Fprintf(&b, "  [%s]", name)
+		}
 		if e.Location != "" {
 			fmt.Fprintf(&b, "  @ %s", e.Location)
 		}

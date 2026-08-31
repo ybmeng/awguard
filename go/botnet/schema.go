@@ -16,9 +16,10 @@ import (
 // ── IDs ─────────────────────────────────────────────────────────────────────
 // Prefixed ULID strings: sortable by creation time, generatable client-side
 // with no coordinator, self-describing in logs. e.g. "bot_01J9X..." .
-type BotID string     // "bot_" + ULID
-type SegmentID string // "seg_" + ULID
-type EventID string   // "evt_" + ULID
+type BotID string      // "bot_" + ULID
+type SegmentID string  // "seg_" + ULID
+type EventID string    // "evt_" + ULID
+type CalendarID string // "cal_" + ULID
 
 // ── Bot ──────────────────────────────────────────────────────────────────────
 // Minimal v0: a bot is a system prompt pointed at a model. That's enough to
@@ -274,6 +275,52 @@ const (
 	StatusFailed   MessageStatus = "failed"   // user turn, model call failed; Error is set
 )
 
+// ── Calendar ──────────────────────────────────────────────────────────────────
+// A named calendar: events are partitioned into calendars ("Personal", "Company
+// Earnings", "Financial Updates") so the user and the bots can keep booked
+// lunches apart from fed announcements. A Calendar is a service entity like
+// Event — owned by the net, written by both the REST path and the calendar
+// tool, and a fifth trigger-captured sync citizen.
+//
+// DECISION (no If-Match): calendars are last-write-wins, the same call already
+// made for Event and Bot.Memory. A calendar has two authored fields — a name
+// and a color — edited by one user and the odd bot; version-checking that would
+// be ceremony with no contention to protect against. There is no derived
+// Version field, so there is nothing for a client to send.
+//
+// DECISION (the default calendar is an ENSURE, not a flag): there is no
+// isDefault column and no reserved id. When a write needs a calendar and none
+// was named — a REST create without calendarId, a tool create without a
+// calendar arg, the migration backfill — the server uses the calendar NAMED
+// "Personal" (case-insensitive), creating it (color "blue", createdBy "user")
+// if missing. A flag would be one more piece of state to sync, to migrate and
+// to fight over; a name-keyed ensure is idempotent and self-healing — deleting
+// "Personal" is legal, and it simply comes back on the next unqualified write.
+// GET /v1/calendars deliberately does NOT ensure: an empty list is a valid
+// answer, not a prompt to create state on a read.
+//
+// DECISION (delete is asymmetric by writer): REST DELETE /v1/calendars/{id}
+// CASCADES — it deletes the calendar's events in the same transaction, as
+// explicit per-row event DELETEs so the chg_event_* triggers hand sync clients
+// real tombstones — because the UI confirms with the user first ("Delete
+// calendar and its N events"). The tool's delete_calendar REFUSES a non-empty
+// calendar with an instructive error naming the event count: a cheap model must
+// not be able to wipe a calendar in one call, so the destructive form is
+// UI-only.
+type Calendar struct {
+	ID    CalendarID `json:"id"`
+	Name  string     `json:"name"`  // trimmed, non-empty, <= 64 chars, unique case-insensitively
+	Color string     `json:"color"` // one of calendarColors; omitted on create → assigned by cycling
+
+	// CreatedBy follows Event.CreatedBy exactly: a BotID for a tool write, the
+	// "user" sentinel for a REST one, stamped by the write path and never by
+	// the caller.
+	CreatedBy string `json:"createdBy"`
+
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 // ── Event ─────────────────────────────────────────────────────────────────────
 // The calendar: the first SERVICE, as opposed to a property of a bot. An Event
 // is owned by the net rather than by any one bot, because the point of it is
@@ -311,7 +358,14 @@ const (
 // an expansion at read time, which changes what ListEvents even is — so decide
 // it before the calendar has data worth migrating.
 type Event struct {
-	ID       EventID   `json:"id"`
+	ID EventID `json:"id"`
+
+	// CalendarID names the calendar this event belongs to. Always present and
+	// always resolvable from a current server: a write that names no calendar
+	// gets the Personal ensure (see Calendar), and one that names an unknown
+	// calendar is rejected, so no event row can dangle.
+	CalendarID CalendarID `json:"calendarId"`
+
 	Title    string    `json:"title"`
 	StartsAt time.Time `json:"startsAt"`
 	EndsAt   time.Time `json:"endsAt"` // must not precede StartsAt
