@@ -137,12 +137,26 @@ struct ChatView: View {
                     .padding(.horizontal, Metric.transcriptHPad)
                     .padding(.vertical, Metric.transcriptVPad)
                 }
-                .onChange(of: messages.count) {
-                    if let last = turns.last?.lastBubbleID {
-                        withAnimation { proxy.scrollTo(last, anchor: .bottom) }
-                    }
-                }
+                // Opens at the newest turn and stays pinned while the reader is
+                // at the bottom; scrolling up unpins, as a chat should.
+                .defaultScrollAnchor(.bottom)
+                // The explicit scroll covers the reader who scrolled up and then
+                // sent: the pin is off, but their own send must snap back down.
+                // `pending` is a trigger too — the thinking bubble appears
+                // without changing the message count.
+                .onChange(of: messages.count) { scrollToNewest(proxy) }
+                .onChange(of: pending) { scrollToNewest(proxy) }
             }
+        }
+    }
+
+    // Deferred one update: onChange fires before the LazyVStack lays out the
+    // row it was told about, and scrollTo to an id with no laid-out row is a
+    // no-op.
+    private func scrollToNewest(_ proxy: ScrollViewProxy) {
+        guard let target = pending ? "pending" : turns.last?.lastBubbleID else { return }
+        Task { @MainActor in
+            withAnimation { proxy.scrollTo(target, anchor: .bottom) }
         }
     }
 
