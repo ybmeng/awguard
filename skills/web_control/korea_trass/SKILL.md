@@ -1,8 +1,43 @@
-# TRASS (한국무역통계 정보포털) — Korean customs trade statistics
+# korea_trass — Korean customs memory-chip export data
 
-Goal: extract weekly/provisional (잠정통계) and monthly export stats for semiconductor HSK codes.
+Goal: provisional (잠정) and monthly export stats for memory HSK codes.
 Target codes: 8542321010 (DRAM), 8542323000 (MCP/HBM proxy), 8542321030 (Flash).
-Wanted fields: export value (USD) + weight, periods like Jun/Jul/Aug 1–20 (provisional 주별 data).
+Fields: export value (USD) + weight, incl. 10-day provisional periods and by-country splits.
+
+## CURRENT STATE (2026-08-31) — read this first
+
+- `scripts/fetch_kcs.py all` (no auth, no browser) pulls three CSVs into data/: `monthly`
+  (7 memory codes × month), `monthly_by_country` (code × destination country × month; 499 rows
+  live-verified), `tentative` (10-day category pace incl. 반도체). 24 offline snapshot tests:
+  `python3 scripts/tests/test_parsers.py` from this dir. Raw JSON archived per run; a 0-row or
+  bad parse exits 1 and never overwrites a good CSV.
+- Release cadence (KST): full-month provisional on the 1st ~09:00, 1~10 on the 11th, 1~20 on the
+  21st; monthly 확정 (incl. by-country) ~the 15th of the following month. 09:00 KST = 5pm PT prior
+  day. Endpoint refresh may trail the press release by minutes–hours; rerun until the row appears.
+- Only unreachable slice: FULL 10-day per-HSK by-country tables — see the paywall placeholder
+  below. Free stopgap: per-session captcha + targeted 국가= queries on TRASS.
+- Human-in-the-loop capture tool: `chromeExtension_GiveItToClaude` (repo root) saves any page's
+  rendered DOM + page-JS data stores (window.data_, CHART_FULL_DATA) to ~/Downloads/GiveItToClaude/
+  on one click. Use when a site blocks automation: the human drives, Claude ingests files.
+
+## Hard-won gotchas (transferable)
+
+- TRASS reCAPTCHA is PER-SESSION: one human click then many queries. After the checkbox, the
+  site's own `fn_callback` runs `goSearch()` itself — do NOT also call goSearch (double-submit
+  consumes the token and re-pops the modal). Captcha tokens expire in ~2 min: never park a modal
+  waiting for a human round-trip; arrange for zero automation between their click and the query.
+- Free-tier truncation can be SERVER-SIDE (top-1 row + "정회원... 전체 데이터가 출력" notice) —
+  check `window.data_` length vs 검색결과 N건 to tell UI truncation from a real paywall.
+- jqGrid pages: rendered DOM may lag the data; read `window.data_` (page JS var) instead of the
+  table. From an automation-driven tab, javascript_tool reads it directly; from a human's own tab
+  you need the extension (its executeScript runs in world:MAIN to see page vars).
+- Opening a URL fresh loses SPA/form state — query state is not in the URL; redo the form.
+- On this site: stub window.alert/confirm/open BEFORE any risky action (alerts freeze the Chrome
+  MCP extension; grid-type toggles spawn popup tabs); stubs die on page reload — reinstall.
+- The MCP extension's data filter [BLOCKED: Cookie/query string data] hits raw querystrings/script
+  dumps — reformat as `key => value` lines or extract identifiers only.
+- Chrome auto-translate breaks Korean sites' JS forms (reads rewritten labels) — keep pages in
+  Korean; drive by element ids, never visible text.
 
 ## Site map (verified 2026-08-31, freeform)
 
