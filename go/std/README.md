@@ -89,7 +89,11 @@ INIT ──1──> MOVED ──2──> REMOTE_DIR ──3──> SYNCED ──
 - **ERR** — any failure renames `.wip` to `.err` recording the stage that
   died and why. Terminal: nothing retries, the dir stays for inspection,
   its id is burned. An insert left mid-WIP by a dead process is swept to
-  ERR on the next startup.
+  ERR when the service next starts — except one interrupted between REFS
+  and COMPLETE: its refs are already on disk, so the sweep finishes the
+  last step and promotes it to COMPLETE. Only the running service sweeps;
+  `stdd ls`/`cat`/`insert` operating directly (no service up) never touch
+  another process's markers.
 
 Serving: `Open(id, name)` refuses non-COMPLETE dirs, serves from local
 storage when present, and otherwise fetches from Drive by the static
@@ -118,8 +122,12 @@ While the installed service is running it serves a local API on a unix
 socket inside the root dir (`<dir>/.artifacts.sock`). `stdd insert`, `ls`
 and `cat` detect it and route through it, so all id allocation and machine
 runs happen in the one service process — no cross-process races. Without a
-running service the same commands operate on the store directly. A second
-service pointed at a busy root refuses to start.
+running service the same commands operate on the store directly. Ownership
+of a root is an exclusive `flock` on `<dir>/.artifacts.lock`, held for the
+service's whole life (and released by the kernel if it crashes): a second
+service pointed at a busy root refuses to start before touching anything —
+it never unlinks the live socket, sweeps in-flight inserts, or drains the
+inbox.
 
 The remote stages are a pluggable `Syncer` interface — `CreateDir` (stage 2),
 `SyncFile` (stage 3), `Fetch` (serving fallback) — so the whole machine stays
@@ -142,7 +150,9 @@ r, err := svc.Open(ctx, id, "report.pdf")       // local, or Drive by remote_id
 `go/std/drive` talks to the Drive v3 API directly — no SDK dependencies, no
 desktop app. Managed dirs mirror to a `std_artifacts/<id>/` folder tree in
 your Drive, uploads are acknowledged before Insert returns, and re-syncs
-replace content instead of duplicating it.
+replace content instead of duplicating it. Transient Drive failures (429,
+5xx, network errors) are retried a few times with short backoff — safe
+because every remote stage is idempotent — before an insert is failed.
 
 1. In the Google Cloud console, create an OAuth client of type **Desktop
    app** (with the Drive API enabled) and download its JSON. The token scope
@@ -152,7 +162,7 @@ replace content instead of duplicating it.
 
 ```bash
 ./stdd drive auth -credentials ~/Downloads/client_secret.json
-# opens a consent URL; approve in the browser
+# prints a consent URL — open it in your browser and approve
 ```
 
 From then on `stdd run` and `stdd insert` force-sync through Drive

@@ -222,6 +222,9 @@ func TestSweepInterruptedWIPToErr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	if err := st.SweepInterrupted(); err != nil {
+		t.Fatalf("SweepInterrupted: %v", err)
+	}
 	status, err := st.Status(5)
 	if err != nil || status.Stage != StageErr {
 		t.Fatalf("Status = %+v (err=%v), want swept to ERR", status, err)
@@ -236,6 +239,112 @@ func TestSweepInterruptedWIPToErr(t *testing.T) {
 	}
 	if id != 6 {
 		t.Errorf("next id = %s, want 6", id)
+	}
+}
+
+func TestSweepPromotesRefsStageWIPToComplete(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ManagedDir)
+	quiet := log.New(io.Discard, "", 0)
+
+	// Simulate a process that died between stage REFS and COMPLETE of insert
+	// 3: every stage succeeded, .refs.json is valid, only the WIP tag removal
+	// never ran.
+	interrupted := filepath.Join(dir, "3")
+	if err := os.MkdirAll(interrupted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(interrupted, "a.txt"), "alpha")
+	if err := writeJSONAtomic(filepath.Join(interrupted, refsFile), Refs{
+		ID:        3,
+		RemoteDir: "rdir-3",
+		Files:     []FileRef{{Name: "a.txt", RemoteID: "rid-3", Size: 5, SHA256: "ab"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(interrupted, wipMarker), marker{Stage: StageRefs}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := NewStore(dir, newFakeSyncer(), quiet)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := st.SweepInterrupted(); err != nil {
+		t.Fatalf("SweepInterrupted: %v", err)
+	}
+	status, err := st.Status(3)
+	if err != nil || status.Stage != StageComplete {
+		t.Fatalf("Status = %+v (err=%v), want promoted to COMPLETE", status, err)
+	}
+	if _, err := os.Stat(filepath.Join(interrupted, wipMarker)); !os.IsNotExist(err) {
+		t.Errorf(".wip should be gone after promotion: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(interrupted, errMarker)); !os.IsNotExist(err) {
+		t.Errorf(".err should not exist after promotion: %v", err)
+	}
+	// The promoted dir is fully servable.
+	r, err := st.Open(context.Background(), 3, "a.txt")
+	if err != nil {
+		t.Fatalf("Open promoted dir: %v", err)
+	}
+	defer r.Close()
+	if got, _ := io.ReadAll(r); string(got) != "alpha" {
+		t.Errorf("content = %q, want alpha", got)
+	}
+}
+
+func TestSweepDoesNotPromoteRefsStageWithBadRefs(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ManagedDir)
+	interrupted := filepath.Join(dir, "4")
+	if err := os.MkdirAll(interrupted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// WIP says refs, but the refs file is corrupt: not provably complete.
+	writeFile(t, filepath.Join(interrupted, refsFile), "{not json")
+	if err := writeJSONAtomic(filepath.Join(interrupted, wipMarker), marker{Stage: StageRefs}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := NewStore(dir, newFakeSyncer(), log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := st.SweepInterrupted(); err != nil {
+		t.Fatalf("SweepInterrupted: %v", err)
+	}
+	status, err := st.Status(4)
+	if err != nil || status.Stage != StageErr {
+		t.Fatalf("Status = %+v (err=%v), want swept to ERR", status, err)
+	}
+}
+
+func TestNewStoreDoesNotSweepInFlightWIP(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ManagedDir)
+
+	// A live service is mid-insert: managed/9 is tagged WIP at stage synced.
+	inFlight := filepath.Join(dir, "9")
+	if err := os.MkdirAll(inFlight, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(inFlight, wipMarker), marker{Stage: StageSynced}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A read-path Store (what stdd ls/cat/insert build in direct mode) must
+	// leave the marker untouched.
+	st, err := NewStore(dir, newFakeSyncer(), log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(inFlight, wipMarker)); err != nil {
+		t.Errorf(".wip must survive NewStore: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(inFlight, errMarker)); !os.IsNotExist(err) {
+		t.Errorf(".err must not appear from NewStore alone: %v", err)
+	}
+	status, err := st.Status(9)
+	if err != nil || status.Stage != StageSynced {
+		t.Fatalf("Status = %+v (err=%v), want in-flight stage synced", status, err)
 	}
 }
 
@@ -306,6 +415,40 @@ func TestOpenServesLocalThenFallsBackByStaticRef(t *testing.T) {
 	if _, err := st.Open(ctx, id, "not-a-file.txt"); err == nil {
 		t.Error("expected error for a name not in the refs")
 	}
+}
+
+func TestOpenRejectsPathTraversal(t *testing.T) {
+	st := newTestStore(t, newFakeSyncer())
+	ctx := context.Background()
+	id, err := st.Insert(ctx, writeFile(t, filepath.Join(t.TempDir(), "a.txt"), "fine"))
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	// Plant secrets at every level an escaping name could reach.
+	writeFile(t, filepath.Join(st.Dir(), "in-managed.txt"), "secret")
+	writeFile(t, filepath.Join(filepath.Dir(st.Dir()), "outside.txt"), "secret")
+
+	for _, name := range []string{
+		"../in-managed.txt",
+		"../../outside.txt",
+		"..", ".", "",
+		"x/../a.txt",
+		`..\outside.txt`,
+	} {
+		r, err := st.Open(ctx, id, name)
+		if err == nil {
+			r.Close()
+			t.Errorf("Open(%q) succeeded, want rejection", name)
+		}
+	}
+
+	// The legitimate name still works.
+	r, err := st.Open(ctx, id, "a.txt")
+	if err != nil {
+		t.Fatalf("Open(a.txt): %v", err)
+	}
+	r.Close()
 }
 
 func TestInsertRejectsMissingAndIrregularSources(t *testing.T) {

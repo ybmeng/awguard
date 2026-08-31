@@ -116,6 +116,36 @@ func TestVerify(t *testing.T) {
 	}
 }
 
+func TestRunSweepsInterruptedInserts(t *testing.T) {
+	root := shortRoot(t)
+
+	// A previous service died mid-insert: managed/2 is still tagged WIP.
+	interrupted := filepath.Join(root, ManagedDir, "2")
+	if err := os.MkdirAll(interrupted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(interrupted, wipMarker), marker{Stage: StageMoved}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc, err := New(Config{Root: root, Logger: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Constructing the service must not sweep; only Run (the single writer
+	// taking ownership) does.
+	if _, err := os.Stat(filepath.Join(interrupted, wipMarker)); err != nil {
+		t.Fatalf(".wip must survive New: %v", err)
+	}
+
+	cancel, _ := startService(t, svc)
+	defer cancel()
+	status, err := svc.Store().Status(2)
+	if err != nil || status.Stage != StageErr {
+		t.Fatalf("Status after Run = %+v (err=%v), want swept to ERR", status, err)
+	}
+}
+
 func TestRunInsertsInBackground(t *testing.T) {
 	s, err := New(Config{
 		Root:     shortRoot(t), // Run binds the API socket; see server_test.go

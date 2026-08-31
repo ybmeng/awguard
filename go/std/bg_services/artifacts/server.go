@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -20,15 +21,36 @@ func SocketPath(root string) string {
 	return filepath.Join(root, ".artifacts.sock")
 }
 
-// serve exposes the store over a unix socket until ctx ends. It refuses to
-// start when another live service already serves this root, and clears a
-// stale socket left by a dead process.
+// LockPath returns the lockfile guarding exclusive ownership of a root. The
+// running service holds an exclusive flock on it for its whole life.
+func LockPath(root string) string {
+	return filepath.Join(root, ".artifacts.lock")
+}
+
+// acquireLock takes the exclusive flock marking this process as the root's
+// single serving writer. Only the lock holder may sweep interrupted inserts,
+// remove or bind the socket, and drain the inbox. The kernel drops the lock
+// automatically when the process dies, so a crash never wedges the root;
+// release drops it explicitly. The lockfile itself is never removed —
+// unlinking a lockfile races with the next acquirer.
+func (s *Service) acquireLock() (release func(), err error) {
+	f, err := os.OpenFile(LockPath(s.root), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("artifacts: open lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("artifacts: another service is already serving %s", s.root)
+	}
+	return func() { _ = f.Close() }, nil
+}
+
+// serve exposes the store over a unix socket until ctx ends. The caller
+// (Run) holds the root's exclusive lock, so any existing socket here is
+// stale — left by a dead process — and safe to clear: a live service would
+// still hold the lock and we would never have gotten this far.
 func (s *Service) serve(ctx context.Context) error {
 	sock := SocketPath(s.root)
-	if c, err := Dial(ctx, s.root); err == nil {
-		c.Close()
-		return fmt.Errorf("artifacts: another service is already serving %s", s.root)
-	}
 	_ = os.Remove(sock)
 
 	ln, err := net.Listen("unix", sock)
@@ -118,7 +140,14 @@ func (s *Service) apiMux() *http.ServeMux {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		rc, err := s.store.Open(r.Context(), id, r.PathValue("name"))
+		// Defense in depth: the wildcard decodes %2F and friends, so reject
+		// traversal here too, before the name reaches the store.
+		name := r.PathValue("name")
+		if !validName(name) {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid file name %q", name))
+			return
+		}
+		rc, err := s.store.Open(r.Context(), id, name)
 		if err != nil {
 			writeErr(w, http.StatusNotFound, err)
 			return

@@ -103,7 +103,10 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("drive: refresh token: %s: %s", resp.Status, body)
+		return "", fmt.Errorf("refresh token: %w", &StatusError{
+			Method: http.MethodPost, URL: c.cfg.TokenURL,
+			Status: resp.Status, StatusCode: resp.StatusCode, Body: string(body),
+		})
 	}
 	var tok struct {
 		AccessToken string `json:"access_token"`
@@ -117,8 +120,39 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	return c.accessToken, nil
 }
 
+// StatusError is a non-2xx Drive API response. It keeps the status code
+// inspectable so callers can tell transient failures (429, 5xx) from
+// permanent ones.
+type StatusError struct {
+	Method     string
+	URL        string
+	Status     string
+	StatusCode int
+	Body       string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("drive: %s %s: %s: %s", e.Method, e.URL, e.Status, e.Body)
+}
+
+// Transient reports whether err looks like a temporary Drive failure — a
+// rate limit (429), a server error (5xx), or a network error — that a retry
+// of the same idempotent operation may fix. Context cancellation is never
+// transient.
+func Transient(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.StatusCode == http.StatusTooManyRequests || se.StatusCode >= 500
+	}
+	var ue *url.Error
+	return errors.As(err, &ue)
+}
+
 // do sends an authenticated request and returns the response, converting
-// non-2xx statuses into errors.
+// non-2xx statuses into *StatusError.
 func (c *Client) do(ctx context.Context, method, rawURL, contentType string, body io.Reader) (*http.Response, error) {
 	tok, err := c.token(ctx)
 	if err != nil {
@@ -139,7 +173,7 @@ func (c *Client) do(ctx context.Context, method, rawURL, contentType string, bod
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		defer resp.Body.Close()
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("drive: %s %s: %s: %s", method, rawURL, resp.Status, msg)
+		return nil, &StatusError{Method: method, URL: rawURL, Status: resp.Status, StatusCode: resp.StatusCode, Body: string(msg)}
 	}
 	return resp, nil
 }
@@ -164,14 +198,15 @@ func escapeQuery(s string) string {
 }
 
 // findByName returns the id of the first non-trashed item with the given
-// name (and parent / mimeType when non-empty), or "" if none exists.
-func (c *Client) findByName(ctx context.Context, name, parentID, mimeType string) (string, error) {
+// name (and parent / mime condition when non-empty), or "" if none exists.
+// mimeCond is a complete query condition like "mimeType = '...'".
+func (c *Client) findByName(ctx context.Context, name, parentID, mimeCond string) (string, error) {
 	q := fmt.Sprintf("name = '%s' and trashed = false", escapeQuery(name))
 	if parentID != "" {
 		q += fmt.Sprintf(" and '%s' in parents", escapeQuery(parentID))
 	}
-	if mimeType != "" {
-		q += fmt.Sprintf(" and mimeType = '%s'", mimeType)
+	if mimeCond != "" {
+		q += " and " + mimeCond
 	}
 	u := fmt.Sprintf("%s/files?q=%s&fields=files(id,name)&pageSize=1", c.cfg.APIBase, url.QueryEscape(q))
 
@@ -192,13 +227,14 @@ func (c *Client) findByName(ctx context.Context, name, parentID, mimeType string
 // FindFolder returns the id of the named folder under parentID, or "" if it
 // does not exist. Empty parentID searches without a parent constraint.
 func (c *Client) FindFolder(ctx context.Context, name, parentID string) (string, error) {
-	return c.findByName(ctx, name, parentID, folderMIME)
+	return c.findByName(ctx, name, parentID, "mimeType = '"+folderMIME+"'")
 }
 
 // FindFile returns the id of the named non-folder file under parentID, or ""
-// if it does not exist.
+// if it does not exist. Folders are excluded, so a folder sharing the name
+// can never be mistaken for the file (or have its "content" patched).
 func (c *Client) FindFile(ctx context.Context, name, parentID string) (string, error) {
-	return c.findByName(ctx, name, parentID, "")
+	return c.findByName(ctx, name, parentID, "mimeType != '"+folderMIME+"'")
 }
 
 // FindOrCreateFolder returns the id of the named folder under parentID,
