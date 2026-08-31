@@ -20,6 +20,10 @@ final class AppStore: ObservableObject {
     @Published private(set) var events: [Event] = []
     @Published var pendingBotIDs: Set<String> = []
     @Published var compactingBotIDs: Set<String> = []
+    // Unsent composer text, per bot (botId → draft), in-memory only. Not
+    // @Published on purpose: ChatView reads and writes it imperatively on bot
+    // switches, and it must never drive a view update.
+    var composerDrafts: [String: String] = [:]
     @Published var lastError: String?
     @Published var serverReachable = true
 
