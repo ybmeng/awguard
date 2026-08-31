@@ -100,6 +100,29 @@ override per call with `-m openai/gpt-4o-mini` or the `ROCK_WORKER_MODEL` env.
 The subagent owns the prompt and everything after the reply; the script only
 makes the call. See its header for the contract.
 
+## Field notes (from the first serial runs)
+
+- The cheap model's drafts are worth the round trip — every rock so far went
+  green in one round — but the applier must expect the same two failure axes
+  each time: state ownership (it reused the composer's draft state for a
+  rename; it passed an Optional id straight to scrollTo) and structural
+  placement (a greedy shape as a card's base with content in .overlay;
+  deprecated API forms; copy-pasted closures). Tokens, naming, and mechanical
+  edits it gets right. Put those two axes in the subagent's brief and review
+  them first when integrating.
+- A pure restyle or UI affordance has no natural failing test. Give the spec a
+  greppable marker — a required accessibility identifier or a new design
+  token — and make the verifier that grep plus the full build. Red→green stays
+  mechanical, and the marker doubles as a real artifact (token, a11y id), not
+  a comment.
+- Before attributing a visual defect found during proof to the rock, render a
+  pre-change baseline from the parent commit. One "regression" so far was a
+  pre-existing harness quirk, proven by the baseline in minutes.
+- When a rock changes what a shared dev tool observes (the snapshot harness
+  now captures the transcript bottom, not the top), the skill doc describing
+  that tool is part of the rock: update it in the same commit, from observed
+  behavior, not intention.
+
 ## Deferred to a later iteration
 
 Parallel rocks, each in its own worktree on its own branch (Agent
