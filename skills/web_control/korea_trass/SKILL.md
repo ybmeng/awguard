@@ -165,10 +165,15 @@ MCP Jun 12,682,181 / Jul 10,085,845; Flash Jun 2,486,161 / Jul 1,780,647.
 
 ## Data files (data/)
 
-- `memory_monthly_2026.csv` — all 7 memory HS10 codes × Jan–Jul 2026, export/import value (천$) +
-  weight (tons) + balance. Source: tradedata.go.kr API (raw: memory_monthly_raw.json).
-- `provisional_categories_2026.csv` — TRASS 잠정치조회 free grid: 2026 exports by 10-day cumulative
-  period (01~10/01~20/01~end) × top-20 categories (전체, 반도체, …), 천$. Aug = through 08-20.
+Maintained by `scripts/fetch_kcs.py`; one canonical CSV per dataset plus `last_result.json` (the
+envelope from the latest run).
+
+- `monthly.csv` — all 7 memory HS10 codes × month, export/import value (천$) + weight (tons) + balance.
+- `monthly_by_country.csv` — same, split by destination country.
+- `tentative.csv` — 10-day cumulative provisional exports (01~10/01~20/01~말일) × top-20 categories
+  (전체, 반도체, …), 천$.
+- `memory_monthly_raw.json` / `memory_by_country_raw.json` — hand-saved raw evidence from the
+  original discovery session.
 
 ## TRASS paid tiers (researched 2026-08-31)
 
