@@ -31,7 +31,11 @@ as numbered steps with the expected observation after each step, so any driver c
 tell success from failure. Some steps are permanently capped at form 2 (a captcha needs a human);
 mark those in the manifest.
 
-**Form 3 — pure script.** Deterministic code or API call, no intelligence anywhere. Requirements:
+**Form 3 — pure script.** Deterministic code or API call, no intelligence anywhere. When the goal
+is reachable through a free API, form 3 is the ONLY form to build — no recipes, no browser paths,
+no form-2 machinery to maintain for slices the API already covers. Forms 2 and 1 then exist only
+for slices the API cannot reach, and for repair. A paid API becomes a dependency only with the
+human's explicit sign-off. Requirements:
 
 - Fails loudly: nonzero exit on any anomaly, and never overwrites good state with bad.
 - Archives raw responses per run, so an escalating model has evidence, not just a stack trace.
@@ -71,21 +75,52 @@ cadence: <when to run / when new data lands>
 human_gates: <steps permanently capped at form 2, or none>
 ---
 <current state, placeholders, anything a driver should know before invoking>
+
+## Reporting
+<how THIS automation's runs report>
+
+## Data spec
+<one subsection per artifact>
 ```
+
+The Reporting section makes the envelope contract concrete for this automation: where the envelope
+lands, which statuses this automation can actually emit and what each means here (which artifacts
+move fast vs slow, what degraded typically looks like), what a needs_human envelope will instruct
+if the automation has human gates, and — when form 3 rides a free API — the statement that form 3
+is the only form and why. A server reading only the README must know every way a run can end.
+
+The data spec makes each artifact consumable and validatable by a server that has never read the
+code: for every artifact, the format (e.g. CSV with header), the grain (what one row is, and the
+key columns that identify it), every column with its type, unit, and meaning (units matter —
+thousand USD vs USD has burned real analyses), sort order if guaranteed, and provenance: the
+source institution, the exact endpoint or recipe the values came from, any transformation applied
+on the way (renames, filters, derived fields), and the revision behavior (does the source restate
+history, or only append?). A validator should be able to check an artifact against this section
+alone — column names, parseability of each column's type, key uniqueness — without knowing the
+domain.
 
 ## Result envelope
 
 Every invocation, whichever form ran, reports:
 
 ```json
-{"automation": "<name>", "status": "ok|degraded|failed", "form_used": 3,
+{"automation": "<name>", "status": "ok|degraded|failed|needs_human", "form_used": 3,
  "artifacts": [{"path": "data/monthly.csv", "rows": 49, "newest": "202607"}],
  "escalation_reason": null}
 ```
 
 `ok` = everything fetched and verified. `degraded` = some datasets succeeded, some failed (still
-exit nonzero). `failed` = nothing usable. `escalation_reason` is a sentence for the next form up,
-not a stack trace — say what was observed ("zero rows for tradeKind E; raw archived at ...").
+exit nonzero). `failed` = terminal error, nothing usable. `needs_human` = a form-2 run reached a
+human gate and parked; `escalation_reason` then states the exact action the human must take
+("click the reCAPTCHA checkbox in tab X"), because the human is the next form up. In every other
+case `escalation_reason` is a sentence for the next form up, not a stack trace — say what was
+observed ("zero rows for tradeKind E; raw archived at ...").
+
+**No silent endings.** Every run — any form, any driver, scripts and models alike — terminates in
+exactly one emitted envelope: stage completed (ok/degraded), terminal error (failed), or waiting
+on a person (needs_human). A driver that stops, pauses, or hands work upward without emitting an
+envelope is itself a defect, the same class as a fetcher that writes a short CSV without erroring.
+Incomplete results are only acceptable when the envelope says they are incomplete.
 
 Most fetch automations are "extend a CSV": each artifact carries `rows` and `newest` (the latest
 period present) precisely so a cheap checker can diff two envelopes and assert "one more row,

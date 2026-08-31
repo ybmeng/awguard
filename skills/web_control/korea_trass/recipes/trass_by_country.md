@@ -89,3 +89,26 @@ any translate prompt.
 
 The element ids are gone (`#SelectCd`, `grid_type`, `goSearch`, `window.data_`), the gate is no longer
 a reCAPTCHA, or the free tier stops returning even the top-1 row.
+
+## Reporting
+
+No silent endings: end every run of this recipe by emitting exactly one envelope with `form_used: 2`,
+even when you stop early. Three ways a run can end here.
+
+Parked at step 6 waiting on the person — name the physical action, because the human is the next form
+up, and leave the modal open so their click lands on a live token:
+
+```json
+{"automation": "korea-trass", "status": "needs_human", "form_used": 2, "artifacts": [],
+ "escalation_reason": "click the 'I'm not a robot' reCAPTCHA checkbox in the open TRASS 잠정치조회 tab (step 6); the modal is already open and the token expires about 2 minutes after the click"}
+```
+
+Rows read successfully — `status: "ok"`, `escalation_reason: null`, with an artifact entry for whatever
+you wrote (`rows` = data rows, `newest` = the latest period in it). A result the free tier truncated to
+the top-1 row (step 8) is still `ok` with a null reason: that cap is the documented paywall and the
+expected outcome here, not an anomaly to escalate. Keep `escalation_reason` non-null only when
+something needs the next form up — otherwise a server watching for it cannot tell a normal run from
+one that needs attention.
+
+A known branch exhausted without rows — `status: "failed"`, `artifacts: []`, and `escalation_reason`
+stating what was observed and which branch you tried, so form 1 starts from evidence.
