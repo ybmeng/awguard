@@ -25,6 +25,9 @@ struct ContentView: View {
     // Lives here rather than in BotDetails so the choice survives the inspector
     // closing and reopening within one run.
     @State private var memoryExpanded = true
+    // Same reasoning as memoryExpanded: the calendar's list/grid choice belongs
+    // to the window, not to a CalendarView that is rebuilt on every selection.
+    @State private var calendarMode: CalendarMode = .list
 
     var body: some View {
         NavigationSplitView {
@@ -51,7 +54,7 @@ struct ContentView: View {
                     nothingSelected
                 }
             case .service(.calendar)?:
-                CalendarView()
+                CalendarView(mode: $calendarMode)
             case .service(.artifacts)?, nil:
                 nothingSelected
             }

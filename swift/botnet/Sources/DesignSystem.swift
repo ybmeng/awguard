@@ -103,6 +103,19 @@ enum Metric {
     /// Between one day's group and the next — large enough that the day headers
     /// read as the structure of the list.
     static let dayGroupGap: CGFloat = 18
+
+    /// A month-grid day cell: tall enough for the date plus three chips and an
+    /// overflow line, which is what the cell is allowed to show.
+    static let monthCellHeight: CGFloat = 96
+    /// The gap between day cells. The grid's own background shows through it,
+    /// which is what draws the rules — there are no separate divider views.
+    static let monthCellGap: CGFloat = 1
+    /// A day's event chip.
+    static let chipRadius: CGFloat = 4
+    static let chipHPad: CGFloat = 4
+    static let chipVPad: CGFloat = 2
+    /// The circle behind today's date number.
+    static let todayMarker: CGFloat = 19
 }
 
 enum TypeScale {
@@ -127,6 +140,14 @@ enum TypeScale {
     static let serviceIcon = Font.system(size: 14)
     /// A day heading in the calendar list.
     static let dayHeader = Font.system(size: 12, weight: .semibold)
+    /// The month name over a grid section.
+    static let monthHeader = Font.system(size: 13, weight: .semibold)
+    /// A day number in a grid cell.
+    static let dayNumber = Font.system(size: 11, weight: .medium)
+    /// The weekday letters over the grid, and a cell's "+2 more" line.
+    static let gridMeta = Font.system(size: 10)
+    /// An event chip inside a day cell — the smallest readable text in the app.
+    static let chip = Font.system(size: 10.5)
 }
 
 // MARK: - Avatar

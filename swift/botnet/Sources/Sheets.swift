@@ -54,11 +54,14 @@ struct NewBotSheet: View {
 /// fresh form per target instead of reusing another event's draft.
 enum EventTarget: Identifiable {
     case new
+    /// A blank event on a day the user picked in the month grid.
+    case newOn(Date)
     case existing(Event)
 
     var id: String {
         switch self {
         case .new: return "new"
+        case .newOn(let day): return "new-\(day.timeIntervalSinceReferenceDate)"
         case .existing(let event): return event.id
         }
     }
@@ -66,6 +69,11 @@ enum EventTarget: Identifiable {
     var event: Event? {
         guard case .existing(let event) = self else { return nil }
         return event
+    }
+
+    var day: Date? {
+        guard case .newOn(let day) = self else { return nil }
+        return day
     }
 }
 
@@ -89,7 +97,7 @@ struct EventSheet: View {
     init(target: EventTarget) {
         self.target = target
         let event = target.event
-        let start = event?.startsAt ?? Self.nextHour()
+        let start = event?.startsAt ?? Self.defaultStart(on: target.day)
         _title = State(initialValue: event?.title ?? "")
         _starts = State(initialValue: start)
         _ends = State(initialValue: event?.endsAt ?? start.addingTimeInterval(Self.defaultDuration))
@@ -147,7 +155,9 @@ struct EventSheet: View {
         Task {
             let saved: Bool
             switch target {
-            case .new:
+            // Both blank cases create the same way: the picked day only chose
+            // where the form opened, it is not a different kind of write.
+            case .new, .newOn:
                 saved = await store.createEvent(
                     title: trimmedTitle, startsAt: starts, endsAt: ends,
                     location: cleaned(location), notes: cleaned(notes))
@@ -177,6 +187,16 @@ struct EventSheet: View {
     }
 
     private static let defaultDuration: TimeInterval = 3600
+
+    /// Where a blank event starts. A day picked in the month grid opens at 9am
+    /// on that day — a day's first event rarely starts at midnight — while
+    /// today, and the plain + button, keep the next-full-hour behaviour.
+    private static func defaultStart(on day: Date?, now: Date = Date()) -> Date {
+        guard let day, !Calendar.current.isDate(day, inSameDayAs: now) else {
+            return nextHour(from: now)
+        }
+        return Calendar.current.date(bySettingHour: 9, minute: 0, second: 0, of: day) ?? day
+    }
 
     /// A new event opens on the next full hour — the time a person most often
     /// means, and never one already gone.

@@ -5,8 +5,26 @@
 
 import SwiftUI
 
+/// The Calendar surface's two readings of the same events: the list, which
+/// answers "what is next", and the grid, which answers "what does this month
+/// look like". List is the default; the choice is owned by ContentView so it
+/// survives leaving the panel and coming back within a run.
+enum CalendarMode: String, CaseIterable, Identifiable {
+    case list, month
+
+    var id: String { rawValue }
+
+    var symbol: String {
+        switch self {
+        case .list: return "list.bullet"
+        case .month: return "square.grid.3x3"
+        }
+    }
+}
+
 struct CalendarView: View {
     @EnvironmentObject var store: AppStore
+    @Binding var mode: CalendarMode
 
     @State private var editing: EventTarget?
 
@@ -15,7 +33,14 @@ struct CalendarView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            if store.events.isEmpty { empty } else { list }
+            switch mode {
+            case .list:
+                if store.events.isEmpty { empty } else { list }
+            case .month:
+                // A month with nothing in it is still a month, so the grid has
+                // no empty state of its own.
+                MonthGridView { editing = $0 }
+            }
         }
         .background(Palette.chrome)
         // The calendar is shared state that a bot can change between visits, so
@@ -33,6 +58,7 @@ struct CalendarView: View {
                 .font(TypeScale.headerTitle)
                 .foregroundStyle(Palette.primaryText)
             Spacer()
+            modePicker
             Button { editing = .new } label: {
                 Image(systemName: "plus").foregroundStyle(Palette.secondaryText)
             }
@@ -44,6 +70,20 @@ struct CalendarView: View {
         .overlay(alignment: .bottom) {
             Rectangle().fill(Palette.hairline).frame(height: 1)
         }
+    }
+
+    // Icons only: two words up here would compete with the title, and the
+    // segmented control is the platform's own compact switch.
+    private var modePicker: some View {
+        Picker("View", selection: $mode) {
+            ForEach(CalendarMode.allCases) { mode in
+                Image(systemName: mode.symbol).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+        .help("Switch between the list and the month grid")
     }
 
     private var list: some View {

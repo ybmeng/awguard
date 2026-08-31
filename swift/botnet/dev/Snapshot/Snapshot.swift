@@ -3,7 +3,7 @@
 // a human driving the app.
 //
 //   ./dev/snapshot.sh                       # light + dark into build/snapshots
-//   snapshot --calendar                     # the Calendar service panel
+//   snapshot --calendar [--month]           # the Calendar panel, list or grid
 //   snapshot --event-sheet [--new-event]    # the event editor, rendered flat
 //
 // It talks to whatever BOTNET_API points at, so point it at the demo server
@@ -15,7 +15,7 @@ import SwiftUI
 /// Which surface the capture puts beside the sidebar.
 private enum Pane {
     case chat
-    case calendar
+    case calendar(CalendarMode)
     /// The event editor. The app presents it as a sheet; offscreen it is drawn
     /// flat, like BotDetails, because a sheet needs a real window to present.
     case eventSheet(EventTarget)
@@ -59,7 +59,8 @@ struct Snapshot {
     private static func pane(_ store: AppStore) -> Pane {
         let flags = CommandLine.arguments
         guard flags.contains("--event-sheet") else {
-            return flags.contains("--calendar") ? .calendar : .chat
+            guard flags.contains("--calendar") else { return .chat }
+            return .calendar(flags.contains("--month") ? .month : .list)
         }
         // Editing an existing event is the interesting case; fall back to the
         // blank form when the calendar is empty rather than failing the run.
@@ -94,8 +95,8 @@ struct Snapshot {
                     BotDetails(bot: bot, expanded: .constant(!collapseMemory))
                         .frame(width: 300)
                 }
-            case .calendar:
-                CalendarView()
+            case .calendar(let mode):
+                CalendarView(mode: .constant(mode))
             case .eventSheet(let target):
                 // Held at the sheet's own size on the pane's ground, so the
                 // capture reads like the presented sheet rather than a form
