@@ -9,7 +9,7 @@ Claude ingests from that inbox.
 
 1. Chrome → `chrome://extensions`
 2. Toggle **Developer mode** (top right)
-3. **Load unpacked** → select this directory (`web_control_skills/GiveItToClaude`)
+3. **Load unpacked** → select this directory (`awguard/chromeExtension_GiveItToClaude`)
 4. Pin the extension (puzzle icon → pin) so the button is visible.
 
 ## Use
