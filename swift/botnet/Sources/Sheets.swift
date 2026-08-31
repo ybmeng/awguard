@@ -92,9 +92,19 @@ struct EventSheet: View {
     @State private var ends: Date
     @State private var location: String
     @State private var notes: String
+    @State private var calendarId: String?
     @State private var saving = false
 
-    init(target: EventTarget) {
+    /// What the calendar selection opened as. Nil means no calendar could be
+    /// defaulted (no filter, no "Personal") — the picker then carries a nil
+    /// "Personal" row, honest because an omitted calendarId is exactly what
+    /// the server files under Personal, creating it if needed.
+    private let initialCalendarId: String?
+
+    /// `defaultCalendarId` is where a *new* event files: CalendarView passes
+    /// the active filter's calendar, else its "Personal", else nil. An existing
+    /// event's own calendar always wins over it.
+    init(target: EventTarget, defaultCalendarId: String? = nil) {
         self.target = target
         let event = target.event
         let start = event?.startsAt ?? Self.defaultStart(on: target.day)
@@ -103,6 +113,8 @@ struct EventSheet: View {
         _ends = State(initialValue: event?.endsAt ?? start.addingTimeInterval(Self.defaultDuration))
         _location = State(initialValue: event?.location ?? "")
         _notes = State(initialValue: event?.notes ?? "")
+        initialCalendarId = event.map { $0.calendarId } ?? defaultCalendarId
+        _calendarId = State(initialValue: initialCalendarId)
     }
 
     private var trimmedTitle: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -122,6 +134,22 @@ struct EventSheet: View {
                     DatePicker("Ends", selection: $ends, in: starts...,
                                displayedComponents: [.date, .hourAndMinute])
                     TextField("Location", text: $location)
+                    // Hidden while there are no calendars to pick between —
+                    // both on an old server and on a new one before the first
+                    // calendar exists; the unqualified save is legal either way.
+                    if !store.calendars.isEmpty {
+                        Picker("Calendar", selection: $calendarId) {
+                            // A nil row only when the sheet opened without a
+                            // calendar: picking a real one must not offer a way
+                            // back to "unspecified" that a PATCH can't express.
+                            if initialCalendarId == nil {
+                                Text("Personal").tag(String?.none)
+                            }
+                            ForEach(store.calendars) { calendar in
+                                Text(calendar.name).tag(String?.some(calendar.id))
+                            }
+                        }
+                    }
                 }
                 Section("Notes") {
                     TextField("", text: $notes, axis: .vertical)
@@ -160,7 +188,8 @@ struct EventSheet: View {
             case .new, .newOn:
                 saved = await store.createEvent(
                     title: trimmedTitle, startsAt: starts, endsAt: ends,
-                    location: cleaned(location), notes: cleaned(notes))
+                    location: cleaned(location), notes: cleaned(notes),
+                    calendarId: calendarId)
             case .existing(let event):
                 saved = await store.updateEvent(event, fields: changes(from: event))
             }
@@ -179,6 +208,9 @@ struct EventSheet: View {
         if ends != event.endsAt { fields["endsAt"] = APIClient.wireTime(ends) }
         if cleaned(location) != event.location ?? "" { fields["location"] = cleaned(location) }
         if cleaned(notes) != event.notes ?? "" { fields["notes"] = cleaned(notes) }
+        // Only a real move goes on the wire; a nil selection means the picker
+        // never left the calendar the event was already in.
+        if let calendarId, calendarId != event.calendarId { fields["calendarId"] = calendarId }
         return fields
     }
 
@@ -205,6 +237,172 @@ struct EventSheet: View {
         var parts = calendar.dateComponents([.year, .month, .day, .hour], from: now)
         parts.hour = (parts.hour ?? 0) + 1
         return calendar.date(from: parts) ?? now
+    }
+}
+
+/// Add, rename, recolor and delete calendars, from the button in the
+/// CalendarView header. Unlike the event editor there is no draft-and-Save:
+/// each row action is its own server write, small enough that the click *is*
+/// the explicit save — except delete, which cascades onto the calendar's
+/// events and therefore confirms first, stating the count it takes with it.
+struct ManageCalendarsSheet: View {
+    @EnvironmentObject var store: AppStore
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var newName = ""
+    @State private var newColor: String?    // nil = the server cycles its enum
+    @State private var pendingDelete: EventCalendar?
+    @State private var confirmingDelete = false
+
+    private var trimmedNewName: String { newName.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if !store.calendars.isEmpty {
+                    Section("Calendars") {
+                        ForEach(store.calendars) { calendar in
+                            CalendarManageRow(calendar: calendar) {
+                                pendingDelete = calendar
+                                confirmingDelete = true
+                            }
+                        }
+                    }
+                }
+                Section("New calendar") {
+                    TextField("Name", text: $newName)
+                        .onSubmit(add)
+                    Picker("Color", selection: $newColor) {
+                        // The server cycles its enum for an unnamed color, so
+                        // "Automatic" spreads the palette without the user
+                        // having to remember what's taken.
+                        Text("Automatic").tag(String?.none)
+                        ForEach(EventCalendar.colors, id: \.self) { color in
+                            Text(color.capitalized).tag(String?.some(color))
+                        }
+                    }
+                    Button("Add Calendar", action: add)
+                        .disabled(trimmedNewName.isEmpty)
+                }
+            }
+            .formStyle(.grouped)
+            .frame(minWidth: 440, minHeight: 360)
+            .navigationTitle("Calendars")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .alert("Delete calendar?", isPresented: $confirmingDelete, presenting: pendingDelete) { calendar in
+                Button("Delete \"\(calendar.name)\"", role: .destructive) {
+                    Task { await store.deleteCalendar(calendar) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { calendar in
+                Text("Deleting \"\(calendar.name)\" also deletes \(countPhrase(for: calendar)). This can't be undone.")
+            }
+        }
+    }
+
+    // The cascade is the whole reason this alert exists, so the count is in
+    // the sentence, not implied.
+    private func countPhrase(for calendar: EventCalendar) -> String {
+        let count = store.eventCount(in: calendar)
+        return count == 1 ? "its 1 event" : "its \(count) events"
+    }
+
+    private func add() {
+        let name = trimmedNewName, color = newColor
+        guard !name.isEmpty else { return }
+        Task {
+            if await store.createCalendar(name: name, color: color) {
+                newName = ""
+                newColor = nil
+            }
+            // A failed add (dup name, server down) keeps the draft; the error
+            // is already on its way to the one shared alert.
+        }
+    }
+}
+
+/// One calendar's row: color popup, rename field, event count, delete. Its
+/// own struct because the rename draft is per-calendar @State — identity from
+/// ForEach keeps a draft from bleeding across rows.
+private struct CalendarManageRow: View {
+    @EnvironmentObject var store: AppStore
+    let calendar: EventCalendar
+    let requestDelete: () -> Void
+
+    @State private var name: String
+
+    init(calendar: EventCalendar, requestDelete: @escaping () -> Void) {
+        self.calendar = calendar
+        self.requestDelete = requestDelete
+        _name = State(initialValue: calendar.name)
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(Palette.calendar(calendar.color))
+                .frame(width: Metric.calendarDot, height: Metric.calendarDot)
+            // Rename commits on Enter — the row's explicit save. An uncommitted
+            // draft simply stays in the field; nothing autosaves on dismiss.
+            // labelsHidden, or the grouped Form prints "Name" ahead of every
+            // row and shoves the actual name to the trailing edge.
+            TextField("Name", text: $name)
+                .textFieldStyle(.plain)
+                .labelsHidden()
+                .multilineTextAlignment(.leading)
+                .onSubmit(commitRename)
+            Spacer()
+            Text(countLabel)
+                .font(TypeScale.rowMeta)
+                .foregroundStyle(Palette.secondaryText)
+            recolorPicker
+            Button(action: requestDelete) {
+                Image(systemName: "trash")
+                    .foregroundStyle(Palette.secondaryText)
+            }
+            .buttonStyle(.borderless)
+            .help("Delete \(calendar.name) and its events")
+        }
+    }
+
+    private var countLabel: String {
+        let count = store.eventCount(in: calendar)
+        return count == 1 ? "1 event" : "\(count) events"
+    }
+
+    // Recoloring through a binding PATCHes on selection: picking the color is
+    // the action, there is nothing else to save with it.
+    private var recolorPicker: some View {
+        Picker("Color", selection: Binding(
+            get: { calendar.color },
+            set: { color in Task { await store.updateCalendar(calendar, fields: ["color": color]) } }
+        )) {
+            ForEach(EventCalendar.colors, id: \.self) { color in
+                Text(color.capitalized).tag(color)
+            }
+            // A color this build doesn't know still has to appear as the
+            // current selection, or the picker would render blank and the
+            // first click would silently rewrite it.
+            if !EventCalendar.colors.contains(calendar.color) {
+                Text(calendar.color.capitalized).tag(calendar.color)
+            }
+        }
+        .labelsHidden()
+        .fixedSize()
+    }
+
+    private func commitRename() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != calendar.name else { return }
+        Task {
+            // On failure (dup name) the draft stays put and the shared alert
+            // explains; the row's stored name is still the server's truth.
+            _ = await store.updateCalendar(calendar, fields: ["name": trimmed])
+        }
     }
 }
 

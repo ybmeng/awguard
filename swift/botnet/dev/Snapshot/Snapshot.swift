@@ -4,7 +4,10 @@
 //
 //   ./dev/snapshot.sh                       # light + dark into build/snapshots
 //   snapshot --calendar [--month]           # the Calendar panel, list or grid
+//   snapshot --calendar --filter-calendar <name>  # with that calendar's chip active
+//   snapshot --calendar --search <text>     # with the header search narrowing it
 //   snapshot --event-sheet [--new-event]    # the event editor, rendered flat
+//   snapshot --manage-calendars             # the calendar manager, rendered flat
 //
 // It talks to whatever BOTNET_API points at, so point it at the demo server
 // from dev/seed-demo.sh rather than the real ~/.botnet/net.db.
@@ -15,10 +18,15 @@ import SwiftUI
 /// Which surface the capture puts beside the sidebar.
 private enum Pane {
     case chat
-    case calendar(CalendarMode)
+    /// The filter is a calendar id (resolved from --filter-calendar's name),
+    /// the query is --search's text: CalendarView opens with that chip active
+    /// and that text typed — states a click can't produce offscreen.
+    case calendar(CalendarMode, filter: String?, query: String)
     /// The event editor. The app presents it as a sheet; offscreen it is drawn
     /// flat, like BotDetails, because a sheet needs a real window to present.
     case eventSheet(EventTarget)
+    /// The calendar manager, drawn flat for the same reason.
+    case manageCalendars
 }
 
 @main
@@ -58,9 +66,22 @@ struct Snapshot {
     @MainActor
     private static func pane(_ store: AppStore) -> Pane {
         let flags = CommandLine.arguments
+        if flags.contains("--manage-calendars") { return .manageCalendars }
         guard flags.contains("--event-sheet") else {
             guard flags.contains("--calendar") else { return .chat }
-            return .calendar(flags.contains("--month") ? .month : .list)
+            // Failing loudly beats a screenshot that silently shows "All":
+            // a typo'd name would otherwise pass review as an unfiltered pane.
+            var filter: String?
+            if let name = argument("--filter-calendar") {
+                guard let match = store.calendars.first(where: {
+                    $0.name.caseInsensitiveCompare(name) == .orderedSame
+                }) else {
+                    fail("no calendar named \(name) on the demo server")
+                }
+                filter = match.id
+            }
+            return .calendar(flags.contains("--month") ? .month : .list,
+                             filter: filter, query: argument("--search") ?? "")
         }
         // Editing an existing event is the interesting case; fall back to the
         // blank form when the calendar is empty rather than failing the run.
@@ -95,8 +116,8 @@ struct Snapshot {
                     BotDetails(bot: bot, expanded: .constant(!collapseMemory))
                         .frame(width: 300)
                 }
-            case .calendar(let mode):
-                CalendarView(mode: .constant(mode))
+            case .calendar(let mode, let filter, let query):
+                CalendarView(mode: .constant(mode), initialFilter: filter, initialQuery: query)
             case .eventSheet(let target):
                 // Held at the sheet's own size on the pane's ground, so the
                 // capture reads like the presented sheet rather than a form
@@ -104,6 +125,13 @@ struct Snapshot {
                 // a real window and does not appear in a flat render.
                 EventSheet(target: target)
                     .frame(width: 460, height: 440)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Palette.chrome)
+            case .manageCalendars:
+                // Flat like the event sheet, and (also like it) without the
+                // window toolbar, so the Done button is verified in code.
+                ManageCalendarsSheet()
+                    .frame(width: 460, height: 400)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Palette.chrome)
             }

@@ -9,11 +9,14 @@ import SwiftUI
 
 struct MonthGridView: View {
     @EnvironmentObject var store: AppStore
+    /// The events to draw — CalendarView passes the same filtered array the
+    /// list renders, so the active chip means one thing in both readings.
+    let events: [Event]
     /// Called with the event to edit, or the day to create one on.
     let open: (EventTarget) -> Void
 
-    private var months: [MonthGrid] { MonthGrid.range(covering: store.events) }
-    private var byDay: [Date: [Event]] { Dictionary(grouping: store.events, by: \.day) }
+    private var months: [MonthGrid] { MonthGrid.range(covering: events) }
+    private var byDay: [Date: [Event]] { Dictionary(grouping: events, by: \.day) }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -33,6 +36,12 @@ struct MonthGridView: View {
             // means is this one.
             .onAppear { proxy.scrollTo(MonthGrid.month(of: Date()), anchor: .top) }
         }
+    }
+
+    /// Same resolution rule as the list rows: a dot only when the calendar
+    /// resolves, so an old server's chips render exactly as before.
+    private func calendarColor(of event: Event) -> Color? {
+        store.calendar(id: event.calendarId).map { Palette.calendar($0.color) }
     }
 
     private func section(_ month: MonthGrid) -> some View {
@@ -71,6 +80,7 @@ struct MonthGridView: View {
                             // month's section; drawing them twice would make
                             // the same event look like two.
                             events: inMonth ? (byDay[day] ?? []) : [],
+                            color: calendarColor(of:),
                             open: open
                         )
                     }
@@ -86,6 +96,7 @@ private struct DayCell: View {
     let day: Date
     let inMonth: Bool
     let events: [Event]
+    let color: (Event) -> Color?
     let open: (EventTarget) -> Void
 
     @State private var hovering = false
@@ -116,7 +127,7 @@ private struct DayCell: View {
             VStack(alignment: .leading, spacing: 1) {
                 dayNumber
                 ForEach(visible) { event in
-                    EventChip(event: event) { open(.existing(event)) }
+                    EventChip(event: event, color: color(event)) { open(.existing(event)) }
                 }
                 if overflow > 0 {
                     Text("+\(overflow) more")
@@ -169,11 +180,19 @@ private struct DayCell: View {
 
 private struct EventChip: View {
     let event: Event
+    let color: Color?
     let open: () -> Void
 
     var body: some View {
         Button(action: open) {
             HStack(spacing: 3) {
+                // A dot, not a tint: at three chips per hundred-point cell a
+                // tinted background would leave the title unreadable in dark
+                // mode, and chipDot is small enough not to cost title width.
+                if let color {
+                    Circle().fill(color)
+                        .frame(width: Metric.chipDot, height: Metric.chipDot)
+                }
                 Text(Self.clock(event.startsAt))
                     .foregroundStyle(Palette.secondaryText)
                 Text(event.title)

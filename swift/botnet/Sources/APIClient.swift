@@ -104,8 +104,11 @@ struct APIClient {
     }
 
     /// createdBy is the server's call, not ours: an event posted here is "user".
+    /// A nil calendarId is omitted, not sent as "": the server then files the
+    /// event under "Personal" (creating it if needed), which is the contract's
+    /// default and also what an older client's create already means.
     func createEvent(title: String, startsAt: Date, endsAt: Date,
-                     location: String, notes: String) async throws -> Event {
+                     location: String, notes: String, calendarId: String? = nil) async throws -> Event {
         var body = [
             "title": title,
             "startsAt": Self.wireTime(startsAt),
@@ -115,6 +118,7 @@ struct APIClient {
         // call produces; the server treats both as unset anyway.
         if !location.isEmpty { body["location"] = location }
         if !notes.isEmpty { body["notes"] = notes }
+        if let calendarId { body["calendarId"] = calendarId }
         return try await send("/v1/events", method: "POST", body: body)
     }
 
@@ -125,6 +129,37 @@ struct APIClient {
 
     func deleteEvent(_ id: String) async throws {
         _ = try await raw("/v1/events/\(id)", method: "DELETE", body: nil)
+    }
+
+    // MARK: calendars (the named collections events file under)
+    //
+    // Same era and same rules as the calendar-tool routes above: last-write-wins,
+    // and a 404 on any of them means a botnetd that predates multiple calendars,
+    // which callers read through `isUnimplemented` and hide rather than report.
+
+    /// Ascending by createdAt, as the server orders them. Never null on the
+    /// wire — an empty list is `[]`, and a valid answer.
+    func listCalendars() async throws -> [EventCalendar] {
+        try await get("/v1/calendars")
+    }
+
+    /// A nil color is omitted: the server then cycles its enum by calendar
+    /// count, which spreads the colors without the client hardcoding the order.
+    func createCalendar(name: String, color: String? = nil) async throws -> EventCalendar {
+        var body = ["name": name]
+        if let color { body["color"] = color }
+        return try await send("/v1/calendars", method: "POST", body: body)
+    }
+
+    /// `fields` is any subset of {name, color}, PATCHed partially like an event.
+    func updateCalendar(_ id: String, fields: [String: String]) async throws -> EventCalendar {
+        try await send("/v1/calendars/\(id)", method: "PATCH", body: fields)
+    }
+
+    /// CASCADES server-side: the calendar's events are deleted with it. The UI
+    /// confirms before calling; the wire call itself is unconditional.
+    func deleteCalendar(_ id: String) async throws {
+        _ = try await raw("/v1/calendars/\(id)", method: "DELETE", body: nil)
     }
 
     private func escaped(_ value: String) -> String {

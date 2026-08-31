@@ -18,6 +18,12 @@ final class AppStore: ObservableObject {
     // them. Empty on a botnetd without the routes, which reads as an empty
     // calendar rather than an error the user can do nothing about.
     @Published private(set) var events: [Event] = []
+    // The named calendars, ascending by createdAt as the server sorts them.
+    @Published private(set) var calendars: [EventCalendar] = []
+    // True once /v1/calendars has 404'd: this botnetd predates multiple
+    // calendars, so the views drop the calendar chrome (chip row, picker,
+    // manage button) and the pane renders exactly as it did before them.
+    @Published private(set) var calendarsUnavailable = false
     @Published var pendingBotIDs: Set<String> = []
     @Published var compactingBotIDs: Set<String> = []
     @Published var lastError: String?
@@ -148,17 +154,97 @@ final class AppStore: ObservableObject {
             guard !APIClient.isUnimplemented(error) else { return }
             lastError = error.localizedDescription
         }
+        // Events and calendars go stale together — a bot's tool call can make a
+        // calendar in the same turn it books into it — so every event refresh
+        // re-reads both.
+        await refreshCalendars()
+    }
+
+    func refreshCalendars() async {
+        do {
+            calendars = try await api.listCalendars()
+            calendarsUnavailable = false
+        } catch {
+            guard !APIClient.isUnimplemented(error) else {
+                // Not sticky by design: a restart onto a current botnetd mid-run
+                // brings the chrome back on the next refresh instead of
+                // pinning the old-server look for the whole session.
+                calendars = []
+                calendarsUnavailable = true
+                return
+            }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// The calendar an event files under, resolved against the live list at
+    /// render time — a recolor propagates to every row without a refetch. Nil
+    /// for an old server's events and for a calendar deleted since the fetch.
+    func calendar(id: String?) -> EventCalendar? {
+        guard let id else { return nil }
+        return calendars.first { $0.id == id }
+    }
+
+    /// How many cached events file under a calendar; what the delete
+    /// confirmation counts.
+    func eventCount(in calendar: EventCalendar) -> Int {
+        events.filter { $0.calendarId == calendar.id }.count
+    }
+
+    @discardableResult
+    func createCalendar(name: String, color: String?) async -> Bool {
+        do {
+            mergeCalendar(try await api.createCalendar(name: name, color: color))
+            return true
+        } catch {
+            lastError = calendarError(error, verb: "add a calendar")
+            return false
+        }
+    }
+
+    @discardableResult
+    func updateCalendar(_ calendar: EventCalendar, fields: [String: String]) async -> Bool {
+        guard !fields.isEmpty else { return true }
+        do {
+            mergeCalendar(try await api.updateCalendar(calendar.id, fields: fields))
+            return true
+        } catch {
+            lastError = calendarError(error, verb: "edit a calendar")
+            return false
+        }
+    }
+
+    /// The server cascades: the calendar's events go with it, so the cache
+    /// drops them too rather than stranding rows that point at a dead id.
+    func deleteCalendar(_ calendar: EventCalendar) async {
+        do {
+            try await api.deleteCalendar(calendar.id)
+            calendars.removeAll { $0.id == calendar.id }
+            events.removeAll { $0.calendarId == calendar.id }
+        } catch {
+            lastError = calendarError(error, verb: "delete a calendar")
+        }
+    }
+
+    // Keeps the cache in the server's own order (createdAt ascending, id as the
+    // tiebreak), same splice as merge(_:) below and for the same reason.
+    private func mergeCalendar(_ calendar: EventCalendar) {
+        calendars.removeAll { $0.id == calendar.id }
+        let at = calendars.firstIndex {
+            ($0.createdAt, $0.id) > (calendar.createdAt, calendar.id)
+        } ?? calendars.endIndex
+        calendars.insert(calendar, at: at)
     }
 
     /// Returns whether the create landed, so the sheet can stay open with the
     /// draft intact when it didn't.
     @discardableResult
     func createEvent(title: String, startsAt: Date, endsAt: Date,
-                     location: String, notes: String) async -> Bool {
+                     location: String, notes: String, calendarId: String? = nil) async -> Bool {
         do {
             let created = try await api.createEvent(
                 title: title, startsAt: startsAt, endsAt: endsAt,
-                location: location, notes: notes)
+                location: location, notes: notes, calendarId: calendarId)
             merge(created)
             return true
         } catch {

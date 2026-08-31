@@ -193,6 +193,27 @@ struct Segment: Identifiable, Codable, Hashable {
     var isOpen: Bool { sealed == nil }
 }
 
+// One named calendar — mirrors go/botnet/schema.go's Calendar. Named
+// EventCalendar because Foundation.Calendar is all over the date math in the
+// calendar views, and shadowing it would force the namespace onto every
+// `Calendar.current`. `color` is the server's enum string ("blue"…"teal");
+// Palette.calendar(_:) maps it to a token and absorbs any value this build
+// doesn't know. Calendars are last-write-wins like events.
+struct EventCalendar: Identifiable, Codable, Hashable {
+    var id: String            // "cal_" + ULID
+    var name: String
+    var color: String
+    /// The bot id that created it, or `Event.userAuthor` for one made in the UI.
+    var createdBy: String
+    var createdAt: Date
+    var updatedAt: Date
+
+    /// The server's color enum, in the order it cycles them for an unnamed
+    /// color. The recolor menus iterate this; Palette.calendar(_:) tolerates a
+    /// value beyond it.
+    static let colors = ["blue", "green", "orange", "purple", "red", "teal"]
+}
+
 // One calendar entry — mirrors go/botnet/schema.go's Event. The server sends
 // location and notes with omitempty, so an unset one is absent from the JSON
 // rather than "": both are Optional here and read as empty either way. Events
@@ -204,6 +225,9 @@ struct Event: Identifiable, Codable, Hashable {
     var endsAt: Date
     var location: String?
     var notes: String?
+    /// The calendar this event files under. Always present from a server with
+    /// multiple calendars; nil means an older botnetd, never a real value.
+    var calendarId: String?
     /// The bot id that created it, or `Event.userAuthor` for one made in the UI.
     var createdBy: String
     var createdAt: Date

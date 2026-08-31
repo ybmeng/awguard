@@ -25,6 +25,32 @@ enum Palette {
     static let secondaryText = dynamic(light: 0x8B8B90, dark: 0x98989E)
     static let attention = dynamic(light: 0xE1830B, dark: 0xF0A03C)
 
+    // The six calendar colors, named for the server's color enum. Each pair is
+    // tuned to read as a small dot on both the light and dark chrome — the dark
+    // variants are lifted, not just reused, because the light values sink into
+    // the dark ground at dot size.
+    static let calendarBlue = dynamic(light: 0x3574E0, dark: 0x6BA0F5)
+    static let calendarGreen = dynamic(light: 0x3D9B4E, dark: 0x62C273)
+    static let calendarOrange = dynamic(light: 0xE07A16, dark: 0xF0A04C)
+    static let calendarPurple = dynamic(light: 0x8E5BD9, dark: 0xB48AF0)
+    static let calendarRed = dynamic(light: 0xD9463C, dark: 0xF07A72)
+    static let calendarTeal = dynamic(light: 0x0F9490, dark: 0x45C4C0)
+
+    /// The wire color string to its token. A value this build doesn't know —
+    /// a newer server's seventh color — draws as the quiet neutral rather than
+    /// failing or shouting; secondaryText is already that gray on both grounds.
+    static func calendar(_ wire: String) -> Color {
+        switch wire {
+        case "blue": return calendarBlue
+        case "green": return calendarGreen
+        case "orange": return calendarOrange
+        case "purple": return calendarPurple
+        case "red": return calendarRed
+        case "teal": return calendarTeal
+        default: return secondaryText
+        }
+    }
+
     // The avatar colors. Index is chosen by hashing the bot id, so a bot keeps
     // the same face for its whole life without storing anything server-side.
     static let avatarColors: [Color] = [
@@ -122,6 +148,15 @@ enum Metric {
     static let chipVPad: CGFloat = 2
     /// The circle behind today's date number.
     static let todayMarker: CGFloat = 19
+
+    /// A calendar's color dot: on a list row and a filter chip.
+    static let calendarDot: CGFloat = 7
+    /// The header's type-to-filter field. Fixed, not flexible: the header's
+    /// controls keep their place as the window resizes.
+    static let calendarSearchWidth: CGFloat = 200
+    /// The same dot inside a month-grid chip, where three chips share a cell
+    /// barely a hundred points wide and the dot must not eat title width.
+    static let chipDot: CGFloat = 5
 }
 
 enum TypeScale {

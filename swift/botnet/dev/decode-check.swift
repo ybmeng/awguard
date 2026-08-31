@@ -219,6 +219,52 @@ struct DecodeCheck {
             _ = try decoder.decode([Event].self, from: Data("[]".utf8))
         }
 
+        // Multiple calendars landed after the first server release: an event
+        // from a current botnetd always carries calendarId, one from an older
+        // build never does, and the same build must decode both — nil meaning
+        // "old server", never a real value.
+        let eventWithCalendar = Data("""
+        {"id":"evt_01M1A0000000000000000003","title":"Fed minutes","startsAt":"2026-09-02T18:00:00Z","endsAt":"2026-09-02T19:00:00Z","calendarId":"cal_01M1B0000000000000000001","createdBy":"user","createdAt":"2026-08-31T09:00:00Z","updatedAt":"2026-08-31T09:00:00Z"}
+        """.utf8)
+        await check("Event.calendarId decodes when present, nil when absent") {
+            let filed = try decoder.decode(Event.self, from: eventWithCalendar)
+            guard filed.calendarId == "cal_01M1B0000000000000000001" else {
+                throw NSError(domain: "decode-check", code: 14, userInfo: [
+                    NSLocalizedDescriptionKey: "calendarId decoded as \(String(describing: filed.calendarId))",
+                ])
+            }
+            let old = try decoder.decode(Event.self, from: bareEvent)
+            guard old.calendarId == nil else {
+                throw NSError(domain: "decode-check", code: 15, userInfo: [
+                    NSLocalizedDescriptionKey: "absent calendarId decoded as \(String(describing: old.calendarId))",
+                ])
+            }
+        }
+
+        // A calendar with a color this build knows, and one with a color it
+        // doesn't (a newer server's enum can grow): both must decode — the
+        // graceful fallback is Palette.calendar(_:)'s job, not the decoder's.
+        let knownColorCalendar = Data("""
+        {"id":"cal_01M1B0000000000000000001","name":"Company Earnings","color":"teal","createdBy":"user","createdAt":"2026-08-31T08:59:00.412Z","updatedAt":"2026-08-31T08:59:00.412Z"}
+        """.utf8)
+        let unknownColorCalendar = Data("""
+        {"id":"cal_01M1B0000000000000000002","name":"Financial Updates","color":"chartreuse","createdBy":"bot_01M16K3W6TZ0EHQFPKZ490BDX2","createdAt":"2026-08-31T09:01:00Z","updatedAt":"2026-08-31T09:01:00Z"}
+        """.utf8)
+        await check("EventCalendar decodes with a known and an unknown color") {
+            let known = try decoder.decode(EventCalendar.self, from: knownColorCalendar)
+            let unknown = try decoder.decode(EventCalendar.self, from: unknownColorCalendar)
+            guard known.color == "teal", known.name == "Company Earnings",
+                  unknown.color == "chartreuse", unknown.createdBy.hasPrefix("bot_")
+            else {
+                throw NSError(domain: "decode-check", code: 16, userInfo: [
+                    NSLocalizedDescriptionKey: "calendar decoded wrong: \(known) / \(unknown)",
+                ])
+            }
+        }
+        await check("empty calendar list decodes") {
+            _ = try decoder.decode([EventCalendar].self, from: Data("[]".utf8))
+        }
+
         // The times the app sends back must be the RFC3339 form the server
         // parses, and must survive a round trip through its own decoder.
         await check("wireTime round-trips through the decoder") {
@@ -284,6 +330,10 @@ struct DecodeCheck {
             await check("live GET /v1/events?from=&to= (404 tolerated)") {
                 let now = Date()
                 do { _ = try await api.listEvents(from: now, to: now.addingTimeInterval(86_400)) }
+                catch let e where APIClient.isUnimplemented(e) {}
+            }
+            await check("live GET /v1/calendars (404 = older server, tolerated)") {
+                do { _ = try await api.listCalendars() }
                 catch let e where APIClient.isUnimplemented(e) {}
             }
             for b in bots {

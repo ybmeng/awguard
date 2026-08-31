@@ -108,8 +108,11 @@ From `swift/botnet/`:
   store data a view loads in `.task` must also be awaited explicitly in
   Snapshot.main() before render (as refresh/loadConversation/loadTools are).
 - Snapshot renders one pane beside the sidebar; pick it with a flag
-  (`--calendar`, `--event-sheet [--new-event]`) — a rendering mode is not the
-  banned `--seed-*` flag. A sheet has to be drawn flat, at its own
+  (`--calendar [--month] [--filter-calendar <name>] [--search <text>]`,
+  `--event-sheet [--new-event]`, `--manage-calendars`) — a rendering mode is
+  not the banned `--seed-*` flag. A mode that resolves a name (like
+  `--filter-calendar`) should fail loudly on no-match, or a typo'd run passes
+  review as the unfiltered pane. A sheet has to be drawn flat, at its own
   `.frame(width:height:)`, and its NavigationStack toolbar (Cancel/Save) will
   NOT appear — the toolbar needs a real window, same as `.inspector`. Verify
   those buttons by reading the code, not the PNG.
@@ -138,7 +141,17 @@ From `swift/botnet/`:
   `Section("Title") { TextField("e.g. Lunch…") }` prints the field's name twice
   the moment it has a value ("e.g. Lunch with Alex" | "Chase sign-in call").
   Label the field (`TextField("Title", …)`) and keep a section header only for
-  a multiline field whose label would sit oddly beside a tall box.
+  a multiline field whose label would sit oddly beside a tall box. The same
+  label slot bites inside a custom HStack row: a grouped Form still prints the
+  TextField's label ahead of the row and right-aligns the field ("Name |
+  Personal | …" on every ManageCalendarsSheet row). For an inline editable
+  field in a composed row, add `.labelsHidden()` +
+  `.multilineTextAlignment(.leading)`.
+- Don't shadow a Foundation type with a model name: the calendar entity is
+  `EventCalendar`, not `Calendar`, because `Calendar.current` runs all through
+  the date math and shadowing it would force `Foundation.Calendar` onto every
+  call site. Check what the obvious name collides with before mirroring a
+  server entity.
 - A pane that fills the window pushes a row's trailing column (an author, a
   stamp) to the far edge, a hand's width from the content it belongs to. Cap
   the list's own width the way `Metric.bubbleWidthFraction` caps a bubble —
