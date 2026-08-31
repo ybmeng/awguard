@@ -122,10 +122,14 @@ From `swift/botnet/`:
   `Snapshot.swift` — that residue was left in the tree three times this session
   after "tree clean" reports. If you must touch source to seed, grep for your
   residue before reporting; the orchestrator greps and rejects it.
-- The snapshot captures the TOP of the transcript, not the newest turn (no
-  reliable scroll-to-bottom offscreen). To snapshot a specific message's UI,
-  seed it onto an EARLY message (the first bot reply) or point at a
-  short-history bot — a reply appended at the end won't be in frame.
+- The snapshot captures the BOTTOM of the transcript: the ScrollView opens
+  pinned to the newest turn (`.defaultScrollAnchor(.bottom)`) and the offscreen
+  render honors that. To snapshot a specific message's UI, seed it onto a LATE
+  message (the last bot reply) or use a short-history bot that fits one
+  viewport — an early message scrolled off the top won't be in frame. The tool
+  renders `store.bots.first`, ordered by `bots.last_message_at` — a
+  denormalized column, so editing a demo message's `sent_at` alone doesn't
+  reorder; `UPDATE bots SET last_message_at=...` picks which bot renders.
 - A `/v1/tools` entry can be a bare server tool (`{type:"openrouter:web_search"}`,
   no `function`). `ToolDefinition` must decode `function` as optional and render
   an unknown/functionless type gracefully (humanize the `type`), or the whole

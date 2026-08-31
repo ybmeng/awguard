@@ -12,6 +12,9 @@ struct ChatView: View {
     @Binding var showDetails: Bool
 
     @State private var draft = ""
+    @State private var renaming = false
+    @State private var renameDraft = ""
+    @FocusState private var renameFocused: Bool
 
     private var messages: [Message] { store.messages(for: bot.id) }
     private var turns: [ChatTurn] { ChatTurn.build(from: messages) }
@@ -29,14 +32,40 @@ struct ChatView: View {
         }
         .background(Palette.chrome)
         .task(id: bot.id) { await store.loadConversation(bot.id) }
+        // An in-progress rename must never carry one bot's draft to another.
+        .onChange(of: bot.id) {
+            renaming = false
+            renameDraft = ""
+        }
     }
 
     private var header: some View {
         HStack(spacing: 8) {
             BotAvatar(botID: bot.id, size: Metric.avatarSmall)
-            Text(bot.displayName)
-                .font(TypeScale.headerTitle)
-                .foregroundStyle(Palette.primaryText)
+            if renaming {
+                TextField("", text: $renameDraft)
+                    .font(TypeScale.headerTitle)
+                    .foregroundStyle(Palette.primaryText)
+                    .textFieldStyle(.plain)
+                    .focused($renameFocused)
+                    .onSubmit(commitRename)
+                    .onExitCommand { renaming = false }
+                    .onAppear { renameFocused = true }
+            } else {
+                Text(bot.displayName)
+                    .font(TypeScale.headerTitle)
+                    .foregroundStyle(Palette.primaryText)
+                Button {
+                    renameDraft = bot.displayName
+                    renaming = true
+                } label: {
+                    Image(systemName: "pencil")
+                        .foregroundStyle(Palette.secondaryText)
+                }
+                .buttonStyle(.borderless)
+                .help("Rename bot")
+                .accessibilityIdentifier("renameBotButton")
+            }
             Spacer()
             actionsMenu
             Button { showDetails.toggle() } label: {
@@ -108,12 +137,26 @@ struct ChatView: View {
                     .padding(.horizontal, Metric.transcriptHPad)
                     .padding(.vertical, Metric.transcriptVPad)
                 }
-                .onChange(of: messages.count) {
-                    if let last = turns.last?.lastBubbleID {
-                        withAnimation { proxy.scrollTo(last, anchor: .bottom) }
-                    }
-                }
+                // Opens at the newest turn and stays pinned while the reader is
+                // at the bottom; scrolling up unpins, as a chat should.
+                .defaultScrollAnchor(.bottom)
+                // The explicit scroll covers the reader who scrolled up and then
+                // sent: the pin is off, but their own send must snap back down.
+                // `pending` is a trigger too — the thinking bubble appears
+                // without changing the message count.
+                .onChange(of: messages.count) { scrollToNewest(proxy) }
+                .onChange(of: pending) { scrollToNewest(proxy) }
             }
+        }
+    }
+
+    // Deferred one update: onChange fires before the LazyVStack lays out the
+    // row it was told about, and scrollTo to an id with no laid-out row is a
+    // no-op.
+    private func scrollToNewest(_ proxy: ScrollViewProxy) {
+        guard let target = pending ? "pending" : turns.last?.lastBubbleID else { return }
+        Task { @MainActor in
+            withAnimation { proxy.scrollTo(target, anchor: .bottom) }
         }
     }
 
@@ -158,6 +201,22 @@ struct ChatView: View {
     }
 
     private var circleDiameter: CGFloat { Metric.composerMinHeight - 20 }
+
+    // A failed save keeps the field open so the name isn't lost; the error
+    // itself surfaces through the store's alert. An empty or unchanged name
+    // just ends the edit — no patch to send.
+    private func commitRename() {
+        let trimmed = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != bot.displayName else {
+            renaming = false
+            return
+        }
+        Task {
+            if await store.updateBot(bot, fields: ["displayName": trimmed]) {
+                renaming = false
+            }
+        }
+    }
 
     private func sendDraft() {
         let text = draft
@@ -591,14 +650,15 @@ private struct ThinkingBubble: View {
     }
 }
 
-// One collapsible inspector section: a header that is the toggle (rotating
-// chevron + title, with an optional trailing accessory that stays clickable on
-// its own), and a body shown only while expanded. Hairlines are self-contained
-// so N sections stack cleanly with no knowledge of their neighbors: the header
-// draws one bottom hairline, and an open section draws one more under its
-// body. Collapsing removes the content view — state that must survive a
-// collapse/expand round-trip (like Memory's draft) belongs to the caller, not
-// inside the content closure.
+// One collapsible inspector section, drawn as a rounded card: a header that is
+// the toggle (rotating chevron + title, with an optional trailing accessory
+// that stays clickable on its own), and a body shown only while expanded, with
+// one hairline between the two. The card treatment — radius, border, clip —
+// lives entirely here so restyling every section is a one-place edit; neighbors
+// are separated by the caller's stack spacing, not by hairlines. Collapsing
+// removes the content view — state that must survive a collapse/expand
+// round-trip (like Memory's draft) belongs to the caller, not inside the
+// content closure.
 struct InspectorSection<Content: View, Accessory: View>: View {
     let title: String
     @Binding var expanded: Bool
@@ -609,9 +669,14 @@ struct InspectorSection<Content: View, Accessory: View>: View {
         VStack(spacing: 0) {
             header
             if expanded {
-                content()
                 hairline
+                content()
             }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: Metric.inspectorCardRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Metric.inspectorCardRadius, style: .continuous)
+                .strokeBorder(Palette.fieldStroke, lineWidth: 1)
         }
     }
 
@@ -638,7 +703,6 @@ struct InspectorSection<Content: View, Accessory: View>: View {
         }
         .padding(.horizontal, Metric.inspectorPad)
         .frame(height: Metric.headerHeight)
-        .overlay(alignment: .bottom) { hairline }
     }
 
     private var hairline: some View {
@@ -668,7 +732,7 @@ struct BotDetails: View {
     private var memory: String { bot.memory ?? "" }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: Metric.inspectorCardSpacing) {
             // Collapsing only hides the body; `editing` and `draft` live on
             // this view, not in the section content, so expanding again lands
             // back in the untouched editor.
@@ -696,6 +760,7 @@ struct BotDetails: View {
             }
             Spacer(minLength: 0)
         }
+        .padding(Metric.inspectorCardInset)
         .background(Palette.chrome)
         .navigationTitle("Details")
         // Switching bots must never carry one bot's unsaved draft to another.

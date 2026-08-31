@@ -86,6 +86,12 @@ enum Metric {
     static let inspectorPad: CGFloat = 12
     /// A panel section grows with its content up to this, then scrolls inside.
     static let inspectorSectionMaxHeight: CGFloat = 300
+    /// Inspector sections draw as rounded cards; the radius, the gap between
+    /// cards, and the inset from the inspector edges are one treatment, so the
+    /// card look retunes here rather than per section.
+    static let inspectorCardRadius: CGFloat = 9
+    static let inspectorCardSpacing: CGFloat = 8
+    static let inspectorCardInset: CGFloat = 12
 
     /// Fixed width for a tool-call row's leading icon, so the summaries line up
     /// down the list even though each tool's glyph is a different width.
