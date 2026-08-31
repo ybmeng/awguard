@@ -1,0 +1,23 @@
+{
+  "automation": "fred-m2",
+  "status": "ok",
+  "form_used": 3,
+  "artifacts": [
+    {
+      "path": "data/m2real.csv",
+      "rows": 810,
+      "newest": "2026-07-01"
+    },
+    {
+      "path": "data/m2sl.csv",
+      "rows": 811,
+      "newest": "2026-07-01"
+    },
+    {
+      "path": "data/wm2ns.csv",
+      "rows": 2379,
+      "newest": "2026-08-03"
+    }
+  ],
+  "escalation_reason": null
+}
