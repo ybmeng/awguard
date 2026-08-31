@@ -7,10 +7,13 @@ Fields: export value (USD) + weight, incl. 10-day provisional periods and by-cou
 ## CURRENT STATE (2026-08-31) — read this first
 
 - `scripts/fetch_kcs.py all` (no auth, no browser) pulls three CSVs into data/: `monthly`
-  (7 memory codes × month), `monthly_by_country` (code × destination country × month; 499 rows
-  live-verified), `tentative` (10-day category pace incl. 반도체). 24 offline snapshot tests:
-  `python3 scripts/tests/test_parsers.py` from this dir. Raw JSON archived per run; a 0-row or
-  bad parse exits 1 and never overwrites a good CSV.
+  (7 memory codes × month), `monthly_by_country` (code × destination country × month; 1,178 rows
+  live-verified, 76 countries × 7 codes × Jan–Jul), `tentative` (10-day category pace incl. 반도체).
+  41 offline snapshot tests: `python3 scripts/tests/test_parsers.py` from this dir. Raw JSON archived
+  per run; a 0-row, truncated, or bad parse exits 1 and never overwrites a good CSV. Every run also
+  emits the automation-123 result envelope (last stdout line + `data/last_result.json`).
+- Manifest: `README.md` (forms 3/2/1, cadence, gates). Form-2 step list for the captcha-gated
+  per-HSK by-country queries: `recipes/trass_by_country.md`.
 - Release cadence (KST): full-month provisional on the 1st ~09:00, 1~10 on the 11th, 1~20 on the
   21st; monthly 확정 (incl. by-country) ~the 15th of the following month. 09:00 KST = 5pm PT prior
   day. Endpoint refresh may trail the press release by minutes–hours; rerun until the row appears.
@@ -98,6 +101,12 @@ https://tradedata.go.kr → /cts/index.do (SPA, URL never changes). Anonymous qu
 - Excel download icons present while logged out (unclicked/untested).
 - **Cookie-less curl WORKS** on `retrieveTrade.do` (no session needed) — plain curl POST returns the
   same JSON. The whole monthly pipeline is scriptable without a browser.
+- **`showPagingLine` truncates SERVER-SIDE with no error** (found 2026-08-31): the response's `count`
+  is the unpaged total while `items` is silently cut to the page size. HS6 854232 × all countries ×
+  Jan–Jul = 1,179 rows, of which `showPagingLine=500` delivered 500 — a CSV that looked healthy but
+  stopped at 2026.04. Tell: `count > len(items)`; a complete response has `count == len(items)`
+  (총계 row included) on all three endpoints. fetch_kcs.py now asserts that and exits 1 on a
+  shortfall. 5000 is honored server-side.
 - **HS enumeration trick**: `hsSgnWhrCol=HS6_SGN&hsSgn=854232&hsSgnGrpCol=HS10_SGN` returns every
   HS10 child × month. `hsSgnWhrCol=HS8_SGN` with an 8-digit code returns 0 (HS8 filter col not
   populated) — filter at HS6 or HS10 only. `korePrlstNm` is EMPTY in grouped responses; fetch names

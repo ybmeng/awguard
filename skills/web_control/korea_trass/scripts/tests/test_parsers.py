@@ -12,12 +12,20 @@ SNAPSHOTS_DIR = Path(__file__).resolve().parent / "snapshots"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from fetch_kcs import (  # noqa: E402
+    AUTOMATION_DIR,
     BY_COUNTRY_FIELDS,
     HS10_NAMES,
     MONTHLY_FIELDS,
     TENTATIVE_FIELDS,
+    FetchError,
+    artifact_path,
     build_by_country_params,
+    build_envelope,
     build_monthly_params,
+    check_not_truncated,
+    failure_sentence,
+    newest_month,
+    newest_tentative_period,
     parse_monthly,
     parse_monthly_by_country,
     parse_tentative,
@@ -209,6 +217,103 @@ class BuildParamsTest(unittest.TestCase):
     def test_by_country_rejects_mixed_length_list(self):
         with self.assertRaises(ValueError):
             build_by_country_params(self.args("854232,8542321010"))
+
+
+class TruncationGuardTest(unittest.TestCase):
+    def check(self, raw):
+        check_not_truncated("monthly_by_country", raw, Path("raw.json"))
+
+    def test_short_item_list_raises(self):
+        with self.assertRaises(FetchError) as caught:
+            self.check({"count": 1179, "items": [{}] * 500})
+        self.assertIn("truncated to 500 of 1179 rows", str(caught.exception))
+
+    def test_complete_response_passes(self):
+        self.check({"count": 106, "items": [{}] * 106})
+
+    def test_snapshots_are_complete(self):
+        for name in (
+            "monthly_202601_202607.json",
+            "by_country_202601_202607.json",
+            "tentative_202606_202608.json",
+        ):
+            self.check(load_snapshot(name))
+
+    def test_missing_or_unparsable_count_passes(self):
+        self.check({"items": [{}]})
+        self.check({"count": None, "items": [{}]})
+        self.check({"count": "", "items": [{}]})
+
+    def test_empty_response_passes(self):
+        self.check(EMPTY_RESPONSE)
+
+
+class EnvelopeTest(unittest.TestCase):
+    MONTHLY = {"path": "data/monthly.csv", "rows": 49, "newest": "2026.07"}
+    TENTATIVE = {"path": "data/tentative.csv", "rows": 8, "newest": "202608 01~20"}
+
+    def test_all_succeeded_is_ok(self):
+        envelope = build_envelope([self.MONTHLY, self.TENTATIVE], [])
+        self.assertEqual(envelope["automation"], "korea-trass")
+        self.assertEqual(envelope["status"], "ok")
+        self.assertEqual(envelope["form_used"], 3)
+        self.assertEqual(envelope["artifacts"], [self.MONTHLY, self.TENTATIVE])
+        self.assertIsNone(envelope["escalation_reason"])
+
+    def test_partial_success_is_degraded(self):
+        envelope = build_envelope([self.MONTHLY], ["tentative: parsed 0 rows"])
+        self.assertEqual(envelope["status"], "degraded")
+        self.assertEqual(envelope["artifacts"], [self.MONTHLY])
+        self.assertEqual(envelope["escalation_reason"], "tentative: parsed 0 rows")
+
+    def test_nothing_succeeded_is_failed(self):
+        envelope = build_envelope([], ["monthly: boom", "tentative: boom"])
+        self.assertEqual(envelope["status"], "failed")
+        self.assertEqual(envelope["artifacts"], [])
+        self.assertEqual(envelope["escalation_reason"], "monthly: boom; tentative: boom")
+
+    def test_envelope_keys_are_exactly_the_contract(self):
+        self.assertEqual(
+            sorted(build_envelope([], [])),
+            ["artifacts", "automation", "escalation_reason", "form_used", "status"],
+        )
+
+    def test_envelope_is_json_serialisable_with_korean_text(self):
+        envelope = build_envelope([], ["monthly_by_country: 중국 rows missing"])
+        self.assertEqual(
+            json.loads(json.dumps(envelope, ensure_ascii=False)), envelope
+        )
+
+    def test_failure_sentence_keeps_a_single_dataset_prefix(self):
+        error = FetchError("monthly: parsed 0 rows, CSV left untouched; see raw.json")
+        self.assertEqual(failure_sentence("monthly", error), str(error))
+
+    def test_failure_sentence_prefixes_a_bare_message(self):
+        error = ValueError("--hs must be digits, got 'abc'")
+        self.assertEqual(
+            failure_sentence("monthly", error), "monthly: --hs must be digits, got 'abc'"
+        )
+
+    def test_artifact_path_is_relative_to_the_automation_dir(self):
+        self.assertEqual(
+            artifact_path(AUTOMATION_DIR / "data" / "monthly.csv"), "data/monthly.csv"
+        )
+
+    def test_artifact_path_outside_the_automation_dir_stays_absolute(self):
+        outside = Path("/var/tmp/elsewhere/monthly.csv")
+        self.assertEqual(artifact_path(outside), str(outside))
+
+    def test_newest_month_from_snapshot(self):
+        rows = parse_monthly(load_snapshot("monthly_202601_202607.json"))
+        self.assertEqual(newest_month(rows), "2026.07")
+
+    def test_newest_month_from_by_country_snapshot(self):
+        rows = parse_monthly_by_country(load_snapshot("by_country_202601_202607.json"))
+        self.assertEqual(newest_month(rows), "2026.07")
+
+    def test_newest_tentative_period_from_snapshot(self):
+        rows = parse_tentative(load_snapshot("tentative_202606_202608.json"))
+        self.assertEqual(newest_tentative_period(rows), "202608 01~20")
 
 
 if __name__ == "__main__":

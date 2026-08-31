@@ -16,6 +16,10 @@ SESSION_URL = "https://tradedata.go.kr/cts/index.do"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) fetch_kcs.py"
 TIMEOUT_SECONDS = 60
 
+AUTOMATION_NAME = "korea-trass"
+AUTOMATION_DIR = Path(__file__).resolve().parent.parent
+FORM = 3
+
 # Grouped responses come back with korePrlstNm empty, so names live here.
 HS10_NAMES = {
     "8542321010": "DRAM (디램)",
@@ -100,7 +104,7 @@ def build_monthly_params(args):
         "priodTo": args.date_to,
         "statsBase": "acptDd",
         "ttwgTpcd": "1000",
-        "showPagingLine": "500",
+        "showPagingLine": "5000",
         "sortColumn": "",
         "sortOrder": "",
         "hsSgnGrpCol": "HS10_SGN",
@@ -118,7 +122,7 @@ def build_by_country_params(args):
         "priodTo": args.date_to,
         "statsBase": "acptDd",
         "ttwgTpcd": "1000",
-        "showPagingLine": "500",
+        "showPagingLine": "5000",
         "selectPaging": "1",
         "sortColumn": "",
         "sortOrder": "",
@@ -203,24 +207,36 @@ def parse_tentative(raw):
     return rows
 
 
+def newest_month(rows):
+    return max(row["month"] for row in rows)
+
+
+def newest_tentative_period(rows):
+    """Month and 10-day period together, since one month holds three cumulative periods."""
+    return max(f"{row['month']} {row['period']}" for row in rows)
+
+
 DATASETS = {
     "monthly": {
         "url": BASE_URL + "retrieveTrade.do",
         "build_params": build_monthly_params,
         "parse": parse_monthly,
         "fieldnames": MONTHLY_FIELDS,
+        "newest": newest_month,
     },
     "monthly_by_country": {
         "url": BASE_URL + "retrieveTrade.do",
         "build_params": build_by_country_params,
         "parse": parse_monthly_by_country,
         "fieldnames": BY_COUNTRY_FIELDS,
+        "newest": newest_month,
     },
     "tentative": {
         "url": BASE_URL + "retrieveTentativeValues.do",
         "build_params": build_tentative_params,
         "parse": parse_tentative,
         "fieldnames": TENTATIVE_FIELDS,
+        "newest": newest_tentative_period,
     },
 }
 
@@ -277,6 +293,49 @@ def append_log(path, stamp, dataset, params, row_count, raw_path):
         handle.write(line + "\n")
 
 
+def check_not_truncated(name, raw, raw_path):
+    """count is the unpaged total; showPagingLine cuts items server-side without any error."""
+    try:
+        count = int(raw.get("count"))
+    except (TypeError, ValueError):
+        return
+    items = len(raw.get("items") or [])
+    if count > items:
+        raise FetchError(
+            f"{name}: response truncated to {items} of {count} rows by showPagingLine, "
+            f"CSV left untouched; see {raw_path}"
+        )
+
+
+def artifact_path(path):
+    """Envelope paths are relative to the automation dir when --out-dir stays inside it."""
+    try:
+        return str(path.relative_to(AUTOMATION_DIR))
+    except ValueError:
+        return str(path)
+
+
+def failure_sentence(name, error):
+    text = str(error)
+    return text if text.startswith(f"{name}:") else f"{name}: {text}"
+
+
+def build_envelope(artifacts, failures):
+    if failures:
+        status = "degraded" if artifacts else "failed"
+        escalation_reason = "; ".join(failures)
+    else:
+        status = "ok"
+        escalation_reason = None
+    return {
+        "automation": AUTOMATION_NAME,
+        "status": status,
+        "form_used": FORM,
+        "artifacts": artifacts,
+        "escalation_reason": escalation_reason,
+    }
+
+
 def run_dataset(name, args):
     dataset = DATASETS[name]
     params = dataset["build_params"](args)
@@ -290,13 +349,16 @@ def run_dataset(name, args):
     raw_path.write_bytes(body)
 
     try:
-        rows = dataset["parse"](json.loads(body))
+        payload = json.loads(body)
+        check_not_truncated(name, payload, raw_path)
+        rows = dataset["parse"](payload)
     except (ValueError, AttributeError) as error:
         raise FetchError(f"{name}: could not parse {raw_path}: {error}") from None
     if not rows:
         raise FetchError(f"{name}: parsed 0 rows, CSV left untouched; see {raw_path}")
 
-    write_csv(out_dir / f"{name}.csv", dataset["fieldnames"], rows)
+    csv_path = out_dir / f"{name}.csv"
+    write_csv(csv_path, dataset["fieldnames"], rows)
     append_log(
         out_dir / "fetch_log.txt",
         now.isoformat(timespec="seconds"),
@@ -305,7 +367,12 @@ def run_dataset(name, args):
         len(rows),
         raw_path,
     )
-    print(f"{name}: {len(rows)} rows -> {out_dir / (name + '.csv')} (raw {raw_path})")
+    print(f"{name}: {len(rows)} rows -> {csv_path} (raw {raw_path})")
+    return {
+        "path": artifact_path(csv_path),
+        "rows": len(rows),
+        "newest": dataset["newest"](rows),
+    }
 
 
 def yyyymm(text):
@@ -350,15 +417,25 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(argv)
     names = sorted(DATASETS) if args.dataset == "all" else [args.dataset]
-    failed = 0
+    artifacts = []
+    failures = []
     for name in names:
         # One dataset's bad --hs or a site hiccup must not block the unrelated ones.
         try:
-            run_dataset(name, args)
+            artifacts.append(run_dataset(name, args))
         except (FetchError, ValueError, OSError) as error:
-            print(f"error: {name}: {error}", file=sys.stderr)
-            failed += 1
-    return 1 if failed else 0
+            sentence = failure_sentence(name, error)
+            print(f"error: {sentence}", file=sys.stderr)
+            failures.append(sentence)
+
+    envelope = build_envelope(artifacts, failures)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "last_result.json").write_text(
+        json.dumps(envelope, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(envelope, ensure_ascii=False))
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
