@@ -26,7 +26,7 @@ import (
 func TestCalendarCRUDRoundTrip(t *testing.T) {
 	s := newEventStore(t)
 
-	cal, err := s.CreateCalendar("  Company Earnings  ", "green", "bot_ADA")
+	cal, err := s.CreateCalendar("  Company Earnings  ", "green", "bot_ADA", false)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestCalendarCRUDRoundTrip(t *testing.T) {
 // rejection is ErrInvalid, which the server maps to 400.
 func TestCalendarValidation(t *testing.T) {
 	s := newEventStore(t)
-	if _, err := s.CreateCalendar("Work", "blue", userAuthor); err != nil {
+	if _, err := s.CreateCalendar("Work", "blue", userAuthor, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -108,17 +108,17 @@ func TestCalendarValidation(t *testing.T) {
 		{"dup name case-insensitive", "wORK", ""},
 	}
 	for _, c := range cases {
-		if _, err := s.CreateCalendar(c.calName, c.color, userAuthor); !errors.Is(err, ErrInvalid) {
+		if _, err := s.CreateCalendar(c.calName, c.color, userAuthor, false); !errors.Is(err, ErrInvalid) {
 			t.Errorf("%s: create = %v, want ErrInvalid", c.name, err)
 		}
 	}
 	// A 64-rune name is exactly legal.
-	if _, err := s.CreateCalendar(strings.Repeat("y", 64), "", userAuthor); err != nil {
+	if _, err := s.CreateCalendar(strings.Repeat("y", 64), "", userAuthor, false); err != nil {
 		t.Errorf("a 64-char name was rejected: %v", err)
 	}
 
 	// The same rules bind a patch, checked against the MERGED calendar.
-	other, err := s.CreateCalendar("Other", "", userAuthor)
+	other, err := s.CreateCalendar("Other", "", userAuthor, false)
 	if err != nil {
 		t.Fatalf("create other: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestCalendarColorAssignment(t *testing.T) {
 	s := newEventStore(t)
 	names := []string{"A", "B", "C", "D", "E", "F", "G"}
 	for i, name := range names {
-		cal, err := s.CreateCalendar(name, "", userAuthor)
+		cal, err := s.CreateCalendar(name, "", userAuthor, false)
 		if err != nil {
 			t.Fatalf("create %s: %v", name, err)
 		}
@@ -158,9 +158,9 @@ func TestListCalendarsAscendingCreatedAt(t *testing.T) {
 	if cals, err := s.ListCalendars(); err != nil || len(cals) != 0 {
 		t.Fatalf("fresh store lists %v (%v), want nothing — no ensure on read", cals, err)
 	}
-	first, _ := s.CreateCalendar("First", "", userAuthor)
-	second, _ := s.CreateCalendar("Second", "", userAuthor)
-	third, _ := s.CreateCalendar("Third", "", userAuthor)
+	first, _ := s.CreateCalendar("First", "", userAuthor, false)
+	second, _ := s.CreateCalendar("Second", "", userAuthor, false)
+	third, _ := s.CreateCalendar("Third", "", userAuthor, false)
 	cals, err := s.ListCalendars()
 	if err != nil {
 		t.Fatalf("list: %v", err)
@@ -242,7 +242,7 @@ func TestEnsurePersonalCalendarIdempotent(t *testing.T) {
 // and at move — and the rejection is ErrInvalid, the caller's fault.
 func TestEventWritesResolveTheCalendar(t *testing.T) {
 	s := newEventStore(t)
-	work, err := s.CreateCalendar("Work", "", userAuthor)
+	work, err := s.CreateCalendar("Work", "", userAuthor, false)
 	if err != nil {
 		t.Fatalf("create calendar: %v", err)
 	}
@@ -470,10 +470,10 @@ func TestCalendarToolInstructiveErrors(t *testing.T) {
 		t.Errorf("unknown calendar with none existing = %q", got)
 	}
 
-	if _, err := s.CreateCalendar("Personal", "", userAuthor); err != nil {
+	if _, err := s.CreateCalendar("Personal", "", userAuthor, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.CreateCalendar("Work", "", userAuthor); err != nil {
+	if _, err := s.CreateCalendar("Work", "", userAuthor, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -501,7 +501,7 @@ func TestCalendarToolInstructiveErrors(t *testing.T) {
 			`error: no calendar named "Wrok" — existing calendars: Personal, Work`},
 		{"rename_calendar with nothing to change",
 			`{"command":"rename_calendar","calendar":"Work"}`,
-			"error: 'rename_calendar' needs a 'name' (the new name) or a 'color' to change"},
+			"error: 'rename_calendar' needs a 'name' (the new name), a 'color' or an 'executable' to change"},
 		{"delete_calendar without a name",
 			`{"command":"delete_calendar"}`,
 			"error: 'delete_calendar' requires a 'calendar' field"},

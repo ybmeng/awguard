@@ -498,7 +498,7 @@ func TestCalendarToolValidation(t *testing.T) {
 		{"update without an id", `{"command":"update","title":"x"}`,
 			"error: 'update' requires a 'event_id' field"},
 		{"update with nothing to change", `{"command":"update","event_id":"` + string(existing.ID) + `"}`,
-			"error: 'update' needs at least one of title, start, end, location, notes, calendar to change"},
+			"error: 'update' needs at least one of title, start, end, location, notes, calendar, rrule, tz, automation to change"},
 		{"update of an unknown event", `{"command":"update","event_id":"evt_NOPE","title":"x"}`,
 			"error: no such event — call list to see the current ids"},
 		{"delete without an id", `{"command":"delete"}`,
@@ -654,7 +654,8 @@ func TestToolsEndpointIncludesCalendar(t *testing.T) {
 		t.Errorf("required = %v, want just command", def.Parameters["required"])
 	}
 	// Flat strings, no nested union — the whole reason this shape was chosen.
-	for _, field := range []string{"event_id", "title", "start", "end", "location", "notes", "from", "to", "calendar", "name", "color"} {
+	// The firing surface (rrule, tz, automation, executable) is flat too.
+	for _, field := range []string{"event_id", "title", "start", "end", "location", "notes", "from", "to", "calendar", "name", "color", "rrule", "tz", "automation", "executable"} {
 		spec, ok := props[field].(map[string]any)
 		if !ok {
 			t.Errorf("parameters miss the %q field", field)

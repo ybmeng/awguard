@@ -626,6 +626,15 @@ mutation.
 Note `AppendMessage` also updates `bots.last_message_at`/`last_message_text`, so it emits
 **two** change rows (message created, bot updated). Easy to miss; the sidebar depends on it.
 
+**Recurrence/firing (2026-09-01) added NO rows to this table.** `events.rrule/tz/automation`
+and `calendars.executable` are fields on already-triggered rows, so every edit of them is the
+existing `UpdateEvent`/`UpdateCalendar` row (pinned by
+`TestRecurringEventUpdateEmitsOneChangeRow`); `CreateCalendar` merely grew an `executable`
+argument. **Instances and fireable are derived reads** (`GET /v1/instances`,
+`GET /v1/fireable` → `Store.Instances`/`Store.Fireable`): they expand recurring events at
+read time, write nothing, and are deliberately outside the change feed — a client that wants
+fresh instances refetches its window after an `events` change row.
+
 The startup sweep **should** emit change rows — a client reconnecting after a restart needs
 to see those failures, and the state token will have moved regardless.
 

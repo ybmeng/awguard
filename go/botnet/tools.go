@@ -163,6 +163,14 @@ type calendarArgs struct {
 	Calendar *string `json:"calendar"` // an existing calendar, by name
 	Name     *string `json:"name"`     // a calendar's (new) name, for the *_calendar commands
 	Color    *string `json:"color"`    // a calendar color, for the *_calendar commands
+
+	// The firing surface (see the Event DECISIONs in schema.go). Executable
+	// is a string "true"/"false" rather than a JSON bool because every field
+	// of this flat schema is a string — mid-tier models mix types up.
+	RRule      *string `json:"rrule"`
+	TZ         *string `json:"tz"`
+	Automation *string `json:"automation"`
+	Executable *string `json:"executable"`
 }
 
 // field returns one flat field by its wire name, and whether it was supplied
@@ -196,6 +204,14 @@ func (a calendarArgs) field(name string) (string, bool) {
 		p = a.Name
 	case "color":
 		p = a.Color
+	case "rrule":
+		p = a.RRule
+	case "tz":
+		p = a.TZ
+	case "automation":
+		p = a.Automation
+	case "executable":
+		p = a.Executable
 	}
 	if p == nil || *p == "" {
 		return "", false
@@ -218,14 +234,19 @@ var calendarCommands = []calendarCommand{
 		requires: []string{"title", "start"},
 		doc: `"create": books an event. Requires "title" and "start"; optional "end" ` +
 			`(defaults to one hour after the start), "location", "notes" and "calendar" ` +
-			`(a calendar name; defaults to "Personal").`,
+			`(a calendar name; defaults to "Personal"). Optional "rrule" makes it recur ` +
+			`(RFC 5545, e.g. FREQ=MONTHLY;BYDAY=4TU — requires "tz", an IANA zone like ` +
+			`America/New_York, so the wall-clock time survives DST); optional "automation" ` +
+			`names an automation the event fires while active — allowed only on an ` +
+			`executable calendar.`,
 		run: runCalendarCreate,
 	},
 	{
 		name: "list",
 		doc: `"list": shows the calendar. Optional "from" and "to" bound the window; ` +
 			`it defaults to the next 14 days. Optional "calendar" (a calendar name) shows ` +
-			`only that calendar. The first line is always the current time, ` +
+			`only that calendar. Recurring events appear once per occurrence in the window, ` +
+			`annotated with their rule. The first line is always the current time, ` +
 			`so use it to resolve "today", "tomorrow" and "next week".`,
 		run: runCalendarList,
 	},
@@ -234,20 +255,23 @@ var calendarCommands = []calendarCommand{
 		requires: []string{"event_id"},
 		doc: `"update": changes an existing event. Requires "event_id" (from "list") plus ` +
 			`any of "title", "start", "end", "location", "notes", "calendar" (moves it to ` +
-			`that calendar) — omitted fields are left alone.`,
+			`that calendar), "rrule", "tz", "automation" — omitted fields are left alone.`,
 		run: runCalendarUpdate,
 	},
 	{
 		name:     "delete",
 		requires: []string{"event_id"},
-		doc:      `"delete": cancels an event. Requires "event_id" (from "list").`,
-		run:      runCalendarDelete,
+		doc: `"delete": cancels an event. Requires "event_id" (from "list"). Deleting a ` +
+			`recurring event removes its whole series.`,
+		run: runCalendarDelete,
 	},
 	{
 		name:     "create_calendar",
 		requires: []string{"name"},
 		doc: `"create_calendar": adds a named calendar. Requires "name"; optional "color" ` +
-			`(one of ` + strings.Join(calendarColors, ", ") + ` — assigned automatically when omitted).`,
+			`(one of ` + strings.Join(calendarColors, ", ") + ` — assigned automatically when omitted) ` +
+			`and "executable" ("true" or "false") — only an executable calendar's events may ` +
+			`fire automations.`,
 		run: runCalendarCreateCalendar,
 	},
 	{
@@ -258,8 +282,9 @@ var calendarCommands = []calendarCommand{
 	{
 		name:     "rename_calendar",
 		requires: []string{"calendar"},
-		doc: `"rename_calendar": renames or recolors a calendar. Requires "calendar" (its ` +
-			`current name) plus "name" (the new name) and/or "color".`,
+		doc: `"rename_calendar": renames, recolors or re-flags a calendar. Requires "calendar" ` +
+			`(its current name) plus any of "name" (the new name), "color", "executable" ` +
+			`("true" or "false").`,
 		run: runCalendarRenameCalendar,
 	},
 	{
@@ -313,9 +338,13 @@ func calendarToolDef() wireTool {
 				"notes":    str(`Anything else worth keeping on the event. Optional.`),
 				"from":     str(`Start of the window to list, RFC3339. Optional; defaults to now.`),
 				"to":       str(`End of the window to list, RFC3339. Optional; defaults to 14 days out.`),
-				"calendar": str(`A calendar, by name (case-insensitive). Optional filter/target for "create", "update" and "list"; the current name for "rename_calendar" and "delete_calendar".`),
-				"name":     str(`A calendar's name: the new calendar for "create_calendar", the new name for "rename_calendar".`),
-				"color":    str(`A calendar color, one of ` + strings.Join(calendarColors, ", ") + `, for "create_calendar" and "rename_calendar". Optional.`),
+				"calendar":   str(`A calendar, by name (case-insensitive). Optional filter/target for "create", "update" and "list"; the current name for "rename_calendar" and "delete_calendar".`),
+				"name":       str(`A calendar's name: the new calendar for "create_calendar", the new name for "rename_calendar".`),
+				"color":      str(`A calendar color, one of ` + strings.Join(calendarColors, ", ") + `, for "create_calendar" and "rename_calendar". Optional.`),
+				"rrule":      str(`An RFC 5545 recurrence rule making the event repeat, e.g. FREQ=MONTHLY;BYDAY=4TU (supported: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH, BYSETPOS, WKST). Requires "tz". Optional, for "create" and "update".`),
+				"tz":         str(`The IANA zone the recurrence's wall clock lives in, e.g. America/New_York. Required with "rrule".`),
+				"automation": str(`The automation this event fires while an instance is active. Only allowed on an executable calendar. Optional, for "create" and "update".`),
+				"executable": str(`"true" or "false": whether the calendar's events may fire automations. Optional, for "create_calendar" and "rename_calendar".`),
 			},
 			"required": []string{"command"},
 		},
@@ -375,6 +404,9 @@ func runCalendarCreate(s *Store, botID BotID, a calendarArgs) (string, error) {
 	}
 	location, _ := a.field("location")
 	notes, _ := a.field("notes")
+	rrule, _ := a.field("rrule")
+	tz, _ := a.field("tz")
+	automation, _ := a.field("automation")
 	// A zero CalendarID gets the store's Personal ensure, so an unqualified
 	// booking lands exactly where an unqualified REST create does.
 	var calID CalendarID
@@ -389,10 +421,12 @@ func runCalendarCreate(s *Store, botID BotID, a calendarArgs) (string, error) {
 		calID = cal.ID
 	}
 	// createdBy is the CALLING bot, stamped by the store — the model cannot
-	// name an author, so an event always says who really booked it.
+	// name an author, so an event always says who really booked it. The
+	// recurrence rules (rrule needs tz, automation needs an executable
+	// calendar) live in the store and come back as instructive errors.
 	ev, err := s.CreateEvent(Event{
 		Title: title, StartsAt: start, EndsAt: end, Location: location, Notes: notes,
-		CalendarID: calID,
+		CalendarID: calID, RRule: rrule, TZ: tz, Automation: automation,
 	}, string(botID))
 	if err != nil {
 		return calendarStoreError(err)
@@ -428,21 +462,24 @@ func runCalendarList(s *Store, _ BotID, a calendarArgs) (string, error) {
 		}
 		only = &cal
 	}
-	events, err := s.ListEvents(from, to)
+	// The window operates on INSTANCES: a recurring event appears once per
+	// occurrence, exactly what the model needs to reason about "this week".
+	instances, err := s.Instances(from, to)
 	if err != nil {
 		return calendarStoreError(err)
 	}
 	if only != nil {
-		kept := events[:0]
-		for _, e := range events {
-			if e.CalendarID == only.ID {
-				kept = append(kept, e)
+		kept := instances[:0]
+		for _, in := range instances {
+			if in.CalendarID == only.ID {
+				kept = append(kept, in)
 			}
 		}
-		events = kept
+		instances = kept
 	}
-	// Annotate each event with its calendar's name whenever there is more than
-	// one calendar to tell apart — a single-calendar net reads as before.
+	// Annotate each instance with its calendar's name whenever there is more
+	// than one calendar to tell apart — a single-calendar net reads as before —
+	// and with its master's rule, so the schedule is legible and editable.
 	cals, err := s.ListCalendars()
 	if err != nil {
 		return "", err
@@ -454,18 +491,56 @@ func runCalendarList(s *Store, _ BotID, a calendarArgs) (string, error) {
 			names[c.ID] = c.Name
 		}
 	}
-	return renderCalendar(now, from, to, events, names), nil
+	rules := map[EventID]string{}
+	for _, in := range instances {
+		if in.Recurring {
+			rules[in.EventID] = "" // fill below, one fetch per distinct master
+		}
+	}
+	for id := range rules {
+		master, err := s.GetEvent(id)
+		if err != nil {
+			return "", err
+		}
+		rules[id] = master.RRule
+	}
+	return renderCalendar(now, from, to, instances, names, rules), nil
+}
+
+// executableArg reads the optional "executable" field: value, whether it was
+// supplied, and the instructive error for anything but "true"/"false". Every
+// field of the flat schema is a string, so the boolean is spelled out.
+func executableArg(a calendarArgs) (value, supplied bool, errText string) {
+	raw, ok := a.field("executable")
+	if !ok {
+		return false, false, ""
+	}
+	switch strings.ToLower(raw) {
+	case "true":
+		return true, true, ""
+	case "false":
+		return false, true, ""
+	}
+	return false, false, fmt.Sprintf(`error: 'executable' must be "true" or "false", not %q`, raw)
 }
 
 func runCalendarCreateCalendar(s *Store, botID BotID, a calendarArgs) (string, error) {
 	name, _ := a.field("name")
 	color, _ := a.field("color")
+	executable, _, errText := executableArg(a)
+	if errText != "" {
+		return errText, nil
+	}
 	// createdBy is the calling bot, exactly as event creates stamp it.
-	cal, err := s.CreateCalendar(name, color, string(botID))
+	cal, err := s.CreateCalendar(name, color, string(botID), executable)
 	if err != nil {
 		return calendarStoreError(err)
 	}
-	return fmt.Sprintf("created calendar %q (%s)", cal.Name, cal.Color), nil
+	desc := cal.Color
+	if cal.Executable {
+		desc += ", executable"
+	}
+	return fmt.Sprintf("created calendar %q (%s)", cal.Name, desc), nil
 }
 
 func runCalendarListCalendars(s *Store, _ BotID, _ calendarArgs) (string, error) {
@@ -504,14 +579,25 @@ func runCalendarRenameCalendar(s *Store, _ BotID, a calendarArgs) (string, error
 	if v, ok := a.field("color"); ok {
 		p.Color = &v
 	}
-	if p.Name == nil && p.Color == nil {
-		return "error: 'rename_calendar' needs a 'name' (the new name) or a 'color' to change", nil
+	executable, supplied, errText := executableArg(a)
+	if errText != "" {
+		return errText, nil
+	}
+	if supplied {
+		p.Executable = &executable
+	}
+	if p.Name == nil && p.Color == nil && p.Executable == nil {
+		return "error: 'rename_calendar' needs a 'name' (the new name), a 'color' or an 'executable' to change", nil
 	}
 	updated, err := s.UpdateCalendar(cal.ID, p)
 	if err != nil {
 		return calendarStoreError(err)
 	}
-	return fmt.Sprintf("updated calendar %q (%s)", updated.Name, updated.Color), nil
+	desc := updated.Color
+	if updated.Executable {
+		desc += ", executable"
+	}
+	return fmt.Sprintf("updated calendar %q (%s)", updated.Name, desc), nil
 }
 
 // runCalendarDeleteCalendar refuses a non-empty calendar BY DECISION (see
@@ -549,6 +635,9 @@ func runCalendarUpdate(s *Store, _ BotID, a calendarArgs) (string, error) {
 		{"title", func(v string) { p.Title = &v }},
 		{"location", func(v string) { p.Location = &v }},
 		{"notes", func(v string) { p.Notes = &v }},
+		{"rrule", func(v string) { p.RRule = &v }},
+		{"tz", func(v string) { p.TZ = &v }},
+		{"automation", func(v string) { p.Automation = &v }},
 	} {
 		if v, ok := a.field(f.name); ok {
 			f.set(v)
@@ -585,7 +674,7 @@ func runCalendarUpdate(s *Store, _ BotID, a calendarArgs) (string, error) {
 		changed = true
 	}
 	if !changed {
-		return "error: 'update' needs at least one of title, start, end, location, notes, calendar to change", nil
+		return "error: 'update' needs at least one of title, start, end, location, notes, calendar, rrule, tz, automation to change", nil
 	}
 	ev, err := s.UpdateEvent(EventID(a.EventID), p)
 	if err != nil {
@@ -624,30 +713,39 @@ func localRFC3339(t time.Time) string {
 }
 
 // renderCalendar formats a listing: the current time FIRST, always, then a
-// compact numbered line per event. The now line is what makes the tool usable
-// at all — without it "book lunch tomorrow" has no anchor. A non-nil names map
-// annotates each event with its calendar — the caller passes one exactly when
-// more than one calendar exists, so a single-calendar net stays uncluttered.
-func renderCalendar(now, from, to time.Time, events []Event, names map[CalendarID]string) string {
+// compact numbered line per INSTANCE — a recurring event appears once per
+// occurrence, its line carrying the master's id (what update/delete take) and
+// its rule. The now line is what makes the tool usable at all — without it
+// "book lunch tomorrow" has no anchor. A non-nil names map annotates each
+// instance with its calendar — the caller passes one exactly when more than
+// one calendar exists, so a single-calendar net stays uncluttered; rules maps
+// a recurring master to its RRULE for the (repeats: ...) annotation.
+func renderCalendar(now, from, to time.Time, instances []Instance, names map[CalendarID]string, rules map[EventID]string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "now: %s\n", localRFC3339(now))
-	if len(events) == 0 {
+	if len(instances) == 0 {
 		fmt.Fprintf(&b, "(no events between %s and %s)", localRFC3339(from), localRFC3339(to))
 		return b.String()
 	}
-	fmt.Fprintf(&b, "%d event(s) between %s and %s:\n", len(events), localRFC3339(from), localRFC3339(to))
-	for i, e := range events {
-		fmt.Fprintf(&b, "%d. %s  %s → %s  %s", i+1, e.ID,
-			localRFC3339(e.StartsAt), localRFC3339(e.EndsAt), e.Title)
-		if name, ok := names[e.CalendarID]; ok {
+	fmt.Fprintf(&b, "%d event(s) between %s and %s:\n", len(instances), localRFC3339(from), localRFC3339(to))
+	for i, in := range instances {
+		fmt.Fprintf(&b, "%d. %s  %s → %s  %s", i+1, in.EventID,
+			localRFC3339(in.StartsAt), localRFC3339(in.EndsAt), in.Title)
+		if in.Recurring && rules[in.EventID] != "" {
+			fmt.Fprintf(&b, "  (repeats: %s)", rules[in.EventID])
+		}
+		if in.Automation != "" {
+			fmt.Fprintf(&b, "  (fires: %s)", in.Automation)
+		}
+		if name, ok := names[in.CalendarID]; ok {
 			fmt.Fprintf(&b, "  [%s]", name)
 		}
-		if e.Location != "" {
-			fmt.Fprintf(&b, "  @ %s", e.Location)
+		if in.Location != "" {
+			fmt.Fprintf(&b, "  @ %s", in.Location)
 		}
-		fmt.Fprintf(&b, "  (by %s)\n", e.CreatedBy)
-		if e.Notes != "" {
-			fmt.Fprintf(&b, "   %s\n", e.Notes)
+		fmt.Fprintf(&b, "  (by %s)\n", in.CreatedBy)
+		if in.Notes != "" {
+			fmt.Fprintf(&b, "   %s\n", in.Notes)
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")

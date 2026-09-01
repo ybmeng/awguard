@@ -188,7 +188,7 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 	expectRows(t, logAfter(t, s, mark), nil, "EnsurePersonalCalendar (again)")
 
 	mark = topSeq(t, s)
-	earnings, err := s.CreateCalendar("Company Earnings", "", string(bot.ID))
+	earnings, err := s.CreateCalendar("Company Earnings", "", string(bot.ID), false)
 	if err != nil {
 		t.Fatalf("create calendar: %v", err)
 	}
