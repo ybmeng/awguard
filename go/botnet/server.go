@@ -29,12 +29,13 @@ const turnTimeout = 5 * time.Minute
 // outcome is reported to that original caller — it is written to the store,
 // which is the only place the client reads from anyway.
 type Server struct {
-	store   *Store
-	llm     LLM
-	netID   string
-	keyPath string  // where SetKey persists the OpenRouter key; "" disables persistence
-	search  *Router // web-search backend router; nil disables the client web_search tool
-	turns   sync.WaitGroup
+	store       *Store
+	llm         LLM
+	netID       string
+	keyPath     string       // where SetKey persists the OpenRouter key; "" disables persistence
+	search      *Router      // web-search backend router; nil disables the client web_search tool
+	automations http.Handler // mounted automations service; nil leaves the routes absent
+	turns       sync.WaitGroup
 }
 
 // Wait blocks until every in-flight model call has finished. Tests use it to
@@ -45,6 +46,13 @@ func (s *Server) Wait() { s.turns.Wait() }
 // ConfigureKeyPersistence tells the server where to save a key set via the
 // config endpoint, so it survives a restart.
 func (s *Server) ConfigureKeyPersistence(path string) { s.keyPath = path }
+
+// MountAutomations installs the automations service's handler, so the app's
+// one backend (this server) also answers the automations read/run routes.
+// stdd passes the in-process service's Handler(); standalone botnetd mounts
+// nothing, and the routes are then absent (404 — the app's hide-the-section
+// signal). Call it before Handler(), which is where the mux is built.
+func (s *Server) MountAutomations(h http.Handler) { s.automations = h }
 
 // ConfigureSearch installs the web-search backend router. botnetd builds it from
 // the environment (NewRouterFromEnv) and calls this; a server left unconfigured
@@ -94,6 +102,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/instances", s.listInstances)
 	mux.HandleFunc("GET /v1/fireable", s.listFireable)
 	mux.HandleFunc("GET /v1/changes", s.getChanges)
+	// The automations bridge, delegated verbatim to the mounted service (same
+	// paths, bodies, status codes). DECISION: allowlist at the gateway — the
+	// app keeps exactly ONE backend, and only these five client-facing routes
+	// cross it; the pipeline-internal POST .../fire and POST /tick are never
+	// registered here, so the unix socket remains the pipeline's own surface.
+	if s.automations != nil {
+		mux.Handle("GET /v1/automations", s.automations)
+		mux.Handle("GET /v1/automations/{name}", s.automations)
+		mux.Handle("GET /v1/automations/{name}/runs", s.automations)
+		mux.Handle("POST /v1/automations/{name}/run", s.automations)
+		mux.Handle("GET /v1/runs/{id}", s.automations)
+	}
 	return mux
 }
 

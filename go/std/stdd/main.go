@@ -84,11 +84,16 @@ func services(root string, interval time.Duration, syncer artifacts.Syncer, bot 
 	if err != nil {
 		return nil, err
 	}
-	botSvc, err := botnetsvc.New(bot)
+	// The automations service is constructed FIRST so its handler can be
+	// mounted into botnet: the app talks to exactly one backend (botnet's
+	// TCP port), which bridges the client-facing automations routes
+	// in-process; the unix socket remains the pipeline's own surface.
+	auto, err := automations.New(automations.Config{Root: root, RepoDir: automationsRepo, BotnetAddr: bot.Addr})
 	if err != nil {
 		return nil, err
 	}
-	auto, err := automations.New(automations.Config{Root: root, RepoDir: automationsRepo, BotnetAddr: bot.Addr})
+	bot.Automations = auto.Handler()
+	botSvc, err := botnetsvc.New(bot)
 	if err != nil {
 		return nil, err
 	}

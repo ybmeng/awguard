@@ -158,3 +158,87 @@ func TestDefaultsMatchBotnetd(t *testing.T) {
 		t.Errorf("Name() = %q, want botnet", svc.Name())
 	}
 }
+
+// waitForAddr waits until the running service reports its bound address.
+func waitForAddr(t *testing.T, svc *Service) string {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if addr := svc.Addr(); addr != "" {
+			return addr
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("service never reported a bound address")
+	return ""
+}
+
+// TestRunMountsAutomations: a Config.Automations handler is mounted into the
+// botnet server, so its list route answers through the one TCP backend, while
+// the pipeline-internal /tick stays absent; without the handler the routes
+// 404, which is the app's hide-the-section signal.
+func TestRunMountsAutomations(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "")
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `[{"name":"stub"}]`)
+	})
+	dir := t.TempDir()
+	svc, err := New(Config{
+		Addr:        "127.0.0.1:0",
+		DBPath:      filepath.Join(dir, "net.db"),
+		KeyPath:     filepath.Join(dir, "config", "openrouter.txt"),
+		Logger:      log.New(io.Discard, "", 0),
+		Automations: stub,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- svc.Run(ctx) }()
+	addr := waitForAddr(t, svc)
+
+	get := func(method, path string) (int, string) {
+		t.Helper()
+		req, _ := http.NewRequest(method, "http://"+addr+path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(raw)
+	}
+	if status, body := get("GET", "/v1/automations"); status != http.StatusOK || body != `[{"name":"stub"}]` {
+		t.Errorf("GET /v1/automations = %d %q, want the stub's answer verbatim", status, body)
+	}
+	if status, _ := get("POST", "/tick"); status != http.StatusNotFound {
+		t.Errorf("POST /tick = %d, want 404 (pipeline-internal, never bridged)", status)
+	}
+	cancel()
+	<-done
+}
+
+// Without Config.Automations the bridge routes are absent.
+func TestRunWithoutAutomationsHidesRoutes(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "")
+	svc := newTestService(t, "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- svc.Run(ctx) }()
+	addr := waitForAddr(t, svc)
+
+	resp, err := http.Get("http://" + addr + "/v1/automations")
+	if err != nil {
+		t.Fatalf("GET /v1/automations: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /v1/automations without a mount = %d, want 404", resp.StatusCode)
+	}
+	cancel()
+	<-done
+}

@@ -155,11 +155,14 @@ func fullRun(r Run) runJSON {
 }
 
 // automationView is one registry row as the API serves it. There is no
-// nextDue: the botnet calendar owns the future.
+// nextDue: the botnet calendar owns the future. Path is the absolute
+// automation directory (repo dir + repo-relative dir) — what the app hands to
+// "open -a Cursor"; Dir stays repo-relative for display.
 type automationView struct {
 	Name          string        `json:"name"`
 	Goal          string        `json:"goal"`
 	Dir           string        `json:"dir"`
+	Path          string        `json:"path"`
 	Schedule      *scheduleJSON `json:"schedule"`
 	ScheduleError *string       `json:"scheduleError"`
 	Freshness     string        `json:"freshness"`
@@ -169,7 +172,8 @@ type automationView struct {
 
 // view assembles one automation's API row at the given instant.
 func (s *Service) view(a Automation, now time.Time) automationView {
-	v := automationView{Name: a.Name, Goal: a.Goal, Dir: a.Dir}
+	v := automationView{Name: a.Name, Goal: a.Goal, Dir: a.Dir,
+		Path: filepath.Join(s.repoDir, a.Dir)}
 	if a.ScheduleError != "" {
 		e := a.ScheduleError
 		v.ScheduleError = &e
@@ -206,6 +210,11 @@ func (s *Service) automation(name string) (Automation, bool) {
 	}
 	return Automation{}, false
 }
+
+// Handler returns the service's HTTP API — the SAME mux the unix socket
+// serves — so the botnet gateway can mount it in-process and the bridged
+// routes cannot drift from the socket's behavior.
+func (s *Service) Handler() http.Handler { return s.apiMux() }
 
 func (s *Service) apiMux() *http.ServeMux {
 	mux := http.NewServeMux()
