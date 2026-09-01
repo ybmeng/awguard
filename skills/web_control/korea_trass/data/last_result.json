@@ -15,8 +15,8 @@
     },
     {
       "path": "data/tentative.csv",
-      "rows": 23,
-      "newest": "202608 01~20"
+      "rows": 24,
+      "newest": "202608 01~31"
     }
   ],
   "escalation_reason": null
