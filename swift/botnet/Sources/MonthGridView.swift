@@ -9,14 +9,17 @@ import SwiftUI
 
 struct MonthGridView: View {
     @EnvironmentObject var store: AppStore
-    /// The events to draw — CalendarView passes the same filtered array the
+    /// The instances to draw — CalendarView passes the same filtered array the
     /// list renders, so the active chip means one thing in both readings.
-    let events: [Event]
-    /// Called with the event to edit, or the day to create one on.
-    let open: (EventTarget) -> Void
+    let instances: [EventInstance]
+    /// Called with the tapped occurrence; CalendarView resolves it to the
+    /// master event, which is what the editor opens.
+    let openInstance: (EventInstance) -> Void
+    /// Called with the day the empty area of a cell was clicked on.
+    let createOn: (Date) -> Void
 
-    private var months: [MonthGrid] { MonthGrid.range(covering: events) }
-    private var byDay: [Date: [Event]] { Dictionary(grouping: events, by: \.day) }
+    private var months: [MonthGrid] { MonthGrid.range(covering: instances) }
+    private var byDay: [Date: [EventInstance]] { Dictionary(grouping: instances, by: \.day) }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -40,8 +43,8 @@ struct MonthGridView: View {
 
     /// Same resolution rule as the list rows: a dot only when the calendar
     /// resolves, so an old server's chips render exactly as before.
-    private func calendarColor(of event: Event) -> Color? {
-        store.calendar(id: event.calendarId).map { Palette.calendar($0.color) }
+    private func calendarColor(of instance: EventInstance) -> Color? {
+        store.calendar(id: instance.calendarId).map { Palette.calendar($0.color) }
     }
 
     private func section(_ month: MonthGrid) -> some View {
@@ -76,12 +79,13 @@ struct MonthGridView: View {
                         DayCell(
                             day: day,
                             inMonth: inMonth,
-                            // A trailing cell's events belong to the next
+                            // A trailing cell's instances belong to the next
                             // month's section; drawing them twice would make
-                            // the same event look like two.
-                            events: inMonth ? (byDay[day] ?? []) : [],
+                            // the same occurrence look like two.
+                            instances: inMonth ? (byDay[day] ?? []) : [],
                             color: calendarColor(of:),
-                            open: open
+                            openInstance: openInstance,
+                            createOn: createOn
                         )
                     }
                 }
@@ -95,9 +99,10 @@ struct MonthGridView: View {
 private struct DayCell: View {
     let day: Date
     let inMonth: Bool
-    let events: [Event]
-    let color: (Event) -> Color?
-    let open: (EventTarget) -> Void
+    let instances: [EventInstance]
+    let color: (EventInstance) -> Color?
+    let openInstance: (EventInstance) -> Void
+    let createOn: (Date) -> Void
 
     @State private var hovering = false
 
@@ -106,8 +111,8 @@ private struct DayCell: View {
     /// would fight the month list scrolling around it.
     private static let maxChips = 3
 
-    private var visible: [Event] { Array(events.prefix(Self.maxChips)) }
-    private var overflow: Int { events.count - visible.count }
+    private var visible: [EventInstance] { Array(instances.prefix(Self.maxChips)) }
+    private var overflow: Int { instances.count - visible.count }
     // Gated on inMonth so today is marked once, in its own month's section,
     // not again on a neighbouring section's muted filler cell.
     private var isToday: Bool { inMonth && Calendar.current.isDateInToday(day) }
@@ -117,7 +122,7 @@ private struct DayCell: View {
             // The empty area of the cell is the "add an event here" target. It
             // sits under the labels, which opt out of hit testing so the click
             // reaches it; the chips keep theirs and open their own event.
-            Button { open(.newOn(day)) } label: {
+            Button { createOn(day) } label: {
                 Rectangle().fill(background).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -126,8 +131,10 @@ private struct DayCell: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 dayNumber
-                ForEach(visible) { event in
-                    EventChip(event: event, color: color(event)) { open(.existing(event)) }
+                ForEach(visible) { instance in
+                    EventChip(instance: instance, color: color(instance)) {
+                        openInstance(instance)
+                    }
                 }
                 if overflow > 0 {
                     Text("+\(overflow) more")
@@ -179,7 +186,7 @@ private struct DayCell: View {
 }
 
 private struct EventChip: View {
-    let event: Event
+    let instance: EventInstance
     let color: Color?
     let open: () -> Void
 
@@ -193,12 +200,24 @@ private struct EventChip: View {
                     Circle().fill(color)
                         .frame(width: Metric.chipDot, height: Metric.chipDot)
                 }
-                Text(Self.clock(event.startsAt))
+                Text(Self.clock(instance.startsAt))
                     .foregroundStyle(Palette.secondaryText)
-                Text(event.title)
+                Text(instance.title)
                     .foregroundStyle(Palette.primaryText)
                     .lineLimit(1)
                 Spacer(minLength: 0)
+                // Same marks as the list rows, at chip scale — this is where a
+                // recurring series is actually SEEN repeating across days.
+                if instance.recurring {
+                    Image(systemName: "repeat")
+                        .font(TypeScale.chipGlyph)
+                        .foregroundStyle(Palette.secondaryText)
+                }
+                if instance.firesAutomation {
+                    Image(systemName: "bolt.fill")
+                        .font(TypeScale.chipGlyph)
+                        .foregroundStyle(Palette.attention)
+                }
             }
             .font(TypeScale.chip)
             .padding(.horizontal, Metric.chipHPad)
@@ -210,7 +229,9 @@ private struct EventChip: View {
             )
         }
         .buttonStyle(.plain)
-        .help("\(event.title) — \(Self.range(event))")
+        .help(instance.firesAutomation
+              ? "\(instance.title) — \(Self.range(instance)) — fires \(instance.automation ?? "")"
+              : "\(instance.title) — \(Self.range(instance))")
     }
 
     /// Compact enough for a cell barely a hundred points wide: "2p" and "9:30a"
@@ -223,9 +244,9 @@ private struct EventChip: View {
             : date.formatted(.dateTime.hour(.defaultDigits(amPM: .narrow)).minute())
     }
 
-    private static func range(_ event: Event) -> String {
-        let start = event.startsAt.formatted(date: .omitted, time: .shortened)
-        let end = event.endsAt.formatted(date: .omitted, time: .shortened)
+    private static func range(_ instance: EventInstance) -> String {
+        let start = instance.startsAt.formatted(date: .omitted, time: .shortened)
+        let end = instance.endsAt.formatted(date: .omitted, time: .shortened)
         return "\(start) – \(end)"
     }
 }
@@ -269,18 +290,19 @@ struct MonthGrid: Identifiable {
         }
     }
 
-    /// The months the grid covers: from the earlier of the oldest event's month
-    /// and last month, through the later of the newest event's month and this
-    /// one — so an empty calendar still shows last month and this one, and a
-    /// calendar with history scrolls back over all of it.
-    static func range(covering events: [Event], now: Date = Date()) -> [MonthGrid] {
+    /// The months the grid covers: from the earlier of the oldest instance's
+    /// month and last month, through the later of the newest instance's month
+    /// and this one — so an empty calendar still shows last month and this one,
+    /// and a calendar with history scrolls back over all of it (bounded by the
+    /// store's instance window on a current server).
+    static func range(covering instances: [EventInstance], now: Date = Date()) -> [MonthGrid] {
         let calendar = Calendar.current
         let thisMonth = month(of: now)
         let lastMonth = calendar.date(byAdding: .month, value: -1, to: thisMonth) ?? thisMonth
-        // The store holds events ascending by start, so the ends of the array
-        // are the oldest and newest without sorting again.
-        let oldest = events.first.map { month(of: $0.startsAt) } ?? thisMonth
-        let newest = events.last.map { month(of: $0.startsAt) } ?? thisMonth
+        // The store holds instances ascending by start, so the ends of the
+        // array are the oldest and newest without sorting again.
+        let oldest = instances.first.map { month(of: $0.startsAt) } ?? thisMonth
+        let newest = instances.last.map { month(of: $0.startsAt) } ?? thisMonth
 
         var cursor = Swift.min(oldest, lastMonth)
         let end = Swift.max(newest, thisMonth)

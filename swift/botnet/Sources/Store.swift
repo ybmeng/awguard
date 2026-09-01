@@ -18,6 +18,11 @@ final class AppStore: ObservableObject {
     // them. Empty on a botnetd without the routes, which reads as an empty
     // calendar rather than an error the user can do nothing about.
     @Published private(set) var events: [Event] = []
+    // What the calendar pane renders: expanded instances over the fetch window,
+    // ascending by start as the server sorts them. On a botnetd without
+    // /v1/instances these are the events above mapped one-to-one, so the pane
+    // reads exactly as it did before instances existed.
+    @Published private(set) var instances: [EventInstance] = []
     // The named calendars, ascending by createdAt as the server sorts them.
     @Published private(set) var calendars: [EventCalendar] = []
     // True once /v1/calendars has 404'd: this botnetd predates multiple
@@ -156,8 +161,45 @@ final class AppStore: ObservableObject {
         }
         // Events and calendars go stale together — a bot's tool call can make a
         // calendar in the same turn it books into it — so every event refresh
-        // re-reads both.
+        // re-reads both. Instances derive from both, so they refresh last.
         await refreshCalendars()
+        await refreshInstances()
+    }
+
+    // The instance fetch window. One window feeds both the list and the month
+    // grid — they render the same filtered array, and two windows would let
+    // the two readings disagree. A month of "Earlier", six months of future:
+    // enough for the grid to show a recurring series repeating, and 210 days
+    // stays well under the contract's 400-day cap.
+    private static let instanceWindowPast: TimeInterval = 30 * 86_400
+    private static let instanceWindowFuture: TimeInterval = 180 * 86_400
+
+    /// Re-derives the pane's instances. Runs after every event fetch and every
+    /// event mutation: instances are expanded server-side, so a saved edit to a
+    /// recurring master moves occurrences this cache can't compute locally.
+    func refreshInstances() async {
+        let today = Calendar.current.startOfDay(for: Date())
+        do {
+            instances = try await api.listInstances(
+                from: today.addingTimeInterval(-Self.instanceWindowPast),
+                to: today.addingTimeInterval(Self.instanceWindowFuture))
+        } catch {
+            guard !APIClient.isUnimplemented(error) else {
+                // Old server: nothing expands, so the wholesale events ARE the
+                // instances — including ones outside the window, exactly the
+                // pane's pre-instances behavior.
+                instances = events.map(EventInstance.single)
+                return
+            }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// The master event an instance points at, for opening the editor. Nil only
+    /// if the master vanished between the two fetches; the caller then does
+    /// nothing rather than editing a ghost.
+    func event(id: String) -> Event? {
+        events.first { $0.id == id }
     }
 
     func refreshCalendars() async {
@@ -221,6 +263,7 @@ final class AppStore: ObservableObject {
             try await api.deleteCalendar(calendar.id)
             calendars.removeAll { $0.id == calendar.id }
             events.removeAll { $0.calendarId == calendar.id }
+            instances.removeAll { $0.calendarId == calendar.id }
         } catch {
             lastError = calendarError(error, verb: "delete a calendar")
         }
@@ -246,6 +289,7 @@ final class AppStore: ObservableObject {
                 title: title, startsAt: startsAt, endsAt: endsAt,
                 location: location, notes: notes, calendarId: calendarId)
             merge(created)
+            await refreshInstances()
             return true
         } catch {
             lastError = calendarError(error, verb: "add an event")
@@ -260,6 +304,7 @@ final class AppStore: ObservableObject {
         guard !fields.isEmpty else { return true }
         do {
             merge(try await api.updateEvent(event.id, fields: fields))
+            await refreshInstances()
             return true
         } catch {
             lastError = calendarError(error, verb: "edit an event")
@@ -271,6 +316,9 @@ final class AppStore: ObservableObject {
         do {
             try await api.deleteEvent(event.id)
             events.removeAll { $0.id == event.id }
+            // The server deletes the whole series (a recurring event is one
+            // row), so every instance pointing at it goes too.
+            instances.removeAll { $0.eventId == event.id }
         } catch {
             lastError = calendarError(error, verb: "delete an event")
         }

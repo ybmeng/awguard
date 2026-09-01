@@ -189,6 +189,12 @@ enum TypeScale {
     static let gridMeta = Font.system(size: 10)
     /// An event chip inside a day cell — the smallest readable text in the app.
     static let chip = Font.system(size: 10.5)
+    /// The repeat/bolt marks on an event row, a calendar chip, and a manage
+    /// row — sized to sit beside rowTitle/rowMeta text without competing.
+    static let eventGlyph = Font.system(size: 10, weight: .medium)
+    /// The same marks inside a month-grid chip, where three chips share a cell
+    /// barely a hundred points wide.
+    static let chipGlyph = Font.system(size: 8, weight: .medium)
 }
 
 // MARK: - Avatar

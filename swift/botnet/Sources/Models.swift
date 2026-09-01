@@ -203,10 +203,15 @@ struct EventCalendar: Identifiable, Codable, Hashable {
     var id: String            // "cal_" + ULID
     var name: String
     var color: String
+    /// Whether events on this calendar may fire automations. Nil means an older
+    /// botnetd, which cannot fire anything, so absent reads as not-executable.
+    var executable: Bool?
     /// The bot id that created it, or `Event.userAuthor` for one made in the UI.
     var createdBy: String
     var createdAt: Date
     var updatedAt: Date
+
+    var isExecutable: Bool { executable == true }
 
     /// The server's color enum, in the order it cycles them for an unnamed
     /// color. The recolor menus iterate this; Palette.calendar(_:) tolerates a
@@ -228,10 +233,23 @@ struct Event: Identifiable, Codable, Hashable {
     /// The calendar this event files under. Always present from a server with
     /// multiple calendars; nil means an older botnetd, never a real value.
     var calendarId: String?
+    /// RFC 5545 recurrence rule (the server's supported subset). Omitted for a
+    /// single event and by an older botnetd; startsAt/endsAt are the FIRST
+    /// occurrence when set. The UI shows it read-only — bots and the
+    /// registration tick author these, per the firing contract.
+    var rrule: String?
+    /// IANA timezone the rule expands in; present exactly when rrule is.
+    var tz: String?
+    /// The automation this event fires while an instance is active. Only legal
+    /// on an executable calendar; omitted (nil) everywhere else.
+    var automation: String?
     /// The bot id that created it, or `Event.userAuthor` for one made in the UI.
     var createdBy: String
     var createdAt: Date
     var updatedAt: Date
+
+    var isRecurring: Bool { !(rrule ?? "").isEmpty }
+    var firesAutomation: Bool { !(automation ?? "").isEmpty }
 
     /// The server's marker for an event the user made rather than a bot; it is
     /// not a bot id, so nothing may look it up in the bot list.
@@ -245,6 +263,53 @@ struct Event: Identifiable, Codable, Hashable {
 
     var hasLocation: Bool { !(location ?? "").isEmpty }
     var hasNotes: Bool { !(notes ?? "").isEmpty }
+}
+
+// One occurrence of an event inside a queried window — decoded from
+// GET /v1/instances, the calendar pane's data source. A recurring event arrives
+// as several of these sharing its eventId; a single event passes through as
+// exactly one. Instances are derived server-side and never synced or edited:
+// opening one edits the MASTER event it points at, which is why eventId is the
+// only id on the wire.
+struct EventInstance: Identifiable, Codable, Hashable {
+    var eventId: String       // the master Event's id
+    /// Same optionality and meaning as Event.calendarId; nil only on an
+    /// instance synthesized from an old server's event.
+    var calendarId: String?
+    var title: String
+    var startsAt: Date
+    var endsAt: Date
+    var location: String?
+    var notes: String?
+    /// The automation the master fires; nil when it fires nothing.
+    var automation: String?
+    /// True on every instance expanded from an RRULE — what the repeat glyph
+    /// marks — and false on a single event's pass-through.
+    var recurring: Bool
+    var createdBy: String
+
+    /// Distinct per occurrence: two instances of one event share eventId, and a
+    /// list keyed on eventId alone would collapse the series onto one row.
+    var id: String { "\(eventId)@\(startsAt.timeIntervalSinceReferenceDate)" }
+
+    /// The day the instance files under; same start-keyed rule as Event.day.
+    var day: Date { Calendar.current.startOfDay(for: startsAt) }
+
+    var isUserCreated: Bool { createdBy == Event.userAuthor }
+    var hasLocation: Bool { !(location ?? "").isEmpty }
+    var hasNotes: Bool { !(notes ?? "").isEmpty }
+    var firesAutomation: Bool { !(automation ?? "").isEmpty }
+
+    /// The old-server fallback: a botnetd without /v1/instances still shows its
+    /// events, mapped one-to-one. Such a server expands nothing and fires
+    /// nothing, so recurring is false and automation nil by construction.
+    static func single(_ event: Event) -> EventInstance {
+        EventInstance(
+            eventId: event.id, calendarId: event.calendarId, title: event.title,
+            startsAt: event.startsAt, endsAt: event.endsAt,
+            location: event.location, notes: event.notes,
+            automation: nil, recurring: false, createdBy: event.createdBy)
+    }
 }
 
 // Decoded from GET /v1/tools: the exact tools the server sends the model each

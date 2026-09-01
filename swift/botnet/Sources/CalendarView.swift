@@ -35,6 +35,10 @@ struct CalendarView: View {
     @State private var filter: String?
     // The header's type-to-filter text; transient for the same reason.
     @State private var query = ""
+    // The series-delete confirmation, armed by requestDelete on a recurring
+    // instance; a single event needs no such gate.
+    @State private var pendingSeriesDelete: Event?
+    @State private var confirmingSeriesDelete = false
 
     init(mode: Binding<CalendarMode>, initialFilter: String? = nil, initialQuery: String = "") {
         _mode = mode
@@ -44,28 +48,28 @@ struct CalendarView: View {
 
     // One filtered array feeds both readings, so the list and the grid can
     // never disagree about what the active chip and the typed text mean. The
-    // two filters compose: an event has to satisfy both.
-    private var filteredEvents: [Event] {
-        var events = store.events
-        if let filter { events = events.filter { $0.calendarId == filter } }
+    // two filters compose: an instance has to satisfy both.
+    private var filteredInstances: [EventInstance] {
+        var instances = store.instances
+        if let filter { instances = instances.filter { $0.calendarId == filter } }
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return events }
-        return events.filter { matches($0, needle: needle) }
+        guard !needle.isEmpty else { return instances }
+        return instances.filter { matches($0, needle: needle) }
     }
 
     // Substring, case-insensitive, across everything a person remembers an
     // event by — including its calendar's name, so typing "earnings" narrows
     // to that calendar without hunting for its chip.
-    private func matches(_ event: Event, needle: String) -> Bool {
-        if event.title.range(of: needle, options: .caseInsensitive) != nil { return true }
-        if event.location?.range(of: needle, options: .caseInsensitive) != nil { return true }
-        if event.notes?.range(of: needle, options: .caseInsensitive) != nil { return true }
-        if let name = store.calendar(id: event.calendarId)?.name,
+    private func matches(_ instance: EventInstance, needle: String) -> Bool {
+        if instance.title.range(of: needle, options: .caseInsensitive) != nil { return true }
+        if instance.location?.range(of: needle, options: .caseInsensitive) != nil { return true }
+        if instance.notes?.range(of: needle, options: .caseInsensitive) != nil { return true }
+        if let name = store.calendar(id: instance.calendarId)?.name,
            name.range(of: needle, options: .caseInsensitive) != nil { return true }
         return false
     }
 
-    private var groups: EventGroups { EventGroups(filteredEvents) }
+    private var groups: EventGroups { EventGroups(filteredInstances) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -73,11 +77,13 @@ struct CalendarView: View {
             if !store.calendars.isEmpty { chipRow }
             switch mode {
             case .list:
-                if filteredEvents.isEmpty { empty } else { list }
+                if filteredInstances.isEmpty { empty } else { list }
             case .month:
                 // A month with nothing in it is still a month, so the grid has
                 // no empty state of its own.
-                MonthGridView(events: filteredEvents) { editing = $0 }
+                MonthGridView(instances: filteredInstances,
+                              openInstance: openMaster(of:),
+                              createOn: { editing = .newOn($0) })
             }
         }
         .background(Palette.chrome)
@@ -94,6 +100,36 @@ struct CalendarView: View {
         }
         .sheet(item: $editing) { EventSheet(target: $0, defaultCalendarId: defaultCalendarId) }
         .sheet(isPresented: $showManage) { ManageCalendarsSheet() }
+        // A recurring event is one row on the server: deleting it takes every
+        // occurrence with it, which is worth a sentence before it happens. A
+        // single event deletes straight from the menu, as it always has.
+        .alert("Delete repeating event?", isPresented: $confirmingSeriesDelete,
+               presenting: pendingSeriesDelete) { master in
+            Button("Delete All Occurrences", role: .destructive) {
+                Task { await store.deleteEvent(master) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { master in
+            Text("\"\(master.title)\" repeats. Deleting it removes the whole series, not just this occurrence.")
+        }
+    }
+
+    /// An instance is a rendering of its master event; tapping it edits the
+    /// master, per the contract. A missing master (deleted between fetches)
+    /// opens nothing rather than a ghost.
+    private func openMaster(of instance: EventInstance) {
+        guard let master = store.event(id: instance.eventId) else { return }
+        editing = .existing(master)
+    }
+
+    private func requestDelete(_ instance: EventInstance) {
+        guard let master = store.event(id: instance.eventId) else { return }
+        guard instance.recurring else {
+            Task { await store.deleteEvent(master) }
+            return
+        }
+        pendingSeriesDelete = master
+        confirmingSeriesDelete = true
     }
 
     /// Where a new event files by default: the filtered calendar when one chip
@@ -216,13 +252,15 @@ struct CalendarView: View {
     private var chipRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                FilterChip(label: "All", color: nil, selected: filter == nil) {
+                FilterChip(label: "All", color: nil, executable: false,
+                           selected: filter == nil) {
                     filter = nil
                 }
                 ForEach(inlineCalendars) { calendar in
                     FilterChip(
                         label: calendar.name,
                         color: Palette.calendar(calendar.color),
+                        executable: calendar.isExecutable,
                         selected: filter == calendar.id
                     ) {
                         filter = calendar.id
@@ -294,14 +332,14 @@ struct CalendarView: View {
                 .foregroundStyle(day.isPast ? Palette.secondaryText : Palette.primaryText)
                 .padding(.horizontal, Metric.sidebarGutter)
                 .padding(.bottom, 2)
-            ForEach(day.events) { event in
-                EventRow(event: event, creator: creator(of: event),
-                         calendarColor: calendarColor(of: event)) {
-                    editing = .existing(event)
+            ForEach(day.instances) { instance in
+                EventRow(instance: instance, creator: creator(of: instance),
+                         calendarColor: calendarColor(of: instance)) {
+                    openMaster(of: instance)
                 }
                 .contextMenu {
                     Button("Delete", role: .destructive) {
-                        Task { await store.deleteEvent(event) }
+                        requestDelete(instance)
                     }
                 }
             }
@@ -334,20 +372,20 @@ struct CalendarView: View {
         }
     }
 
-    /// The event's calendar color, resolved against the live calendar list so a
-    /// recolor propagates without a refetch. Nil — no dot at all — when the
-    /// event has no calendar (old server) or its calendar is gone; an unknown
-    /// color *string* still dots, in the palette's neutral fallback.
-    private func calendarColor(of event: Event) -> Color? {
-        store.calendar(id: event.calendarId).map { Palette.calendar($0.color) }
+    /// The instance's calendar color, resolved against the live calendar list
+    /// so a recolor propagates without a refetch. Nil — no dot at all — when it
+    /// has no calendar (old server) or its calendar is gone; an unknown color
+    /// *string* still dots, in the palette's neutral fallback.
+    private func calendarColor(of instance: EventInstance) -> Color? {
+        store.calendar(id: instance.calendarId).map { Palette.calendar($0.color) }
     }
 
     // Resolved against the live bot list at render time, never captured onto the
     // row, so a renamed bot renames here without a refetch.
-    private func creator(of event: Event) -> EventCreator {
-        guard !event.isUserCreated else { return .user }
-        let name = store.bots.first { $0.id == event.createdBy }?.displayName
-        return .bot(id: event.createdBy, name: name ?? "a bot")
+    private func creator(of instance: EventInstance) -> EventCreator {
+        guard !instance.isUserCreated else { return .user }
+        let name = store.bots.first { $0.id == instance.createdBy }?.displayName
+        return .bot(id: instance.createdBy, name: name ?? "a bot")
     }
 }
 
@@ -366,6 +404,9 @@ enum EventCreator {
 private struct FilterChip: View {
     let label: String
     let color: Color?
+    /// Draws the bolt beside the name: this calendar's events can fire
+    /// automations, and the chip row is where the user scans for that.
+    let executable: Bool
     let selected: Bool
     let select: () -> Void
 
@@ -377,6 +418,11 @@ private struct FilterChip: View {
                         .frame(width: Metric.calendarDot, height: Metric.calendarDot)
                 }
                 Text(label).lineLimit(1)
+                if executable {
+                    Image(systemName: "bolt.fill")
+                        .font(TypeScale.eventGlyph)
+                        .foregroundStyle(Palette.attention)
+                }
             }
             .font(TypeScale.rowMeta)
             .foregroundStyle(selected ? Palette.userBubbleText : Palette.primaryText)
@@ -385,12 +431,14 @@ private struct FilterChip: View {
             .background(selected ? Palette.userBubble : Palette.fieldFill, in: Capsule())
         }
         .buttonStyle(.plain)
-        .help(color == nil ? "Show every calendar" : "Show only \(label)")
+        .help(color == nil ? "Show every calendar"
+              : executable ? "Show only \(label) — its events can fire automations"
+              : "Show only \(label)")
     }
 }
 
 private struct EventRow: View {
-    let event: Event
+    let instance: EventInstance
     let creator: EventCreator
     let calendarColor: Color?
     let open: () -> Void
@@ -411,13 +459,28 @@ private struct EventRow: View {
                             Circle().fill(calendarColor)
                                 .frame(width: Metric.calendarDot, height: Metric.calendarDot)
                         }
-                        Text(event.title)
+                        Text(instance.title)
                             .font(TypeScale.rowTitle)
                             .foregroundStyle(Palette.primaryText)
                             .lineLimit(1)
+                        // The firing affordances, right after the title where
+                        // the row is read: repeat = this is one occurrence of a
+                        // series, bolt = an automation fires while it is active.
+                        if instance.recurring {
+                            Image(systemName: "repeat")
+                                .font(TypeScale.eventGlyph)
+                                .foregroundStyle(Palette.secondaryText)
+                                .help("Repeats — one occurrence of a series")
+                        }
+                        if instance.firesAutomation {
+                            Image(systemName: "bolt.fill")
+                                .font(TypeScale.eventGlyph)
+                                .foregroundStyle(Palette.attention)
+                                .help("Fires \(instance.automation ?? "")")
+                        }
                     }
-                    if event.hasLocation {
-                        Label(event.location ?? "", systemImage: "mappin.and.ellipse")
+                    if instance.hasLocation {
+                        Label(instance.location ?? "", systemImage: "mappin.and.ellipse")
                             .font(TypeScale.rowMeta)
                             .foregroundStyle(Palette.secondaryText)
                             .lineLimit(1)
@@ -437,16 +500,16 @@ private struct EventRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help("Edit \(event.title)")
+        .help("Edit \(instance.title)")
     }
 
     // A fixed column so every title on the day starts at the same x; the end
     // time is quieter because the start is what the eye scans for.
     private var time: some View {
         VStack(alignment: .trailing, spacing: 1) {
-            Text(Self.clock(event.startsAt))
+            Text(Self.clock(instance.startsAt))
                 .foregroundStyle(Palette.primaryText)
-            Text(Self.endClock(event))
+            Text(Self.endClock(instance))
                 .foregroundStyle(Palette.secondaryText)
         }
         .font(TypeScale.rowMeta)
@@ -476,10 +539,10 @@ private struct EventRow: View {
 
     // An overnight flight files under the day it leaves, so its end time would
     // otherwise read as twelve hours before its start. The day count says so.
-    private static func endClock(_ event: Event) -> String {
-        let end = Calendar.current.startOfDay(for: event.endsAt)
-        let days = Calendar.current.dateComponents([.day], from: event.day, to: end).day ?? 0
-        return days > 0 ? "\(clock(event.endsAt)) +\(days)" : clock(event.endsAt)
+    private static func endClock(_ instance: EventInstance) -> String {
+        let end = Calendar.current.startOfDay(for: instance.endsAt)
+        let days = Calendar.current.dateComponents([.day], from: instance.day, to: end).day ?? 0
+        return days > 0 ? "\(clock(instance.endsAt)) +\(days)" : clock(instance.endsAt)
     }
 }
 
@@ -492,11 +555,11 @@ struct EventGroups {
     var upcoming: [EventDay] = []
     var past: [EventDay] = []
 
-    init(_ events: [Event], now: Date = Date()) {
+    init(_ instances: [EventInstance], now: Date = Date()) {
         let today = Calendar.current.startOfDay(for: now)
-        let byDay = Dictionary(grouping: events, by: \.day)
-        let days = byDay.map { date, events in
-            EventDay(date: date, events: events.sorted {
+        let byDay = Dictionary(grouping: instances, by: \.day)
+        let days = byDay.map { date, instances in
+            EventDay(date: date, instances: instances.sorted {
                 ($0.startsAt, $0.id) < ($1.startsAt, $1.id)
             }, today: today)
         }
@@ -507,15 +570,15 @@ struct EventGroups {
 
 struct EventDay: Identifiable {
     let date: Date
-    let events: [Event]
+    let instances: [EventInstance]
     let isPast: Bool
     let label: String
 
     var id: Date { date }
 
-    init(date: Date, events: [Event], today: Date) {
+    init(date: Date, instances: [EventInstance], today: Date) {
         self.date = date
-        self.events = events
+        self.instances = instances
         self.isPast = date < today
         self.label = Self.label(for: date, today: today)
     }

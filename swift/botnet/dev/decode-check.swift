@@ -265,6 +265,103 @@ struct DecodeCheck {
             _ = try decoder.decode([EventCalendar].self, from: Data("[]".utf8))
         }
 
+        // Recurrence landed with calendar-driven firing: an event carrying an
+        // RRULE carries its IANA tz and (on an executable calendar) the
+        // automation it fires. All three are omitempty on the wire, so the same
+        // build must decode a firing event and every older fixture above with
+        // all three absent — nil meaning "not recurring / fires nothing", the
+        // Models header rule.
+        let firingEvent = Data("""
+        {"id":"evt_01M1A0000000000000000004","title":"fred-m2","startsAt":"2026-09-22T17:05:00Z","endsAt":"2026-09-22T17:35:00Z","calendarId":"cal_01M1B0000000000000000003","rrule":"FREQ=MONTHLY;BYDAY=4TU","tz":"America/New_York","automation":"fred-m2","createdBy":"user","createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:00:00Z"}
+        """.utf8)
+        await check("Event rrule/tz/automation decode when present, nil when absent") {
+            let firing = try decoder.decode(Event.self, from: firingEvent)
+            guard firing.rrule == "FREQ=MONTHLY;BYDAY=4TU",
+                  firing.tz == "America/New_York",
+                  firing.automation == "fred-m2",
+                  firing.isRecurring, firing.firesAutomation
+            else {
+                throw NSError(domain: "decode-check", code: 17, userInfo: [
+                    NSLocalizedDescriptionKey: "recurrence fields decoded wrong: \(firing)",
+                ])
+            }
+            let plain = try decoder.decode(Event.self, from: fullEvent)
+            guard plain.rrule == nil, plain.tz == nil, plain.automation == nil,
+                  !plain.isRecurring, !plain.firesAutomation
+            else {
+                throw NSError(domain: "decode-check", code: 18, userInfo: [
+                    NSLocalizedDescriptionKey: "absent recurrence fields decoded as real values: \(plain)",
+                ])
+            }
+        }
+
+        // Executable calendars: the contract sends `executable` on every
+        // calendar from a current server; an older server omits it, and absent
+        // must read as not-executable, never as unknown-but-maybe.
+        let executableCalendar = Data("""
+        {"id":"cal_01M1B0000000000000000003","name":"Automations","color":"orange","executable":true,"createdBy":"user","createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:00:00Z"}
+        """.utf8)
+        await check("EventCalendar.executable decodes when present, absent = not executable") {
+            let exec = try decoder.decode(EventCalendar.self, from: executableCalendar)
+            guard exec.executable == true, exec.isExecutable else {
+                throw NSError(domain: "decode-check", code: 19, userInfo: [
+                    NSLocalizedDescriptionKey: "executable decoded wrong: \(exec)",
+                ])
+            }
+            let old = try decoder.decode(EventCalendar.self, from: knownColorCalendar)
+            guard old.executable == nil, !old.isExecutable else {
+                throw NSError(domain: "decode-check", code: 20, userInfo: [
+                    NSLocalizedDescriptionKey: "absent executable decoded as \(String(describing: old.executable))",
+                ])
+            }
+        }
+
+        // GET /v1/instances: the calendar pane's data source. One recurring
+        // event arrives as several instances sharing its eventId on different
+        // days — each must keep a distinct Identifiable id or SwiftUI collapses
+        // them — and a single event passes through with recurring=false.
+        let instances = Data("""
+        [{"eventId":"evt_01M1A0000000000000000004","calendarId":"cal_01M1B0000000000000000003","title":"fred-m2","startsAt":"2026-09-22T17:05:00Z","endsAt":"2026-09-22T17:35:00Z","automation":"fred-m2","recurring":true,"createdBy":"user"},{"eventId":"evt_01M1A0000000000000000004","calendarId":"cal_01M1B0000000000000000003","title":"fred-m2","startsAt":"2026-10-27T17:05:00Z","endsAt":"2026-10-27T17:35:00Z","automation":"fred-m2","recurring":true,"createdBy":"user"},{"eventId":"evt_01M1A0000000000000000001","calendarId":"cal_01M1B0000000000000000001","title":"Lunch with Alex","startsAt":"2026-09-02T12:00:00Z","endsAt":"2026-09-02T13:00:00Z","location":"Blue Bottle","notes":"bring the lease","recurring":false,"createdBy":"bot_01M16K3W6TZ0EHQFPKZ490BDX2"}]
+        """.utf8)
+        await check("instances: same event on two days, distinct ids, single pass-through") {
+            let list = try decoder.decode([EventInstance].self, from: instances)
+            guard list.count == 3,
+                  list[0].eventId == list[1].eventId,
+                  list[0].id != list[1].id,
+                  list[0].recurring, list[1].recurring,
+                  list[0].firesAutomation, list[0].automation == "fred-m2",
+                  !list[2].recurring, list[2].location == "Blue Bottle",
+                  list[2].automation == nil, !list[2].firesAutomation,
+                  !list[2].isUserCreated, list[0].isUserCreated
+            else {
+                throw NSError(domain: "decode-check", code: 21, userInfo: [
+                    NSLocalizedDescriptionKey: "instances decoded wrong: \(list)",
+                ])
+            }
+        }
+        await check("empty instances list decodes") {
+            _ = try decoder.decode([EventInstance].self, from: Data("[]".utf8))
+        }
+
+        // The old-server fallback: a botnetd without /v1/instances still shows
+        // its events, synthesized one-to-one. Every rendered field must survive
+        // the mapping, and a plain event reads as non-recurring.
+        await check("EventInstance.single preserves the event") {
+            let event = try decoder.decode(Event.self, from: fullEvent)
+            let single = EventInstance.single(event)
+            guard single.eventId == event.id, single.title == event.title,
+                  single.startsAt == event.startsAt, single.endsAt == event.endsAt,
+                  single.location == event.location, single.notes == event.notes,
+                  single.calendarId == event.calendarId,
+                  single.createdBy == event.createdBy,
+                  !single.recurring, single.automation == nil
+            else {
+                throw NSError(domain: "decode-check", code: 22, userInfo: [
+                    NSLocalizedDescriptionKey: "single-event synthesis dropped a field: \(single)",
+                ])
+            }
+        }
+
         // The times the app sends back must be the RFC3339 form the server
         // parses, and must survive a round trip through its own decoder.
         await check("wireTime round-trips through the decoder") {
@@ -334,6 +431,11 @@ struct DecodeCheck {
             }
             await check("live GET /v1/calendars (404 = older server, tolerated)") {
                 do { _ = try await api.listCalendars() }
+                catch let e where APIClient.isUnimplemented(e) {}
+            }
+            await check("live GET /v1/instances?from=&to= (404 = older server, tolerated)") {
+                let now = Date()
+                do { _ = try await api.listInstances(from: now, to: now.addingTimeInterval(86_400)) }
                 catch let e where APIClient.isUnimplemented(e) {}
             }
             for b in bots {

@@ -7,6 +7,7 @@
 //   snapshot --calendar --filter-calendar <name>  # with that calendar's chip active
 //   snapshot --calendar --search <text>     # with the header search narrowing it
 //   snapshot --event-sheet [--new-event]    # the event editor, rendered flat
+//   snapshot --event-sheet --event-title <t>  # the editor on that exact event
 //   snapshot --manage-calendars             # the calendar manager, rendered flat
 //
 // It talks to whatever BOTNET_API points at, so point it at the demo server
@@ -82,6 +83,16 @@ struct Snapshot {
             }
             return .calendar(flags.contains("--month") ? .month : .list,
                              filter: filter, query: argument("--search") ?? "")
+        }
+        // A named event fails loudly on no match, same as --filter-calendar:
+        // a typo'd title must not pass review as whatever events.first was.
+        if let title = argument("--event-title") {
+            guard let match = store.events.first(where: {
+                $0.title.caseInsensitiveCompare(title) == .orderedSame
+            }) else {
+                fail("no event titled \(title) on the demo server")
+            }
+            return .eventSheet(.existing(match))
         }
         // Editing an existing event is the interesting case; fall back to the
         // blank form when the calendar is empty rather than failing the run.

@@ -151,6 +151,28 @@ struct EventSheet: View {
                         }
                     }
                 }
+                // Read-only by decision: bots and the automations service
+                // author recurrence; the sheet states it rather than editing
+                // it, verbatim (the rrule IS the spec, paraphrasing would
+                // hide what actually fires). Editing recurrence here is OPEN
+                // in the contract, deferred.
+                if let event = target.event, event.isRecurring || event.firesAutomation {
+                    Section {
+                        if event.isRecurring {
+                            LabeledContent("Repeats") {
+                                Text(Self.recurrenceSummary(event))
+                                    .foregroundStyle(Palette.secondaryText)
+                                    .multilineTextAlignment(.trailing)
+                            }
+                        }
+                        if event.firesAutomation {
+                            LabeledContent("Fires") {
+                                Label(event.automation ?? "", systemImage: "bolt.fill")
+                                    .foregroundStyle(Palette.attention)
+                            }
+                        }
+                    }
+                }
                 Section("Notes") {
                     TextField("", text: $notes, axis: .vertical)
                         .lineLimit(3...8)
@@ -216,6 +238,14 @@ struct EventSheet: View {
 
     private func cleaned(_ text: String) -> String {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// "FREQ=MONTHLY;BYDAY=4TU · America/New_York" — the rule verbatim with
+    /// its timezone, the same separator the day headers use. tz is required
+    /// with rrule server-side, but a missing one still reads cleanly here.
+    private static func recurrenceSummary(_ event: Event) -> String {
+        guard let tz = event.tz, !tz.isEmpty else { return event.rrule ?? "" }
+        return "\(event.rrule ?? "") · \(tz)"
     }
 
     private static let defaultDuration: TimeInterval = 3600
@@ -346,6 +376,15 @@ private struct CalendarManageRow: View {
             Circle()
                 .fill(Palette.calendar(calendar.color))
                 .frame(width: Metric.calendarDot, height: Metric.calendarDot)
+            // The same badge the chip row wears: this calendar's events may
+            // fire automations. Before the name, so the flexible rename field
+            // can't push it out of the eye's path.
+            if calendar.isExecutable {
+                Image(systemName: "bolt.fill")
+                    .font(TypeScale.eventGlyph)
+                    .foregroundStyle(Palette.attention)
+                    .help("Executable — events here can fire automations")
+            }
             // Rename commits on Enter — the row's explicit save. An uncommitted
             // draft simply stays in the field; nothing autosaves on dismiss.
             // labelsHidden, or the grouped Form prints "Name" ahead of every

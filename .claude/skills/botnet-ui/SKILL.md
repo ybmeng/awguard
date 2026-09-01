@@ -68,9 +68,15 @@ From `swift/botnet/`:
   menu. Owns `SidebarSelection` (`.bot(id)` | `.service(kind)`) and
   `ServiceKind`; ContentView switches the detail pane on that enum, so a new
   service is a case plus a pane, never a sentinel id.
-- `CalendarView.swift` — the Calendar service's pane: events grouped by day
+- `CalendarView.swift` — the Calendar service's pane: instances grouped by day
   (upcoming, then "Earlier"), each row showing its author. Grouping lives in
-  `EventGroups`/`EventDay` in the same file, not in the view body.
+  `EventGroups`/`EventDay` in the same file, not in the view body. The pane
+  renders `EventInstance` (from /v1/instances over the Store's bounded window),
+  NEVER `Event`: a recurring event is one row server-side but many instances,
+  and clicking any of them opens the MASTER event
+  (`store.event(id: instance.eventId)`). On a 404 the Store synthesizes
+  instances one-to-one from the wholesale events list, so old servers render
+  exactly as before — new view code must keep working off that synthesis.
 - `Store.swift` — AppStore, thin @MainActor client over botnetd; caches server
   responses, owns no durable state. `awaitReply` polls a sent turn until it
   settles, then `refreshBotList()` — that refetch is what live-updates
@@ -156,6 +162,20 @@ From `swift/botnet/`:
   stamp) to the far edge, a hand's width from the content it belongs to. Cap
   the list's own width the way `Metric.bubbleWidthFraction` caps a bubble —
   `Metric.calendarListWidth` is the calendar's version — and left-align it.
+- When the contract endpoint hasn't landed in go/ yet (parallel server agent),
+  don't stall and don't fake data into Store: stand up a contract-shaped stub
+  HTTP server in the SCRATCHPAD (static JSON per the contract, python
+  http.server on an odd port) and point BOTNET_API at it — the real APIClient
+  decodes real HTTP and the snapshot proves the rendering. Label those PNGs as
+  stub-verified in the report and re-run against the real botnetd once the
+  route lands. The stub never enters the tree.
+- Seeding times for grid review: the grid groups by LOCAL day, so pick UTC
+  instants that stay on the intended local date (a 17:05Z event is next-day in
+  UTC+8, and your "4th Tuesday" chip renders on a Wednesday). Check `date +%z`
+  before choosing seed times.
+- A multi-month grid check (a recurring series on several correct days across
+  two months) doesn't fit 900pt: run `snapshot --calendar --month --height
+  1250` so both month sections are in frame.
 - Markdown in bot bubbles: `Text(String)` renders literally — parse with
   `AttributedString(markdown:options:)` at `.inlineOnlyPreservingWhitespace`
   (keeps single newlines, leaves block syntax literal), raw-text fallback on

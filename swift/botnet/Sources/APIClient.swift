@@ -131,6 +131,16 @@ struct APIClient {
         _ = try await raw("/v1/events/\(id)", method: "DELETE", body: nil)
     }
 
+    /// Expanded instances of every event overlapping the window, ascending by
+    /// start: single events pass through, recurring events expand server-side.
+    /// Both bounds are required by the contract (window cap 400 days), so
+    /// neither is optional here. 404 means a botnetd that predates instances;
+    /// callers fall back to the wholesale events list.
+    func listInstances(from: Date, to: Date) async throws -> [EventInstance] {
+        try await get("/v1/instances?from=" + escaped(Self.wireTime(from))
+                      + "&to=" + escaped(Self.wireTime(to)))
+    }
+
     // MARK: calendars (the named collections events file under)
     //
     // Same era and same rules as the calendar-tool routes above: last-write-wins,
