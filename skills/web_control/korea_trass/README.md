@@ -7,6 +7,12 @@ forms:
   "1": SKILL.md
 verify: python3 scripts/tests/test_parsers.py
 cadence: "KST releases: full-month provisional on the 1st ~09:00, 1~10 on the 11th, 1~20 on the 21st, monthly 확정 (incl. by-country) ~the 15th of the following month. 09:00 KST = 17:00 PT the prior day; the endpoint can trail the press release by minutes to hours, so rerun until the new period appears."
+schedule:
+  rrule: "FREQ=MONTHLY;BYMONTHDAY=1,11,15,21"
+  at: "09:05"
+  tz: "Asia/Seoul"
+  retry_every: 1h
+  retry_for: 24h
 human_gates: "TRASS 잠정치조회 per-session reCAPTCHA — one human checkbox click per session unlocks the per-HSK 10-day queries in recipes/trass_by_country.md. Form 3 has no gate."
 ---
 

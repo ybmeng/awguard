@@ -71,7 +71,13 @@ forms:
   "2": <recipe path, or absent>
   "1": SKILL.md
 verify: <offline test command>
-cadence: <when to run / when new data lands>
+cadence: <when to run / when new data lands — prose for humans>
+schedule:
+  rrule: "FREQ=MONTHLY;BYDAY=4TU"   # runner-service RRULE subset (the std calendar expander)
+  at: "13:05"                        # wall-clock HH:MM in tz
+  tz: "America/New_York"             # IANA id
+  retry_every: 2h                    # Go duration between attempts inside a window
+  retry_for: 30h                     # window length from each occurrence
 human_gates: <steps permanently capped at form 2, or none>
 ---
 <current state, placeholders, anything a driver should know before invoking>
@@ -82,6 +88,14 @@ human_gates: <steps permanently capped at form 2, or none>
 ## Data spec
 <one subsection per artifact>
 ```
+
+`schedule:` is the machine-readable twin of the `cadence:` prose. The runner service invokes
+form 3 on it: each occurrence (rrule + at, anchored in tz) opens a window `retry_for` long, and
+the service attempts form 3 every `retry_every` inside it until a run's envelope both says `ok`
+and advances past the pre-window baseline (a new artifact path, or a newer `newest` at a known
+path — `rows` is deliberately ignored, since sources restate history at constant row counts).
+No `schedule:` block means the automation is registered, listed, and manually runnable, but
+never auto-run.
 
 The Reporting section makes the envelope contract concrete for this automation: where the envelope
 lands, which statuses this automation can actually emit and what each means here (which artifacts
@@ -135,9 +149,11 @@ newer period" without opening the CSV. Completion checks match on the envelope, 
    lower forms, refreshes snapshots if the source legitimately changed, gets the verifier green,
    and commits. Repair, then re-demote.
 
-A future service registers automations by manifest, invokes form 3 on cadence, and routes
-envelopes up this chain. Until then, the chain is run by hand — but every automation is written
-as if the service already exists.
+The std automations service (`go/std/bg_services/automations`, hosted by stdd with
+`-automations-repo`) registers automations by manifest and invokes form 3 on the manifest
+`schedule:` today, recording every run's envelope — `needs_human` and `escalation_reason`
+included. Routing envelopes up the 3→2→1 chain is still done by hand; every automation is
+written as if the full chain service already exists.
 
 ## Reuse before discovery
 

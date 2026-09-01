@@ -6,6 +6,12 @@ forms:
   "1": SKILL.md
 verify: python3 scripts/tests/test_parsers.py
 cadence: Monthly. Fed H.6 "Money Stock Measures" posts the fourth Tuesday at 1:00 p.m. ET (next business day if that Tuesday is a federal holiday); FRED mirrors within ~1 minute, so poll 13:05 ET and retry through the next business day. Next 2026 dates - Sep 22, Oct 27, Nov 24, Dec 22.
+schedule:
+  rrule: "FREQ=MONTHLY;BYDAY=4TU"
+  at: "13:05"
+  tz: "America/New_York"
+  retry_every: 2h
+  retry_for: 30h
 human_gates: none
 ---
 
