@@ -1,14 +1,24 @@
 // Package automations is the std automations runner service: it discovers
-// automation-123 manifests in a repo checkout, invokes their form-3 commands
-// on the manifests' schedules, and records every run's result envelope, all
-// served over a unix-socket REST API (see skills/automation_123/SKILL.md for
-// the paradigm this serves).
+// automation-123 manifests in a repo checkout, runs their form-3 commands
+// when the botnet calendar fires them, and records every run's result
+// envelope, all served over a unix-socket REST API (see
+// skills/automation_123/SKILL.md for the paradigm this serves).
+//
+// The service owns no clock and no schedule. The botnet calendar is the
+// single source of truth for what fires: the ping service ticks execcal,
+// execcal reads the calendar's fireable instances and POSTs them here as
+// /fire requests, and this service is the idempotent arbiter — it answers
+// "satisfied", "paced" or "enqueued" purely from the runs table, so a
+// repeated, late or double fire never misbehaves. Its own /tick (pinged
+// every few minutes) rescans manifests and ensures each scheduled automation
+// has a recurring calendar event to fire it (ensure-if-absent: the calendar
+// stays authoritative, user and bot edits stick).
 //
 // The service owns <Root>/automations/automations.db (sqlite) and serves its
-// API on <Root>/automations/automations.sock — single writer, exactly like
-// calendar, so callers route through the service instead of racing the DB.
-// Runs are serial across all automations: one subprocess at a time, so
-// repo-tree writes stay single-writer too.
+// API on <Root>/automations/automations.sock — single writer, so callers
+// route through the service instead of racing the DB. Runs are serial across
+// all automations: one subprocess at a time, so repo-tree writes stay
+// single-writer too.
 //
 // MVP scope is form 3 only. OPEN: forms 2/1 (cheap-driver recipes,
 // frontier-model repair) are deferred until the user settles how the service
@@ -21,8 +31,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,9 +45,6 @@ import (
 const Dir = "automations"
 
 const (
-	// DefaultInterval is the scheduler tick used when Config.Interval is zero.
-	DefaultInterval = time.Minute
-
 	// runTimeout is the hard per-run wall-clock limit; on expiry the whole
 	// process group is killed so python children die with their sh parent.
 	runTimeout = 15 * time.Minute
@@ -61,8 +70,10 @@ type Config struct {
 	// itself, and the API answers with an empty list.
 	RepoDir string
 
-	// Interval is the scheduler tick. Zero means DefaultInterval.
-	Interval time.Duration
+	// BotnetAddr is the botnet HTTP listen address (host:port)
+	// registration-ensure talks to. Empty disables registration — the
+	// service still discovers, fires and records.
+	BotnetAddr string
 
 	// Logger receives lifecycle and per-run lines. Nil means the standard
 	// logger.
@@ -72,13 +83,13 @@ type Config struct {
 // Service is the automations registry, its serial runner and its API server.
 // It implements bgservices.Service.
 type Service struct {
-	root     string
-	repoDir  string
-	interval time.Duration
-	timeout  time.Duration
-	logger   *log.Logger
-	store    *Store
-	queue    chan job
+	root       string
+	repoDir    string
+	botnetAddr string
+	timeout    time.Duration
+	logger     *log.Logger
+	store      *Store
+	queue      chan job
 
 	mu      sync.Mutex
 	autos   []Automation    // latest discovery snapshot
@@ -97,12 +108,9 @@ func New(cfg Config) (*Service, error) {
 	}
 
 	s := &Service{
-		root: root, repoDir: cfg.RepoDir, interval: cfg.Interval,
+		root: root, repoDir: cfg.RepoDir, botnetAddr: cfg.BotnetAddr,
 		timeout: runTimeout, logger: cfg.Logger,
 		queue: make(chan job, queueCap), autos: []Automation{}, pending: map[string]bool{},
-	}
-	if s.interval <= 0 {
-		s.interval = DefaultInterval
 	}
 	if s.logger == nil {
 		s.logger = log.Default()
@@ -136,9 +144,11 @@ func (s *Service) Name() string { return "automations" }
 func (s *Service) Root() string { return s.root }
 
 // Run operates the service until ctx is canceled: the API server on the unix
-// socket, the serial runner, and the scheduler loop that rediscovers manifests
-// and enqueues due attempts each tick. It refuses to start when another live
-// service already serves this root.
+// socket and the serial runner. There is no scheduler — the ping service
+// drives /tick and the calendar (via execcal) drives /fire. One startup tick
+// runs immediately so the registry and calendar registration converge at
+// boot instead of one ping interval later. Run refuses to start when another
+// live service already serves this root.
 func (s *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -154,15 +164,22 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.store.SweepInterrupted(fmtTime(time.Now())); err != nil {
 		return err
 	}
+	if s.repoDir == "" {
+		s.logger.Print("automations: no repo configured (pass -automations-repo or set $AUTOMATIONS_REPO); serving zero automations")
+	}
 
-	errCh := make(chan error, 3)
+	go func() {
+		if err := s.tick(); err != nil {
+			s.logger.Printf("automations: startup tick: %v (retried on the next ping)", err)
+		}
+	}()
+
+	errCh := make(chan error, 2)
 	go func() { errCh <- s.serve(ctx) }()
 	go func() { errCh <- s.worker(ctx) }()
-	go func() { errCh <- s.scheduleLoop(ctx) }()
 
 	err := <-errCh
 	cancel()
-	<-errCh
 	<-errCh
 	return err
 }
@@ -180,61 +197,27 @@ func (s *Service) drainQueue() {
 	}
 }
 
-// scheduleLoop rediscovers the registry and enqueues due scheduled runs, every
-// Interval until ctx ends. The first tick runs immediately.
-func (s *Service) scheduleLoop(ctx context.Context) error {
-	if s.repoDir == "" {
-		s.logger.Print("automations: no repo configured (pass -automations-repo or set $AUTOMATIONS_REPO); serving zero automations")
-	}
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-	for {
-		s.tick(time.Now())
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
-// tick is one scheduler pass: refresh the discovery snapshot, then evaluate
-// every scheduled automation's window against the runs table and enqueue an
-// attempt where one is due. All state is derived from disk, so a restart
-// between ticks changes nothing.
-func (s *Service) tick(now time.Time) {
+// tick is one maintenance pass, driven by the ping service (and once at
+// startup): refresh the discovery snapshot from the repo, then ensure every
+// scheduled automation is registered on the botnet calendar. The returned
+// error is for logging only — an unreachable botnet is retried on the next
+// tick, never fatal, and the rescan half always happens.
+func (s *Service) tick() error {
 	autos := s.discover()
 	s.mu.Lock()
 	s.autos = autos
 	s.mu.Unlock()
-
-	for _, a := range autos {
-		if a.Schedule == nil {
-			continue
-		}
-		st, err := s.scheduleState(a, now)
-		if err != nil {
-			s.logger.Printf("automations: %s: %v", a.Name, err)
-			continue
-		}
-		if !due(a.Schedule, st, now) {
-			continue
-		}
-		id, err := s.enqueue(a.Name, "schedule")
-		if err != nil {
-			continue // in flight or queued — the guard, not a failure
-		}
-		s.logger.Printf("automations: %s due (window opened %s), enqueued %s", a.Name, fmtTime(st.occ), id)
-	}
+	return s.ensureRegistered(autos)
 }
 
-// Verify is a fast, self-contained end-to-end check against throwaway dirs: a
-// fake automation manifest (with a schedule block) whose form-3 command is a
-// tiny sh script emitting a valid envelope is discovered, run manually through
-// the real runner path, and its recorded envelope round-tripped; then the
-// advanced()/freshness derivations and the schedule expander's next-occurrence
-// math (FREQ=MONTHLY;BYDAY=4TU across a DST boundary) are asserted. No
-// network, well under a second.
+// Verify is a fast, self-contained end-to-end check against throwaway dirs
+// and fakes: a fake automation manifest (with a schedule template) whose
+// form-3 command emits a valid envelope is discovered, run manually through
+// the real runner path, and its recorded envelope round-tripped; the
+// advanced() rules and the fire arbiter's verdicts (enqueued → satisfied,
+// paced) are asserted against crafted runs; and one registration-ensure pass
+// against an in-memory fake botnet must create the Automations calendar and
+// event exactly once. Loopback only, well under a second.
 func (s *Service) Verify(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -274,25 +257,50 @@ verify probe body
 		return fmt.Errorf("automations verify: %w", err)
 	}
 
+	// A fake botnet calendar: empty until POSTed to, then remembers.
+	var fakeMu sync.Mutex
+	var calendars, events []map[string]any
+	var writes int
+	fake := httptest.NewServer(newVerifyBotnet(&fakeMu, &calendars, &events, &writes))
+	defer fake.Close()
+
 	probe, err := New(Config{
 		Root: filepath.Join(tmp, "root"), RepoDir: filepath.Join(tmp, "repo"),
-		Logger: log.New(io.Discard, "", 0),
+		BotnetAddr: strings.TrimPrefix(fake.URL, "http://"),
+		Logger:     log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		return fmt.Errorf("automations verify: %w", err)
 	}
 	defer probe.store.Close()
 
-	autos := probe.discover()
+	// One tick: discovery plus registration-ensure.
+	if err := probe.tick(); err != nil {
+		return fmt.Errorf("automations verify: tick: %w", err)
+	}
+	autos := probe.autos
 	if len(autos) != 1 || autos[0].Name != "probe" || autos[0].Schedule == nil {
 		return fmt.Errorf("automations verify: discovery = %+v, want one scheduled automation named probe", autos)
 	}
-	probe.mu.Lock()
-	probe.autos = autos
-	probe.mu.Unlock()
+	fakeMu.Lock()
+	firstWrites := writes
+	fakeMu.Unlock()
+	if firstWrites != 2 {
+		return fmt.Errorf("automations verify: registration made %d writes, want 2 (calendar + event)", firstWrites)
+	}
+	// Ensure-if-absent: a second tick must write nothing.
+	if err := probe.tick(); err != nil {
+		return fmt.Errorf("automations verify: second tick: %w", err)
+	}
+	fakeMu.Lock()
+	secondWrites := writes
+	fakeMu.Unlock()
+	if secondWrites != firstWrites {
+		return fmt.Errorf("automations verify: second tick wrote %d more times; registration must be ensure-if-absent", secondWrites-firstWrites)
+	}
 
 	// One manual run through the real runner path: enqueue, execute, read back.
-	id, err := probe.enqueue("probe", "manual")
+	id, err := probe.enqueue("probe", "manual", "", "")
 	if err != nil {
 		return fmt.Errorf("automations verify: enqueue: %w", err)
 	}
@@ -327,41 +335,46 @@ verify probe body
 		return fmt.Errorf("automations verify: a newer period or a new path must advance")
 	}
 
-	// freshness derivations.
+	// Fire arbiter verdicts. The manual run above started inside this window
+	// and advanced (no baseline), so the window is already satisfied.
 	a := autos[0]
-	occ := time.Date(2026, 2, 24, 18, 5, 0, 0, time.UTC)
-	open := windowState{occ: occ, end: occ.Add(30 * time.Hour), open: true}
-	closed := windowState{occ: occ, end: occ.Add(30 * time.Hour)}
-	failedRun := &Run{Status: "failed"}
-	if got := freshness(a, open, nil); got != "pending" {
-		return fmt.Errorf("automations verify: freshness(open unsatisfied) = %q, want pending", got)
+	now := time.Now().UTC()
+	ws, we := now.Add(-time.Hour), now.Add(5*time.Hour)
+	if v, err := probe.fireVerdict(a, ws, we, now); err != nil || v != "satisfied" {
+		return fmt.Errorf("automations verify: fireVerdict after an advancing run = (%q, %v), want satisfied", v, err)
 	}
-	if got := freshness(a, closed, nil); got != "stale" {
-		return fmt.Errorf("automations verify: freshness(closed unsatisfied) = %q, want stale", got)
+	// A later window has that run as its pre-window baseline; a fresh
+	// restating attempt inside it paces, and pacing lapses after retry_every.
+	ws2, we2 := now.Add(time.Minute), now.Add(6*time.Hour)
+	later := now.Add(3 * time.Minute)
+	if err := probe.store.Insert(Run{
+		ID: newID("run_"), Automation: "probe", Trigger: "schedule",
+		Started: fmtTime(now.Add(2 * time.Minute)), Finished: fmtTime(now.Add(2 * time.Minute)),
+		Status: "ok", FormUsed: 3, Envelope: run.Envelope,
+		WindowStart: fmtTime(ws2), WindowEnd: fmtTime(we2),
+	}); err != nil {
+		return fmt.Errorf("automations verify: %w", err)
 	}
-	if got := freshness(a, windowState{occ: occ, end: occ.Add(30 * time.Hour), satisfied: true}, failedRun); got != "failed" {
-		return fmt.Errorf("automations verify: freshness(satisfied, last run failed) = %q, want failed", got)
+	if v, err := probe.fireVerdict(a, ws2, we2, later); err != nil || v != "paced" {
+		return fmt.Errorf("automations verify: fireVerdict on a fresh restating attempt = (%q, %v), want paced", v, err)
+	}
+	if v, err := probe.fireVerdict(a, ws2, we2, later.Add(3*time.Hour)); err != nil || v != "enqueued" {
+		return fmt.Errorf("automations verify: fireVerdict after retry_every lapsed = (%q, %v), want enqueued", v, err)
+	}
+
+	// Freshness derives from the recorded fire window.
+	st, err := probe.windowFromFires(a, later)
+	if err != nil {
+		return fmt.Errorf("automations verify: %w", err)
+	}
+	if !st.open || st.satisfied {
+		return fmt.Errorf("automations verify: window state = %+v, want open and unsatisfied", st)
+	}
+	if got := freshness(a, st, &run); got != "pending" {
+		return fmt.Errorf("automations verify: freshness = %q, want pending", got)
 	}
 	if got := freshness(Automation{}, windowState{}, nil); got != "unscheduled" {
 		return fmt.Errorf("automations verify: freshness(no schedule) = %q, want unscheduled", got)
-	}
-
-	// Next-occurrence math across the 2026-03-08 US DST switch: the 13:05 wall
-	// clock must hold on both sides while the UTC offset changes.
-	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
-	next, err := a.Schedule.nextOccurrence(now)
-	if err != nil {
-		return fmt.Errorf("automations verify: %w", err)
-	}
-	if want := time.Date(2026, 3, 24, 17, 5, 0, 0, time.UTC); !next.Equal(want) {
-		return fmt.Errorf("automations verify: next 4TU after %s = %s, want %s (13:05 EDT)", now, next, want)
-	}
-	prev, err := a.Schedule.latestOccurrence(now)
-	if err != nil {
-		return fmt.Errorf("automations verify: %w", err)
-	}
-	if want := time.Date(2026, 2, 24, 18, 5, 0, 0, time.UTC); !prev.Equal(want) {
-		return fmt.Errorf("automations verify: latest 4TU before %s = %s, want %s (13:05 EST)", now, prev, want)
 	}
 	return nil
 }

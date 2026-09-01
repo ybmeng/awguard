@@ -154,14 +154,14 @@ func fullRun(r Run) runJSON {
 	return out
 }
 
-// automationView is one registry row as the API serves it.
+// automationView is one registry row as the API serves it. There is no
+// nextDue: the botnet calendar owns the future.
 type automationView struct {
 	Name          string        `json:"name"`
 	Goal          string        `json:"goal"`
 	Dir           string        `json:"dir"`
 	Schedule      *scheduleJSON `json:"schedule"`
 	ScheduleError *string       `json:"scheduleError"`
-	NextDue       *string       `json:"nextDue"`
 	Freshness     string        `json:"freshness"`
 	LastRun       *runSummary   `json:"lastRun"`
 	Runs          []runSummary  `json:"runs,omitempty"` // GET /v1/automations/{name} only
@@ -187,12 +187,8 @@ func (s *Service) view(a Automation, now time.Time) automationView {
 	var st windowState
 	if a.Schedule != nil {
 		v.Schedule = a.Schedule.json()
-		st, err = s.scheduleState(a, now)
-		if err != nil {
+		if st, err = s.windowFromFires(a, now); err != nil {
 			s.logger.Printf("automations: %s: %v", a.Name, err)
-		} else if nd, err := a.Schedule.nextDue(st, now); err == nil && !nd.IsZero() {
-			str := fmtTime(nd)
-			v.NextDue = &str
 		}
 	}
 	v.Freshness = freshness(a, st, lastRun)
@@ -277,7 +273,7 @@ func (s *Service) apiMux() *http.ServeMux {
 	})
 
 	mux.HandleFunc("POST /v1/automations/{name}/run", func(w http.ResponseWriter, r *http.Request) {
-		id, err := s.enqueue(r.PathValue("name"), "manual")
+		id, err := s.enqueue(r.PathValue("name"), "manual", "", "")
 		switch {
 		case errors.Is(err, errUnknownAutomation):
 			writeErr(w, http.StatusNotFound, err)
@@ -288,6 +284,69 @@ func (s *Service) apiMux() *http.ServeMux {
 		default:
 			writeJSON(w, http.StatusAccepted, map[string]string{"runId": id})
 		}
+	})
+
+	// The firing pipeline's arbiter endpoint: execcal forwards each active
+	// calendar instance here, and the runs table alone decides whether this
+	// fire is a no-op (satisfied, paced) or becomes a run. Idempotent by
+	// construction — a repeated, late or double fire changes nothing.
+	mux.HandleFunc("POST /v1/automations/{name}/fire", func(w http.ResponseWriter, r *http.Request) {
+		a, ok := s.automation(r.PathValue("name"))
+		if !ok {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("%w: %q", errUnknownAutomation, r.PathValue("name")))
+			return
+		}
+		var body struct {
+			WindowStart string `json:"windowStart"`
+			WindowEnd   string `json:"windowEnd"`
+			EventID     string `json:"eventId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("fire body must be JSON {windowStart, windowEnd, eventId}: %v", err))
+			return
+		}
+		ws, err := time.Parse(time.RFC3339, body.WindowStart)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("windowStart %q must be RFC3339: %v", body.WindowStart, err))
+			return
+		}
+		we, err := time.Parse(time.RFC3339, body.WindowEnd)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("windowEnd %q must be RFC3339: %v", body.WindowEnd, err))
+			return
+		}
+		if !ws.Before(we) {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("windowStart %s must precede windowEnd %s", body.WindowStart, body.WindowEnd))
+			return
+		}
+		verdict, err := s.fireVerdict(a, ws, we, time.Now())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if verdict != "enqueued" {
+			writeJSON(w, http.StatusOK, map[string]string{"verdict": verdict})
+			return
+		}
+		id, err := s.enqueue(a.Name, "schedule", fmtTime(ws), fmtTime(we))
+		switch {
+		case errors.Is(err, errBusy):
+			writeErr(w, http.StatusConflict, err)
+		case err != nil:
+			writeErr(w, http.StatusInternalServerError, err)
+		default:
+			writeJSON(w, http.StatusOK, map[string]string{"verdict": "enqueued", "runId": id})
+		}
+	})
+
+	// The ping service's maintenance tick: rescan manifests and ensure the
+	// calendar registration. Botnet trouble is logged and retried on the next
+	// tick — the pipeline's clock must never see it as a failure.
+	mux.HandleFunc("POST /tick", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.tick(); err != nil {
+			s.logger.Printf("automations: tick: %v", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
 
 	mux.HandleFunc("GET /v1/runs/{id}", func(w http.ResponseWriter, r *http.Request) {

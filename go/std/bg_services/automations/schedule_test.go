@@ -19,12 +19,15 @@ func scheduleMap(rrule, at, tz string) map[string]string {
 	return map[string]string{"rrule": rrule, "at": at, "tz": tz, "retry_every": "1h", "retry_for": "6h"}
 }
 
+// The schedule block is a provisioning template (rrule/at/tz/retry_for seed
+// the calendar event) plus retry_every as fire-time pacing. Parsing validates
+// the fields it can locally; the rrule's content is validated by the botnet
+// when the event is created.
 func TestParseScheduleErrors(t *testing.T) {
 	cases := []struct {
 		field, val, want string
 	}{
 		{"rrule", "", "rrule is required"},
-		{"rrule", "FREQ=HOURLY", "not supported"},
 		{"at", "9:05", "HH:MM"},
 		{"at", "25:99", "HH:MM"},
 		{"tz", "Mars/Olympus", "unknown tz"},
@@ -40,62 +43,8 @@ func TestParseScheduleErrors(t *testing.T) {
 	}
 }
 
-// TestNextOccurrenceAcrossDST pins the fred-m2 rule: fourth Tuesday at 13:05
-// America/New_York, evaluated across the 2026-03-08 spring-forward. The wall
-// clock holds while the UTC offset moves from -05 to -04.
-func TestNextOccurrenceAcrossDST(t *testing.T) {
-	sc := mustSchedule(t, scheduleMap("FREQ=MONTHLY;BYDAY=4TU", "13:05", "America/New_York"))
-	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
-
-	prev, err := sc.latestOccurrence(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := time.Date(2026, 2, 24, 18, 5, 0, 0, time.UTC); !prev.Equal(want) {
-		t.Errorf("latestOccurrence = %s, want %s (13:05 EST)", prev, want)
-	}
-	next, err := sc.nextOccurrence(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := time.Date(2026, 3, 24, 17, 5, 0, 0, time.UTC); !next.Equal(want) {
-		t.Errorf("nextOccurrence = %s, want %s (13:05 EDT)", next, want)
-	}
-}
-
-// TestOccurrencesByMonthDayList pins the korea-trass rule: the 1st, 11th, 15th
-// and 21st at 09:05 Asia/Seoul (KST has no DST; 09:05 KST = 00:05 UTC).
-func TestOccurrencesByMonthDayList(t *testing.T) {
-	sc := mustSchedule(t, scheduleMap("FREQ=MONTHLY;BYMONTHDAY=1,11,15,21", "09:05", "Asia/Seoul"))
-	now := time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC)
-
-	prev, err := sc.latestOccurrence(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := time.Date(2026, 9, 1, 0, 5, 0, 0, time.UTC); !prev.Equal(want) {
-		t.Errorf("latestOccurrence = %s, want %s", prev, want)
-	}
-	next, err := sc.nextOccurrence(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := time.Date(2026, 9, 11, 0, 5, 0, 0, time.UTC); !next.Equal(want) {
-		t.Errorf("nextOccurrence = %s, want %s", next, want)
-	}
-
-	// An occurrence exactly at now is "latest", never "next".
-	at := time.Date(2026, 9, 11, 0, 5, 0, 0, time.UTC)
-	if prev, _ = sc.latestOccurrence(at); !prev.Equal(at) {
-		t.Errorf("latestOccurrence(at occurrence) = %s, want %s", prev, at)
-	}
-	if next, _ = sc.nextOccurrence(at); !next.Equal(time.Date(2026, 9, 15, 0, 5, 0, 0, time.UTC)) {
-		t.Errorf("nextOccurrence(at occurrence) = %s, want the 15th", next)
-	}
-}
-
-// dailySchedule is the schedule used by the window-state tests: noon UTC,
-// retry every hour, six-hour window.
+// dailySchedule is the template used by the window-state tests: retry every
+// hour inside a six-hour window.
 func dailySchedule(t *testing.T) *Schedule {
 	return mustSchedule(t, scheduleMap("FREQ=DAILY", "12:00", "UTC"))
 }
@@ -113,47 +62,80 @@ func insertFinished(t *testing.T, s *Service, name, trigger, started, status, en
 	return id
 }
 
+// insertFireRun records a finished fire-triggered run carrying its window.
+func insertFireRun(t *testing.T, s *Service, name, started, status, envelope, ws, we string) string {
+	t.Helper()
+	id := newID("run_")
+	err := s.store.Insert(Run{
+		ID: id, Automation: name, Trigger: "schedule", Started: started,
+		Finished: started, ExitCode: 0, Status: status, FormUsed: 3, Envelope: envelope,
+		WindowStart: ws, WindowEnd: we,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func envWith(newest string) string {
 	return `{"automation":"auto","status":"ok","form_used":3,"artifacts":[{"path":"data/a.csv","rows":49,"newest":"` + newest + `"}],"escalation_reason":null}`
 }
 
-// TestWindowStateAndFreshness drives the runner-semantics table: baseline,
-// advanced, satisfied, retry pacing, stale windows and freshness precedence —
-// all derived from the runs table, nothing from memory.
-func TestWindowStateAndFreshness(t *testing.T) {
+// TestWindowFromFiresAndFreshness drives the reworked freshness table: the
+// latest known window comes from fire-run rows (the calendar owns the
+// future), satisfaction and pacing state derive from the runs inside it, and
+// nothing lives in memory.
+func TestWindowFromFiresAndFreshness(t *testing.T) {
 	sc := dailySchedule(t)
 	a := Automation{Name: "auto", Schedule: sc}
-	now := time.Date(2026, 6, 15, 14, 0, 0, 0, time.UTC) // occ 12:00, window until 18:00
+	now := time.Date(2026, 6, 15, 14, 0, 0, 0, time.UTC)
+	ws, we := "2026-06-15T12:00:00Z", "2026-06-15T18:00:00Z"
 
-	t.Run("no runs: pending window, due immediately", func(t *testing.T) {
+	t.Run("no fires ever: never (the calendar owns the future)", func(t *testing.T) {
 		s := newProbe(t, "")
-		st, err := s.scheduleState(a, now)
+		st, err := s.windowFromFires(a, now)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !st.open || st.satisfied || !st.occ.Equal(time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)) {
-			t.Fatalf("state = %+v", st)
+		if !st.start.IsZero() {
+			t.Fatalf("state = %+v, want no known window", st)
 		}
-		if !due(sc, st, now) {
-			t.Error("want due with no attempts in an open window")
-		}
-		if got := freshness(a, st, nil); got != "pending" {
-			t.Errorf("freshness = %q, want pending", got)
-		}
-		if nd, _ := sc.nextDue(st, now); !nd.Equal(st.occ) {
-			t.Errorf("nextDue = %s, want the occurrence itself", nd)
+		if got := freshness(a, st, nil); got != "never" {
+			t.Errorf("freshness = %q, want never", got)
 		}
 	})
 
-	t.Run("first ok run with no baseline satisfies", func(t *testing.T) {
+	t.Run("open window, unsatisfied fire run: pending", func(t *testing.T) {
 		s := newProbe(t, "")
-		insertFinished(t, s, "auto", "schedule", "2026-06-15T13:00:00Z", "ok", envWith("2026-05"))
-		st, err := s.scheduleState(a, now)
+		// Baseline before the window; the in-window fire restated history.
+		insertFinished(t, s, "auto", "manual", "2026-06-14T13:00:00Z", "ok", envWith("2026-05"))
+		insertFireRun(t, s, "auto", "2026-06-15T12:05:00Z", "ok", envWith("2026-05"), ws, we)
+		st, err := s.windowFromFires(a, now)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !st.satisfied || due(sc, st, now) {
-			t.Fatalf("state = %+v, want satisfied and not due", st)
+		if !st.open || st.satisfied {
+			t.Fatalf("state = %+v, want open unsatisfied", st)
+		}
+		if !st.lastAttempt.Equal(time.Date(2026, 6, 15, 12, 5, 0, 0, time.UTC)) {
+			t.Errorf("lastAttempt = %s", st.lastAttempt)
+		}
+		last, _, _ := s.store.Latest("auto")
+		if got := freshness(a, st, &last); got != "pending" {
+			t.Errorf("freshness = %q, want pending", got)
+		}
+	})
+
+	t.Run("advancing fire run satisfies the window: ok", func(t *testing.T) {
+		s := newProbe(t, "")
+		insertFinished(t, s, "auto", "manual", "2026-06-14T13:00:00Z", "ok", envWith("2026-05"))
+		insertFireRun(t, s, "auto", "2026-06-15T12:05:00Z", "ok", envWith("2026-06"), ws, we)
+		st, err := s.windowFromFires(a, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !st.satisfied {
+			t.Fatalf("state = %+v, want satisfied", st)
 		}
 		last, _, _ := s.store.Latest("auto")
 		if got := freshness(a, st, &last); got != "ok" {
@@ -161,85 +143,48 @@ func TestWindowStateAndFreshness(t *testing.T) {
 		}
 	})
 
-	t.Run("restated history at constant rows does not satisfy", func(t *testing.T) {
-		s := newProbe(t, "")
-		// Baseline: an ok run before the occurrence, manual — trigger is irrelevant.
-		insertFinished(t, s, "auto", "manual", "2026-06-14T13:00:00Z", "ok", envWith("2026-05"))
-		// In-window run re-fetches the same newest period.
-		insertFinished(t, s, "auto", "schedule", "2026-06-15T12:05:00Z", "ok", envWith("2026-05"))
-		st, err := s.scheduleState(a, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if st.satisfied {
-			t.Fatal("a run that did not advance past the baseline must not satisfy")
-		}
-		// Pacing: last attempt 12:05, retry_every 1h → due again at 13:05 ≤ now.
-		if !due(sc, st, now) {
-			t.Error("want due once retry_every has elapsed")
-		}
-		if due(sc, st, time.Date(2026, 6, 15, 12, 30, 0, 0, time.UTC)) {
-			t.Error("must not be due before retry_every elapses")
-		}
-		if nd, _ := sc.nextDue(st, now); !nd.Equal(time.Date(2026, 6, 15, 13, 5, 0, 0, time.UTC)) {
-			t.Errorf("nextDue = %s, want lastAttempt+retry_every", nd)
-		}
-	})
-
-	t.Run("advancing past the baseline satisfies", func(t *testing.T) {
-		s := newProbe(t, "")
-		insertFinished(t, s, "auto", "manual", "2026-06-14T13:00:00Z", "ok", envWith("2026-05"))
-		insertFinished(t, s, "auto", "schedule", "2026-06-15T12:05:00Z", "ok", envWith("2026-06"))
-		st, err := s.scheduleState(a, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !st.satisfied || due(sc, st, now) {
-			t.Fatalf("state = %+v, want satisfied", st)
-		}
-	})
-
-	t.Run("degraded never satisfies but keeps the retry cadence", func(t *testing.T) {
-		s := newProbe(t, "")
-		degraded := strings.Replace(envWith("2026-06"), `"status":"ok"`, `"status":"degraded"`, 1)
-		insertFinished(t, s, "auto", "schedule", "2026-06-15T12:05:00Z", "degraded", degraded)
-		st, err := s.scheduleState(a, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if st.satisfied {
-			t.Fatal("degraded must not satisfy")
-		}
-		if !due(sc, st, now) {
-			t.Error("degraded does not stop the retry cadence")
-		}
-	})
-
-	t.Run("expired unsatisfied window is stale and never due", func(t *testing.T) {
+	t.Run("latest window closed unsatisfied: stale", func(t *testing.T) {
 		s := newProbe(t, "")
 		late := time.Date(2026, 6, 15, 19, 0, 0, 0, time.UTC) // window closed 18:00
-		st, err := s.scheduleState(a, late)
+		insertFireRun(t, s, "auto", "2026-06-15T12:05:00Z", "failed",
+			`{"automation":"auto","status":"failed","form_used":3,"artifacts":[],"escalation_reason":"down"}`, ws, we)
+		st, err := s.windowFromFires(a, late)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if st.open || due(sc, st, late) {
-			t.Fatalf("state = %+v, want closed and not due", st)
+		if st.open || st.satisfied {
+			t.Fatalf("state = %+v, want closed unsatisfied", st)
 		}
-		if got := freshness(a, st, nil); got != "stale" {
+		last, _, _ := s.store.Latest("auto")
+		if got := freshness(a, st, &last); got != "stale" {
 			t.Errorf("freshness = %q, want stale", got)
 		}
-		// nextDue moves to the next occurrence.
-		if nd, _ := sc.nextDue(st, late); !nd.Equal(time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)) {
-			t.Errorf("nextDue = %s, want tomorrow noon", nd)
+	})
+
+	t.Run("newer window supersedes an older one", func(t *testing.T) {
+		s := newProbe(t, "")
+		// Yesterday's window was satisfied; today's fire opened a new one.
+		insertFireRun(t, s, "auto", "2026-06-14T12:05:00Z", "ok", envWith("2026-05"),
+			"2026-06-14T12:00:00Z", "2026-06-14T18:00:00Z")
+		insertFireRun(t, s, "auto", "2026-06-15T12:05:00Z", "ok", envWith("2026-05"), ws, we)
+		st, err := s.windowFromFires(a, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !st.start.Equal(time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)) {
+			t.Errorf("window start = %s, want today's window", st.start)
+		}
+		if st.satisfied {
+			t.Error("today's restated fetch must not satisfy against yesterday's baseline")
 		}
 	})
 
 	t.Run("satisfied window with a later failed run reads failed", func(t *testing.T) {
 		s := newProbe(t, "")
-		insertFinished(t, s, "auto", "schedule", "2026-06-15T12:05:00Z", "ok", envWith("2026-06"))
+		insertFireRun(t, s, "auto", "2026-06-15T12:05:00Z", "ok", envWith("2026-06"), ws, we)
 		insertFinished(t, s, "auto", "manual", "2026-06-15T13:30:00Z", "failed",
 			`{"automation":"auto","status":"failed","form_used":3,"artifacts":[],"escalation_reason":"FRED unreachable"}`)
-		st, err := s.scheduleState(a, now)
+		st, err := s.windowFromFires(a, now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -259,20 +204,20 @@ func TestWindowStateAndFreshness(t *testing.T) {
 	})
 }
 
-// TestRestartIdempotence proves the runner derives everything from disk: a
+// TestRestartIdempotence proves the arbiter derives everything from disk: a
 // satisfied window seen through a brand-new Service on the same root stays
-// satisfied, so a restart never re-runs it.
+// satisfied.
 func TestRestartIdempotence(t *testing.T) {
 	root := t.TempDir()
-	sc := dailySchedule(t)
-	a := Automation{Name: "auto", Schedule: sc}
+	a := Automation{Name: "auto", Schedule: dailySchedule(t)}
 	now := time.Date(2026, 6, 15, 14, 0, 0, 0, time.UTC)
+	ws, we := "2026-06-15T12:00:00Z", "2026-06-15T18:00:00Z"
 
 	first, err := New(Config{Root: root, Logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	insertFinished(t, first, "auto", "schedule", "2026-06-15T12:05:00Z", "ok", envWith("2026-06"))
+	insertFireRun(t, first, "auto", "2026-06-15T12:05:00Z", "ok", envWith("2026-06"), ws, we)
 	first.store.Close()
 
 	reopened, err := New(Config{Root: root, Logger: discardLogger()})
@@ -280,11 +225,23 @@ func TestRestartIdempotence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.store.Close()
-	st, err := reopened.scheduleState(a, now)
+	st, err := reopened.windowFromFires(a, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st.satisfied || due(sc, st, now) {
-		t.Fatalf("state after reopen = %+v, want satisfied and not due", st)
+	if !st.satisfied {
+		t.Fatalf("state after reopen = %+v, want satisfied", st)
 	}
+	if v, err := reopened.fireVerdict(a, mustParse(t, ws), mustParse(t, we), now); err != nil || v != "satisfied" {
+		t.Fatalf("fireVerdict after reopen = (%q, %v), want satisfied", v, err)
+	}
+}
+
+func mustParse(t *testing.T, s string) time.Time {
+	t.Helper()
+	ts, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ts
 }

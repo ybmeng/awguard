@@ -35,6 +35,13 @@ type Run struct {
 	Envelope   string // the raw envelope JSON line, "" when none was parsed
 	StderrTail string // last 8KB of stderr
 	Error      string // service-side error text ("" on a clean envelope run)
+
+	// WindowStart/WindowEnd are the calendar window bounds of a fire-triggered
+	// run (fixed-width RFC3339 UTC), "" on manual runs. The latest recorded
+	// window IS the service's knowledge of the schedule — the calendar owns
+	// the future, so freshness derives from these rows alone.
+	WindowStart string
+	WindowEnd   string
 }
 
 // fmtTime is the storage layout for run timestamps: fixed-width RFC3339 UTC to
@@ -94,17 +101,29 @@ CREATE INDEX IF NOT EXISTS runs_automation_started ON runs(automation, started_a
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	// Guarded column adds for databases created before calendar-driven firing.
+	for _, col := range []string{"window_start", "window_end"} {
+		var n int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = ?`, col).Scan(&n); err != nil {
+			return fmt.Errorf("migrate: %w", err)
+		}
+		if n == 0 {
+			if _, err := s.db.Exec(`ALTER TABLE runs ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("migrate: add %s: %w", col, err)
+			}
+		}
+	}
 	return nil
 }
 
-const runColumns = `id, automation, "trigger", started_at, finished_at, exit_code, status, form_used, envelope, stderr_tail, error`
+const runColumns = `id, automation, "trigger", started_at, finished_at, exit_code, status, form_used, envelope, stderr_tail, error, window_start, window_end`
 
 // Insert records a freshly enqueued run. Started holds the enqueue instant as
 // a provisional value; MarkStarted overwrites it when execution begins.
 func (s *Store) Insert(r Run) error {
-	_, err := s.db.Exec(`INSERT INTO runs (`+runColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err := s.db.Exec(`INSERT INTO runs (`+runColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.Automation, r.Trigger, r.Started, r.Finished, r.ExitCode, r.Status,
-		r.FormUsed, r.Envelope, r.StderrTail, r.Error)
+		r.FormUsed, r.Envelope, r.StderrTail, r.Error, r.WindowStart, r.WindowEnd)
 	if err != nil {
 		return fmt.Errorf("insert run: %w", err)
 	}
@@ -172,10 +191,25 @@ func (s *Store) LatestOKBefore(automation, before string) (Run, bool, error) {
 	return r, err == nil, err
 }
 
-// StartedIn returns the runs started in [from, to), oldest first.
-func (s *Store) StartedIn(automation, from, to string) ([]Run, error) {
-	return s.query(`SELECT `+runColumns+` FROM runs WHERE automation = ? AND started_at >= ? AND started_at < ?
-		ORDER BY started_at, rowid`, automation, from, to)
+// StartedSince returns the runs started at or after from, oldest first.
+func (s *Store) StartedSince(automation, from string) ([]Run, error) {
+	return s.query(`SELECT `+runColumns+` FROM runs WHERE automation = ? AND started_at >= ?
+		ORDER BY started_at, rowid`, automation, from)
+}
+
+// LatestWindow returns the window bounds of the fire run with the newest
+// window start — the service's latest knowledge of the calendar's schedule.
+// ok is false when no fire run was ever recorded.
+func (s *Store) LatestWindow(automation string) (start, end string, ok bool, err error) {
+	row := s.db.QueryRow(`SELECT window_start, window_end FROM runs WHERE automation = ? AND window_start != ''
+		ORDER BY window_start DESC, rowid DESC LIMIT 1`, automation)
+	switch err := row.Scan(&start, &end); {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", "", false, nil
+	case err != nil:
+		return "", "", false, fmt.Errorf("latest window: %w", err)
+	}
+	return start, end, true, nil
 }
 
 // List returns an automation's runs, newest first, capped at limit.
@@ -204,7 +238,7 @@ func (s *Store) query(q string, args ...any) ([]Run, error) {
 func scanRun(scan func(...any) error) (Run, error) {
 	var r Run
 	err := scan(&r.ID, &r.Automation, &r.Trigger, &r.Started, &r.Finished, &r.ExitCode,
-		&r.Status, &r.FormUsed, &r.Envelope, &r.StderrTail, &r.Error)
+		&r.Status, &r.FormUsed, &r.Envelope, &r.StderrTail, &r.Error, &r.WindowStart, &r.WindowEnd)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Run{}, ErrRunNotFound
 	}

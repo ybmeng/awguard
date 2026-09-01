@@ -25,9 +25,9 @@ func shortRoot(t *testing.T) string {
 	return dir
 }
 
-func newSocketService(t *testing.T, root, repo string, interval time.Duration) *Service {
+func newSocketService(t *testing.T, root, repo string) *Service {
 	t.Helper()
-	svc, err := New(Config{Root: root, RepoDir: repo, Interval: interval, Logger: discardLogger()})
+	svc, err := New(Config{Root: root, RepoDir: repo, Logger: discardLogger()})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -119,17 +119,17 @@ func waitForRegistry(t *testing.T, c *http.Client, n int) []automationView {
 func TestServiceAPIEndToEnd(t *testing.T) {
 	repo := t.TempDir()
 	// "slow" is unscheduled and takes long enough to observe the 409;
-	// "old" carries a schedule whose window (1s) is long closed → stale, and
-	// the scheduler will never auto-run it during the test.
+	// "sched" carries a schedule template but has never been fired → never
+	// (the calendar owns the future; there is no nextDue anymore).
 	writeAutomation(t, repo, "slow", "sleep 0.2\necho '"+okEnvelope+"'", "")
-	writeAutomation(t, repo, "old", "echo '"+okEnvelope+"'", `schedule:
+	writeAutomation(t, repo, "sched", "echo '"+okEnvelope+"'", `schedule:
   rrule: "FREQ=MONTHLY;BYMONTHDAY=1,11,15,21"
   at: "09:05"
   tz: "Asia/Seoul"
   retry_every: 1h
   retry_for: 1s
 `)
-	svc := newSocketService(t, shortRoot(t), repo, 50*time.Millisecond)
+	svc := newSocketService(t, shortRoot(t), repo)
 	cancel, done := startService(t, svc)
 	c := apiClient(svc.Root())
 
@@ -138,16 +138,20 @@ func TestServiceAPIEndToEnd(t *testing.T) {
 	for _, v := range views {
 		byName[v.Name] = v
 	}
-	if v := byName["slow"]; v.Freshness != "unscheduled" || v.Schedule != nil || v.NextDue != nil || v.LastRun != nil {
+	if v := byName["slow"]; v.Freshness != "unscheduled" || v.Schedule != nil || v.LastRun != nil {
 		t.Errorf("slow = %+v, want a bare unscheduled row", v)
 	}
-	v := byName["old"]
+	v := byName["sched"]
 	if v.Schedule == nil || v.Schedule.RRULE != "FREQ=MONTHLY;BYMONTHDAY=1,11,15,21" ||
 		v.Schedule.RetryEvery != "1h" || v.Schedule.TZ != "Asia/Seoul" {
-		t.Errorf("old.schedule = %+v, want the manifest block echoed", v.Schedule)
+		t.Errorf("sched.schedule = %+v, want the manifest block echoed", v.Schedule)
 	}
-	if v.Freshness != "stale" || v.NextDue == nil {
-		t.Errorf("old = freshness %q nextDue %v, want stale with a nextDue", v.Freshness, v.NextDue)
+	if v.Freshness != "never" {
+		t.Errorf("sched = freshness %q, want never (no fire has ever opened a window)", v.Freshness)
+	}
+	// nextDue is gone from the API: the calendar owns the future.
+	if raw := rawList(t, c); strings.Contains(raw, "nextDue") {
+		t.Errorf("list body still carries nextDue: %s", raw)
 	}
 
 	// Manual trigger: 202 with a run id, 409 while in flight, 404 unknown.
@@ -229,9 +233,21 @@ func TestServiceAPIEndToEnd(t *testing.T) {
 	}
 }
 
+// rawList returns the raw /v1/automations body.
+func rawList(t *testing.T, c *http.Client) string {
+	t.Helper()
+	resp, err := c.Get("http://automations/v1/automations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return string(raw)
+}
+
 // TestListNeverNull: an empty registry answers [] — never null.
 func TestListNeverNull(t *testing.T) {
-	svc := newSocketService(t, shortRoot(t), "", DefaultInterval)
+	svc := newSocketService(t, shortRoot(t), "")
 	cancel, _ := startService(t, svc)
 	defer cancel()
 	c := apiClient(svc.Root())
@@ -247,59 +263,13 @@ func TestListNeverNull(t *testing.T) {
 	}
 }
 
-// TestSchedulerAutoRuns: an automation whose window is open gets exactly one
-// scheduled run — satisfied stops the cadence, derived purely from disk.
-func TestSchedulerAutoRuns(t *testing.T) {
-	repo := t.TempDir()
-	at := time.Now().UTC().Add(-2 * time.Minute).Format("15:04")
-	writeAutomation(t, repo, "fresh", "echo '"+okEnvelope+"'", `schedule:
-  rrule: "FREQ=DAILY"
-  at: "`+at+`"
-  tz: "UTC"
-  retry_every: 1h
-  retry_for: 23h
-`)
-	svc := newSocketService(t, shortRoot(t), repo, 50*time.Millisecond)
-	cancel, _ := startService(t, svc)
-	defer cancel()
-	c := apiClient(svc.Root())
-
-	var runs []runSummary
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		doJSON(t, c, http.MethodGet, "/v1/automations/fresh/runs", &runs)
-		if len(runs) == 1 && runs[0].Finished != "" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("scheduled run never completed: %+v", runs)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if runs[0].Trigger != "schedule" || runs[0].Status != "ok" {
-		t.Fatalf("auto run = %+v", runs[0])
-	}
-
-	// Several ticks later the satisfied window must not have re-run.
-	time.Sleep(200 * time.Millisecond)
-	doJSON(t, c, http.MethodGet, "/v1/automations/fresh/runs", &runs)
-	if len(runs) != 1 {
-		t.Fatalf("satisfied window re-ran: %d runs", len(runs))
-	}
-	var view automationView
-	doJSON(t, c, http.MethodGet, "/v1/automations/fresh", &view)
-	if view.Freshness != "ok" {
-		t.Errorf("freshness after satisfied run = %q, want ok", view.Freshness)
-	}
-}
-
 func TestSecondServiceRefusesBusyRoot(t *testing.T) {
 	root := shortRoot(t)
-	svc1 := newSocketService(t, root, "", DefaultInterval)
+	svc1 := newSocketService(t, root, "")
 	cancel, _ := startService(t, svc1)
 	defer cancel()
 
-	svc2 := newSocketService(t, root, "", DefaultInterval)
+	svc2 := newSocketService(t, root, "")
 	ctx, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel2()
 	if err := svc2.Run(ctx); err == nil || !strings.Contains(err.Error(), "already serving") {

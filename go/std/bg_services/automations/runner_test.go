@@ -2,6 +2,7 @@ package automations
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -16,7 +17,7 @@ import (
 // real runner path, returning the recorded row.
 func runOnce(t *testing.T, s *Service, name string) Run {
 	t.Helper()
-	id, err := s.enqueue(name, "manual")
+	id, err := s.enqueue(name, "manual", "", "")
 	if err != nil {
 		t.Fatalf("enqueue %s: %v", name, err)
 	}
@@ -120,17 +121,17 @@ func TestEnqueueGuards(t *testing.T) {
 	s := newProbe(t, repo)
 	discoverInto(t, s)
 
-	if _, err := s.enqueue("nope", "manual"); !errors.Is(err, errUnknownAutomation) {
+	if _, err := s.enqueue("nope", "manual", "", ""); !errors.Is(err, errUnknownAutomation) {
 		t.Errorf("unknown enqueue = %v, want errUnknownAutomation", err)
 	}
-	if _, err := s.enqueue("one", "manual"); err != nil {
+	if _, err := s.enqueue("one", "manual", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue("one", "manual"); !errors.Is(err, errBusy) {
+	if _, err := s.enqueue("one", "manual", "", ""); !errors.Is(err, errBusy) {
 		t.Errorf("second enqueue = %v, want errBusy", err)
 	}
 	s.execute(context.Background(), <-s.queue)
-	if _, err := s.enqueue("one", "manual"); err != nil {
+	if _, err := s.enqueue("one", "manual", "", ""); err != nil {
 		t.Errorf("enqueue after completion = %v, want accepted again", err)
 	}
 }
@@ -154,11 +155,11 @@ func TestSerialExecution(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.worker(ctx) }()
 
-	idL, err := s.enqueue("left", "manual")
+	idL, err := s.enqueue("left", "manual", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	idR, err := s.enqueue("right", "manual")
+	idR, err := s.enqueue("right", "manual", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,5 +223,57 @@ func TestStoreSweepAndOrdering(t *testing.T) {
 
 	if _, err := s.store.Get("run_00000000000000000000000000"); !errors.Is(err, ErrRunNotFound) {
 		t.Errorf("Get missing = %v, want ErrRunNotFound", err)
+	}
+}
+
+// TestStoreMigratesWindowColumns: a pre-firing database (no window columns)
+// opens cleanly, its rows read back with empty windows, and new fire runs
+// record theirs.
+func TestStoreMigratesWindowColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const preFiring = `
+CREATE TABLE runs (
+    id          TEXT PRIMARY KEY,
+    automation  TEXT NOT NULL,
+    "trigger"   TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT NOT NULL DEFAULT '',
+    exit_code   INTEGER NOT NULL DEFAULT -1,
+    status      TEXT NOT NULL,
+    form_used   INTEGER NOT NULL DEFAULT 0,
+    envelope    TEXT NOT NULL DEFAULT '',
+    stderr_tail TEXT NOT NULL DEFAULT '',
+    error       TEXT NOT NULL DEFAULT ''
+);`
+	if _, err := old.Exec(preFiring); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`INSERT INTO runs (id, automation, "trigger", started_at, status)
+		VALUES ('run_OLD', 'auto', 'manual', '2026-06-01T00:00:00Z', 'ok')`); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("OpenStore over a pre-firing db: %v", err)
+	}
+	defer s.Close()
+	r, err := s.Get("run_OLD")
+	if err != nil || r.WindowStart != "" || r.WindowEnd != "" {
+		t.Fatalf("old row = %+v (%v), want readable with empty window", r, err)
+	}
+	fire := Run{ID: "run_NEW", Automation: "auto", Trigger: "schedule", Started: "2026-06-15T12:05:00Z",
+		Status: "ok", WindowStart: "2026-06-15T12:00:00Z", WindowEnd: "2026-06-15T18:00:00Z"}
+	if err := s.Insert(fire); err != nil {
+		t.Fatal(err)
+	}
+	ws, we, ok, err := s.LatestWindow("auto")
+	if err != nil || !ok || ws != fire.WindowStart || we != fire.WindowEnd {
+		t.Fatalf("LatestWindow = (%q, %q, %v, %v), want the fire run's window", ws, we, ok, err)
 	}
 }

@@ -2,46 +2,58 @@ package automations
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
-// windowState is everything the scheduler and the API derive from the runs
-// table for one scheduled automation at one instant. Nothing here lives in
-// memory between ticks — it is recomputed from disk every time, which is what
-// makes the runner idempotent across restarts.
+// windowState is everything the fire arbiter and the API derive from the
+// runs table for one automation at one instant. The calendar owns the future:
+// the latest known window comes from recorded fire runs, and nothing here
+// lives in memory between requests — it is recomputed from disk every time,
+// which is what makes firing idempotent across restarts, repeats and
+// double-fires.
 type windowState struct {
-	occ         time.Time // latest schedule occurrence ≤ now; zero when none yet
-	end         time.Time // occ + retry_for (the window's exclusive end)
-	open        bool      // now ∈ [occ, end)
-	satisfied   bool      // some run started in the window: status ok AND advanced(baseline)
-	lastAttempt time.Time // start of the latest run started in the window; zero when none
+	start       time.Time // latest recorded fire window's start; zero when none yet
+	end         time.Time // that window's exclusive end
+	open        bool      // now < end
+	satisfied   bool      // some run started ≥ start: status ok AND advanced(baseline)
+	lastAttempt time.Time // start of the latest run started ≥ start; zero when none
 }
 
-// scheduleState evaluates a's current window against the runs table. a must
-// carry a valid Schedule.
-func (s *Service) scheduleState(a Automation, now time.Time) (windowState, error) {
+// windowFromFires evaluates a's latest known fire window against the runs
+// table.
+func (s *Service) windowFromFires(a Automation, now time.Time) (windowState, error) {
 	var st windowState
-	occ, err := a.Schedule.latestOccurrence(now)
-	if err != nil {
+	ws, we, ok, err := s.store.LatestWindow(a.Name)
+	if err != nil || !ok {
 		return st, err
 	}
-	if occ.IsZero() {
-		return st, nil
+	if st.start, err = time.Parse(time.RFC3339, ws); err != nil {
+		return st, fmt.Errorf("recorded window start %q: %w", ws, err)
 	}
-	st.occ, st.end = occ, occ.Add(a.Schedule.RetryFor)
+	if st.end, err = time.Parse(time.RFC3339, we); err != nil {
+		return st, fmt.Errorf("recorded window end %q: %w", we, err)
+	}
 	st.open = now.Before(st.end)
+	st.satisfied, st.lastAttempt, err = s.windowRuns(a.Name, st.start)
+	return st, err
+}
 
-	baseline, err := s.baseline(a.Name, occ)
+// windowRuns scans the runs started at or after windowStart: whether one of
+// them satisfied the window (envelope ok and advanced past the pre-window
+// baseline) and when the latest attempt started.
+func (s *Service) windowRuns(name string, windowStart time.Time) (satisfied bool, lastAttempt time.Time, err error) {
+	baseline, err := s.baseline(name, windowStart)
 	if err != nil {
-		return st, err
+		return false, time.Time{}, err
 	}
-	runs, err := s.store.StartedIn(a.Name, fmtTime(occ), fmtTime(st.end))
+	runs, err := s.store.StartedSince(name, fmtTime(windowStart))
 	if err != nil {
-		return st, err
+		return false, time.Time{}, err
 	}
 	for _, r := range runs {
-		if t, err := time.Parse(time.RFC3339, r.Started); err == nil && t.After(st.lastAttempt) {
-			st.lastAttempt = t
+		if t, err := time.Parse(time.RFC3339, r.Started); err == nil && t.After(lastAttempt) {
+			lastAttempt = t
 		}
 		if r.Status != "ok" {
 			continue
@@ -51,16 +63,17 @@ func (s *Service) scheduleState(a Automation, now time.Time) (windowState, error
 			continue
 		}
 		if advanced(env, baseline) {
-			st.satisfied = true
+			satisfied = true
 		}
 	}
-	return st, nil
+	return satisfied, lastAttempt, nil
 }
 
 // baseline returns the envelope of the latest run with envelope status ok
-// (manual or scheduled) that started before occ, or nil when there is none.
-func (s *Service) baseline(name string, occ time.Time) (*Envelope, error) {
-	r, ok, err := s.store.LatestOKBefore(name, fmtTime(occ))
+// (manual or scheduled) that started before the window opened, or nil when
+// there is none.
+func (s *Service) baseline(name string, windowStart time.Time) (*Envelope, error) {
+	r, ok, err := s.store.LatestOKBefore(name, fmtTime(windowStart))
 	if err != nil || !ok {
 		return nil, err
 	}
@@ -71,31 +84,25 @@ func (s *Service) baseline(name string, occ time.Time) (*Envelope, error) {
 	return &env, nil
 }
 
-// due reports whether the scheduler should start an attempt now: the window is
-// open and unsatisfied, and either no attempt has started in it or the last
-// one started at least retry_every ago. The in-flight guard is the enqueue
-// path's pending set, not this function.
-func due(sc *Schedule, st windowState, now time.Time) bool {
-	if !st.open || st.satisfied {
-		return false
+// fireVerdict is the idempotent arbiter's decision for one fire of the window
+// [ws, we): "satisfied" when an ok+advanced run already landed since ws,
+// "paced" when the latest in-window attempt is younger than the template's
+// retry_every, "enqueued" otherwise (the caller then actually enqueues). An
+// automation without a schedule template has no retry_every and is never
+// paced — satisfaction alone guards its re-runs.
+func (s *Service) fireVerdict(a Automation, ws, we, now time.Time) (string, error) {
+	satisfied, lastAttempt, err := s.windowRuns(a.Name, ws)
+	if err != nil {
+		return "", err
 	}
-	if st.lastAttempt.IsZero() {
-		return true
+	switch {
+	case satisfied:
+		return "satisfied", nil
+	case a.Schedule != nil && !lastAttempt.IsZero() && now.Sub(lastAttempt) < a.Schedule.RetryEvery:
+		return "paced", nil
+	default:
+		return "enqueued", nil
 	}
-	return now.Sub(st.lastAttempt) >= sc.RetryEvery
-}
-
-// nextDue is when the next automatic attempt could start: inside an open
-// unsatisfied window it is the next retry (which may be in the past — due
-// now); otherwise the next schedule occurrence.
-func (sc *Schedule) nextDue(st windowState, now time.Time) (time.Time, error) {
-	if st.open && !st.satisfied {
-		if st.lastAttempt.IsZero() {
-			return st.occ, nil
-		}
-		return st.lastAttempt.Add(sc.RetryEvery), nil
-	}
-	return sc.nextOccurrence(now)
 }
 
 // freshness classifies one automation for the API.
@@ -104,12 +111,12 @@ func freshness(a Automation, st windowState, lastRun *Run) string {
 	switch {
 	case a.Schedule == nil:
 		return "unscheduled"
-	case st.occ.IsZero() && lastRun == nil:
-		return "never" // scheduled, no runs yet, first window not yet opened
+	case st.start.IsZero() && lastRun == nil:
+		return "never" // scheduled, but no fire has ever opened a window and nothing ran
 	case st.open && !st.satisfied:
 		return "pending"
-	case !st.occ.IsZero() && !st.open && !st.satisfied:
-		return "stale" // latest closed window ended unsatisfied
+	case !st.start.IsZero() && !st.open && !st.satisfied:
+		return "stale" // latest known window closed unsatisfied
 	case lastRun != nil && (lastRun.Status == "failed" || lastRun.Status == StatusError):
 		return "failed"
 	default:

@@ -41,7 +41,8 @@ import (
 	"stdtools/go/std/bg_services/artifacts"
 	"stdtools/go/std/bg_services/automations"
 	"stdtools/go/std/bg_services/botnetsvc"
-	"stdtools/go/std/bg_services/calendar"
+	"stdtools/go/std/bg_services/execcal"
+	"stdtools/go/std/bg_services/ping"
 	"stdtools/go/std/drive"
 )
 
@@ -64,7 +65,8 @@ Commands:
   status                       show launchd state for the service
 
 Botnet flags (run, install):
-  -botnet-addr A               botnet listen address (default $BOTNET_ADDR, else 127.0.0.1:8730)
+  -botnet-addr A               botnet listen address (default $BOTNET_ADDR, else 127.0.0.1:8730);
+                               execcal and the automations calendar registration talk to it too
   -botnet-db F                 botnet SQLite file (default $BOTNET_DB, else ~/.botnet/net.db)
 
 Automations flags (run, install):
@@ -73,7 +75,10 @@ Automations flags (run, install):
 	os.Exit(2)
 }
 
-// services builds the full roster of std background services.
+// services builds the full roster of std background services. The firing
+// pipeline is wired here: ping (the only clock) ticks execcal every minute
+// and the automations service every five; execcal bridges the botnet
+// calendar's fireable instances to automations /fire.
 func services(root string, interval time.Duration, syncer artifacts.Syncer, bot botnetsvc.Config, automationsRepo string) ([]bgservices.Service, error) {
 	art, err := artifacts.New(artifacts.Config{Root: root, Interval: interval, Syncer: syncer})
 	if err != nil {
@@ -83,17 +88,25 @@ func services(root string, interval time.Duration, syncer artifacts.Syncer, bot 
 	if err != nil {
 		return nil, err
 	}
-	cal, err := calendar.New(calendar.Config{Root: root, Interval: interval})
+	auto, err := automations.New(automations.Config{Root: root, RepoDir: automationsRepo, BotnetAddr: bot.Addr})
 	if err != nil {
 		return nil, err
 	}
-	// The automations scheduler ticks at its own default (1m); stdd's
-	// -interval is the artifacts poll interval and is not forwarded.
-	auto, err := automations.New(automations.Config{Root: root, RepoDir: automationsRepo})
+	exec, err := execcal.New(execcal.Config{
+		Root: root, BotnetAddr: bot.Addr,
+		AutomationsSocket: automations.SocketPath(root),
+	})
 	if err != nil {
 		return nil, err
 	}
-	return []bgservices.Service{art, botSvc, cal, auto}, nil
+	pinger, err := ping.New(ping.Config{Root: root, Targets: []ping.Target{
+		{Name: "execcal-tick", URL: "unix://" + execcal.SocketPath(root) + "/tick", Interval: time.Minute},
+		{Name: "automations-tick", URL: "unix://" + automations.SocketPath(root) + "/tick", Interval: 5 * time.Minute},
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return []bgservices.Service{art, botSvc, auto, exec, pinger}, nil
 }
 
 // loadSyncer builds the Google Drive syncer from the persisted auth config,

@@ -34,10 +34,12 @@ type job struct {
 	a  Automation
 }
 
-// enqueue records a queued run and hands it to the serial runner. It returns
-// errUnknownAutomation for a name not in the current registry and errBusy when
-// that automation already has a run in flight or queued.
-func (s *Service) enqueue(name, trigger string) (string, error) {
+// enqueue records a queued run and hands it to the serial runner. Fire-
+// triggered runs pass their window bounds (fixed-width RFC3339 UTC); manual
+// runs pass "". It returns errUnknownAutomation for a name not in the current
+// registry and errBusy when that automation already has a run in flight or
+// queued.
+func (s *Service) enqueue(name, trigger, windowStart, windowEnd string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var a Automation
@@ -59,6 +61,7 @@ func (s *Service) enqueue(name, trigger string) (string, error) {
 		ID: id, Automation: name, Trigger: trigger,
 		Started: fmtTime(time.Now()), // provisional; MarkStarted overwrites
 		Status:  StatusQueued, ExitCode: -1,
+		WindowStart: windowStart, WindowEnd: windowEnd,
 	}
 	if err := s.store.Insert(run); err != nil {
 		return "", err

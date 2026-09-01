@@ -73,11 +73,11 @@ forms:
 verify: <offline test command>
 cadence: <when to run / when new data lands — prose for humans>
 schedule:
-  rrule: "FREQ=MONTHLY;BYDAY=4TU"   # runner-service RRULE subset (the std calendar expander)
+  rrule: "FREQ=MONTHLY;BYDAY=4TU"   # botnet-calendar RRULE subset (RFC 5545 slice)
   at: "13:05"                        # wall-clock HH:MM in tz
   tz: "America/New_York"             # IANA id
-  retry_every: 2h                    # Go duration between attempts inside a window
-  retry_for: 30h                     # window length from each occurrence
+  retry_every: 2h                    # fire-time pacing: Go duration between attempts in a window
+  retry_for: 30h                     # window length — becomes the calendar event's duration
 human_gates: <steps permanently capped at form 2, or none>
 ---
 <current state, placeholders, anything a driver should know before invoking>
@@ -89,13 +89,19 @@ human_gates: <steps permanently capped at form 2, or none>
 <one subsection per artifact>
 ```
 
-`schedule:` is the machine-readable twin of the `cadence:` prose. The runner service invokes
-form 3 on it: each occurrence (rrule + at, anchored in tz) opens a window `retry_for` long, and
-the service attempts form 3 every `retry_every` inside it until a run's envelope both says `ok`
-and advances past the pre-window baseline (a new artifact path, or a newer `newest` at a known
-path — `rows` is deliberately ignored, since sources restate history at constant row counts).
-No `schedule:` block means the automation is registered, listed, and manually runnable, but
-never auto-run.
+`schedule:` is the machine-readable twin of the `cadence:` prose, and it is a **provisioning
+template, not the schedule itself**. The botnet calendar is the single source of truth for what
+fires: the automations service's registration-ensure reads the template once and, only if no
+calendar event anywhere names this automation, creates one recurring event on the executable
+"Automations" calendar (rrule + at + tz seed the recurrence, `retry_for` becomes the event
+duration — the retry window). From then on the calendar is authoritative — moving, editing, or
+deleting that event (by the user or a bot) changes when the automation fires, and the template
+never overwrites those edits. `retry_every` is the one fire-time field: while an event instance
+is active, fires are paced to one attempt per `retry_every` until a run's envelope both says
+`ok` and advances past the pre-window baseline (a new artifact path, or a newer `newest` at a
+known path — `rows` is deliberately ignored, since sources restate history at constant row
+counts). No `schedule:` block means the automation is registered, listed, and manually runnable,
+but never auto-registered on the calendar; an event naming it by hand still fires it.
 
 The Reporting section makes the envelope contract concrete for this automation: where the envelope
 lands, which statuses this automation can actually emit and what each means here (which artifacts
@@ -150,10 +156,12 @@ newer period" without opening the CSV. Completion checks match on the envelope, 
    and commits. Repair, then re-demote.
 
 The std automations service (`go/std/bg_services/automations`, hosted by stdd with
-`-automations-repo`) registers automations by manifest and invokes form 3 on the manifest
-`schedule:` today, recording every run's envelope — `needs_human` and `escalation_reason`
-included. Routing envelopes up the 3→2→1 chain is still done by hand; every automation is
-written as if the full chain service already exists.
+`-automations-repo`) registers automations by manifest and runs form 3 when the botnet calendar
+fires it: ping ticks execcal, execcal reads the calendar's active executable instances, and each
+fire lands on the automations service, which answers satisfied/paced/enqueued purely from the
+runs table. Every run's envelope is recorded — `needs_human` and `escalation_reason` included.
+Routing envelopes up the 3→2→1 chain is still done by hand; every automation is written as if
+the full chain service already exists.
 
 ## Reuse before discovery
 
