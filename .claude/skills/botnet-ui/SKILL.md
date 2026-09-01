@@ -206,6 +206,15 @@ From `swift/botnet/`:
   ok): scheduled manifest + ok manual run → "ok"; scheduled + failed run →
   "failed"; a scheduleError manifest → schedule nil → "unscheduled" even
   with an error run; scheduled + no runs → "never".
+- A view state gated on THIS machine (a FileManager.fileExists check, like
+  the artifact open-in-Cursor links) cannot be proven against a seeded demo —
+  the demo DB's paths don't exist, so the affordance silently renders as its
+  degraded form and the PNG passes review while showing nothing. Point the
+  snapshot at the live daemon instead (`BOTNET_API=http://127.0.0.1:8730`,
+  READ-ONLY panes only — every fetch behind the rendered pane must be a GET,
+  same discipline as decode-check's live probes), where the machine-state is
+  actually true. Choose the snapshot backend by where the state you're
+  proving lives, not by habit.
 - Snapshot must not write UserDefaults to pose @AppStorage state (defaults
   litter, cross-run pollution): give the view an override init param
   (`collapsedOverride`) that wins over the stored value, nil in the app.
