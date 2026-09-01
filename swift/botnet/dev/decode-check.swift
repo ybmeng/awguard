@@ -362,6 +362,191 @@ struct DecodeCheck {
             }
         }
 
+        // Automations (bridged through botnet from the stdd automations
+        // service). The list row: schedule present with its raw duration
+        // strings, scheduleError null, a lastRun summary, and the absolute
+        // `path` the bridge adds for Open in Cursor.
+        let automationRow = Data("""
+        {"name":"fred-fixture","goal":"Monthly M2 fetch","dir":"fred-fixture","path":"/tmp/auto-repo/fred-fixture","schedule":{"rrule":"FREQ=MONTHLY;BYDAY=4TU","at":"13:05","tz":"America/New_York","retryEvery":"2h","retryFor":"30h"},"scheduleError":null,"freshness":"ok","lastRun":{"id":"run_01M9RUNAAAAAAAAAAAAAAAAAA1","automation":"fred-fixture","trigger":"schedule","started":"2026-08-25T17:05:02Z","finished":"2026-08-25T17:05:41Z","exitCode":0,"status":"ok","formUsed":3,"escalationReason":null}}
+        """.utf8)
+        await check("Automation decodes: schedule present, lastRun summary, path") {
+            let a = try decoder.decode(Automation.self, from: automationRow)
+            guard a.name == "fred-fixture", a.goal == "Monthly M2 fetch",
+                  a.path == "/tmp/auto-repo/fred-fixture",
+                  a.schedule?.rrule == "FREQ=MONTHLY;BYDAY=4TU",
+                  a.schedule?.at == "13:05", a.schedule?.tz == "America/New_York",
+                  a.schedule?.retryEvery == "2h", a.schedule?.retryFor == "30h",
+                  a.scheduleError == nil, a.freshness == "ok",
+                  a.lastRun?.trigger == "schedule", a.lastRun?.exitCode == 0,
+                  a.lastRun?.formUsed == 3, a.lastRun?.escalationReason == nil,
+                  a.runs == nil
+            else {
+                throw NSError(domain: "decode-check", code: 23, userInfo: [
+                    NSLocalizedDescriptionKey: "automation row decoded wrong: \(a)",
+                ])
+            }
+        }
+
+        // Unscheduled: schedule null, lastRun null, and no path key (a service
+        // that predates the bridge's path field) — nil, never a real value.
+        let unscheduledRow = Data("""
+        {"name":"plain-fixture","goal":"","dir":"nested/plain-fixture","schedule":null,"scheduleError":null,"freshness":"unscheduled","lastRun":null}
+        """.utf8)
+        await check("Automation decodes: schedule/lastRun null, path absent") {
+            let a = try decoder.decode(Automation.self, from: unscheduledRow)
+            guard a.schedule == nil, a.lastRun == nil, a.path == nil,
+                  a.freshness == "unscheduled", a.scheduleError == nil
+            else {
+                throw NSError(domain: "decode-check", code: 24, userInfo: [
+                    NSLocalizedDescriptionKey: "unscheduled row decoded wrong: \(a)",
+                ])
+            }
+        }
+
+        // A manifest whose schedule block failed to parse: scheduleError set,
+        // treated as unscheduled server-side.
+        let brokenSchedRow = Data("""
+        {"name":"broken-sched","goal":"g","dir":"broken-sched","schedule":null,"scheduleError":"schedule: at \\"25:99\\" must be wall-clock HH:MM (e.g. \\"13:05\\")","freshness":"unscheduled","lastRun":null}
+        """.utf8)
+        await check("Automation.scheduleError decodes when set") {
+            let a = try decoder.decode(Automation.self, from: brokenSchedRow)
+            guard a.scheduleError?.contains("25:99") == true else {
+                throw NSError(domain: "decode-check", code: 25, userInfo: [
+                    NSLocalizedDescriptionKey: "scheduleError decoded wrong: \(a)",
+                ])
+            }
+        }
+
+        // Every freshness value the service emits must decode and map to a
+        // color; an unknown future value must fall back quietly, not crash.
+        await check("every freshness value decodes") {
+            for f in ["ok", "pending", "stale", "failed", "never", "unscheduled", "future-value"] {
+                let row = Data("""
+                {"name":"x","goal":"","dir":"x","schedule":null,"scheduleError":null,"freshness":"\(f)","lastRun":null}
+                """.utf8)
+                let a = try decoder.decode(Automation.self, from: row)
+                guard a.freshness == f else {
+                    throw NSError(domain: "decode-check", code: 26, userInfo: [
+                        NSLocalizedDescriptionKey: "freshness \(f) decoded as \(a.freshness)",
+                    ])
+                }
+            }
+        }
+
+        // The detail row is the list row plus runs (newest first). A running
+        // run has finished:"" — that is a string on the wire, never a Date, so
+        // an in-flight run must decode and read as unfinished.
+        let automationDetail = Data("""
+        {"name":"fred-fixture","goal":"Monthly M2 fetch","dir":"fred-fixture","path":"/tmp/auto-repo/fred-fixture","schedule":{"rrule":"FREQ=MONTHLY;BYDAY=4TU","at":"13:05","tz":"America/New_York","retryEvery":"2h","retryFor":"30h"},"scheduleError":null,"freshness":"pending","lastRun":{"id":"run_01M9RUNAAAAAAAAAAAAAAAAAA2","automation":"fred-fixture","trigger":"manual","started":"2026-09-01T09:00:00Z","finished":"","exitCode":-1,"status":"running","formUsed":0,"escalationReason":null},"runs":[{"id":"run_01M9RUNAAAAAAAAAAAAAAAAAA2","automation":"fred-fixture","trigger":"manual","started":"2026-09-01T09:00:00Z","finished":"","exitCode":-1,"status":"running","formUsed":0,"escalationReason":null},{"id":"run_01M9RUNAAAAAAAAAAAAAAAAAA1","automation":"fred-fixture","trigger":"schedule","started":"2026-08-25T17:05:02Z","finished":"2026-08-25T17:05:41Z","exitCode":1,"status":"failed","formUsed":3,"escalationReason":"source paywalled"}]}
+        """.utf8)
+        await check("Automation detail: runs list, running vs finished, escalationReason") {
+            let a = try decoder.decode(Automation.self, from: automationDetail)
+            guard let runs = a.runs, runs.count == 2,
+                  runs[0].status == "running", !runs[0].isFinished,
+                  runs[0].finishedAt == nil, runs[0].startedAt != nil,
+                  runs[1].isFinished, runs[1].escalationReason == "source paywalled",
+                  runs[1].exitCode == 1,
+                  let dur = runs[1].duration, Int(dur) == 39
+            else {
+                throw NSError(domain: "decode-check", code: 27, userInfo: [
+                    NSLocalizedDescriptionKey: "detail runs decoded wrong: \(String(describing: a.runs))",
+                ])
+            }
+        }
+
+        // A FRESH automation's detail row: zero runs means the wire omits the
+        // `runs` key entirely (Go's omitempty), same as lastRun null. The
+        // decode must not throw, and absent must stay nil — the Store's
+        // detail load is what normalizes it to [] (absence provably means
+        // "no runs yet" only there; on a list row it means "not a detail").
+        let freshDetail = Data("""
+        {"name":"fresh-fixture","goal":"g","dir":"fresh-fixture","path":"/tmp/auto-repo/fresh-fixture","schedule":{"rrule":"FREQ=DAILY","at":"07:00","tz":"America/New_York","retryEvery":"1h","retryFor":"6h"},"scheduleError":null,"freshness":"never","lastRun":null}
+        """.utf8)
+        await check("fresh detail: absent runs key decodes (nil), lastRun null") {
+            let a = try decoder.decode(Automation.self, from: freshDetail)
+            guard a.runs == nil, a.lastRun == nil, a.freshness == "never" else {
+                throw NSError(domain: "decode-check", code: 33, userInfo: [
+                    NSLocalizedDescriptionKey: "fresh detail decoded wrong: \(a)",
+                ])
+            }
+        }
+
+        // GET /v1/runs/{id}: the summary flattened with envelope, stderrTail,
+        // error. Envelope present decodes into artifacts the table renders.
+        let fullRunOK = Data("""
+        {"id":"run_01M9RUNAAAAAAAAAAAAAAAAAA1","automation":"fred-fixture","trigger":"schedule","started":"2026-08-25T17:05:02Z","finished":"2026-08-25T17:05:41Z","exitCode":0,"status":"ok","formUsed":3,"escalationReason":null,"envelope":{"automation":"fred-fixture","status":"ok","form_used":3,"artifacts":[{"path":"data/m2.csv","rows":312,"newest":"2026-08-29"}],"escalation_reason":null},"stderrTail":"","error":""}
+        """.utf8)
+        await check("RunDetail decodes: envelope artifacts, empty stderr/error") {
+            let r = try decoder.decode(RunDetail.self, from: fullRunOK)
+            guard r.summary.id == "run_01M9RUNAAAAAAAAAAAAAAAAAA1",
+                  r.summary.status == "ok",
+                  let env = r.envelope, env.artifacts.count == 1,
+                  env.artifacts[0].path == "data/m2.csv",
+                  env.artifacts[0].rows == 312,
+                  env.artifacts[0].newest == "2026-08-29",
+                  env.status == "ok", env.formUsed == 3,
+                  r.stderrTail.isEmpty, r.error.isEmpty
+            else {
+                throw NSError(domain: "decode-check", code: 28, userInfo: [
+                    NSLocalizedDescriptionKey: "full run decoded wrong: \(r)",
+                ])
+            }
+        }
+
+        // A no-envelope run (timeout, bad driver): envelope null, service-side
+        // error and stderr tail carry the diagnosis.
+        let fullRunError = Data("""
+        {"id":"run_01M9RUNAAAAAAAAAAAAAAAAAA3","automation":"broken-sched","trigger":"manual","started":"2026-09-01T08:00:00Z","finished":"2026-09-01T08:00:01Z","exitCode":1,"status":"error","formUsed":0,"escalationReason":null,"envelope":null,"stderrTail":"boom: no such source\\n","error":"no envelope: stdout is empty (the driver must emit the result envelope as its last stdout line)"}
+        """.utf8)
+        await check("RunDetail decodes: envelope null, error + stderrTail set") {
+            let r = try decoder.decode(RunDetail.self, from: fullRunError)
+            guard r.envelope == nil, r.error.contains("no envelope"),
+                  r.stderrTail.contains("boom") else {
+                throw NSError(domain: "decode-check", code: 29, userInfo: [
+                    NSLocalizedDescriptionKey: "error run decoded wrong: \(r)",
+                ])
+            }
+        }
+
+        // An envelope of an unknown future shape must degrade to nil, never
+        // fail the whole RunDetail decode — the contract says decode leniently.
+        let fullRunWeird = Data("""
+        {"id":"run_01M9RUNAAAAAAAAAAAAAAAAAA4","automation":"x","trigger":"manual","started":"2026-09-01T08:00:00Z","finished":"2026-09-01T08:00:01Z","exitCode":0,"status":"ok","formUsed":3,"escalationReason":null,"envelope":{"artifacts":"not-an-array","v2":true},"stderrTail":"","error":""}
+        """.utf8)
+        await check("RunDetail tolerates an unknown envelope shape") {
+            let r = try decoder.decode(RunDetail.self, from: fullRunWeird)
+            guard r.envelope == nil, r.summary.status == "ok" else {
+                throw NSError(domain: "decode-check", code: 30, userInfo: [
+                    NSLocalizedDescriptionKey: "weird envelope should decode as nil: \(String(describing: r.envelope))",
+                ])
+            }
+        }
+
+        // POST /v1/automations/{name}/run answers 202 {runId}; a 409 while one
+        // is in flight must be tellable apart from a real failure.
+        await check("run-now 202 body decodes; 409 classifies as busy") {
+            let accepted = try decoder.decode([String: String].self, from: Data("""
+            {"runId":"run_01M9RUNAAAAAAAAAAAAAAAAAA5"}
+            """.utf8))
+            guard accepted["runId"]?.hasPrefix("run_") == true else {
+                throw NSError(domain: "decode-check", code: 31, userInfo: [
+                    NSLocalizedDescriptionKey: "202 body decoded wrong: \(accepted)",
+                ])
+            }
+            let busy = APIClient.ServerError(message: "busy", status: 409, body: Data())
+            guard APIClient.isBusy(busy), !APIClient.isBusy(
+                APIClient.ServerError(message: "boom", status: 500, body: Data()))
+            else {
+                throw NSError(domain: "decode-check", code: 32, userInfo: [
+                    NSLocalizedDescriptionKey: "isBusy misclassifies statuses",
+                ])
+            }
+        }
+
+        await check("empty automations list decodes") {
+            _ = try decoder.decode([Automation].self, from: Data("[]".utf8))
+        }
+
         // The times the app sends back must be the RFC3339 form the server
         // parses, and must survive a round trip through its own decoder.
         await check("wireTime round-trips through the decoder") {
@@ -436,6 +621,10 @@ struct DecodeCheck {
             await check("live GET /v1/instances?from=&to= (404 = older server, tolerated)") {
                 let now = Date()
                 do { _ = try await api.listInstances(from: now, to: now.addingTimeInterval(86_400)) }
+                catch let e where APIClient.isUnimplemented(e) {}
+            }
+            await check("live GET /v1/automations (404 = unmounted bridge, tolerated)") {
+                do { _ = try await api.listAutomations() }
                 catch let e where APIClient.isUnimplemented(e) {}
             }
             for b in bots {

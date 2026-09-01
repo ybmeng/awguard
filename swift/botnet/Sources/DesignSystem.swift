@@ -51,6 +51,32 @@ enum Palette {
         }
     }
 
+    /// An automation's freshness to its sidebar-dot color. Quiet by default:
+    /// only a healthy schedule is green and only trouble is loud — pending,
+    /// never and unscheduled are states, not problems, so they share the
+    /// neutral gray. An unknown future value falls back the same way.
+    static func freshness(_ wire: String) -> Color {
+        switch wire {
+        case "ok": return calendarGreen
+        case "stale": return attention
+        case "failed": return calendarRed
+        default: return secondaryText // pending, never, unscheduled, future values
+        }
+    }
+
+    /// A run's status to its label color — the same temperature scale as the
+    /// freshness dot: green for a clean envelope, orange for degraded and
+    /// needs_human (the run spoke, but wants eyes), red for failed and for
+    /// error (no envelope at all), gray for the in-flight states.
+    static func runStatus(_ wire: String) -> Color {
+        switch wire {
+        case "ok": return calendarGreen
+        case "degraded", "needs_human": return attention
+        case "failed", "error": return calendarRed
+        default: return secondaryText // queued, running, future values
+        }
+    }
+
     // The avatar colors. Index is chosen by hashing the bot id, so a bot keeps
     // the same face for its whole life without storing anything server-side.
     static let avatarColors: [Color] = [
@@ -87,6 +113,24 @@ enum Metric {
 
     static let avatarSmall: CGFloat = 20
     static let avatarRow: CGFloat = 30
+
+    /// How far a section's rows sit in from its chevron header — what makes
+    /// the sidebar read as an explorer tree rather than three flat lists.
+    static let sidebarIndent: CGFloat = 12
+    /// The fixed chevron column on a section header, so the three section
+    /// labels start at one x whichever way their carets point.
+    static let sectionChevronWidth: CGFloat = 12
+    /// An automation's freshness dot in the sidebar; same size family as
+    /// calendarDot, separate because the two can retune apart.
+    static let freshnessDot: CGFloat = 7
+
+    /// The automation pane's content column stops growing here, same reason
+    /// as calendarListWidth: a run row's trailing fields must stay near the
+    /// name, not a window's width away.
+    static let automationListWidth: CGFloat = 680
+    /// A disclosed run's stderr tail scrolls inside this rather than growing
+    /// the row by up to 8KB of text.
+    static let stderrMaxHeight: CGFloat = 160
 
     static let bubbleRadius: CGFloat = 17
     static let bubbleHPad: CGFloat = 14

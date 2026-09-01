@@ -176,6 +176,57 @@ struct APIClient {
         value.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? value
     }
 
+    // MARK: automations (bridged from the stdd automations service)
+    //
+    // Five read/run routes botnet mounts when it hosts the automations
+    // service; 404 on all of them means an unmounted bridge (standalone
+    // botnetd, old server), which callers read through `isUnimplemented` and
+    // hide the whole section rather than report.
+
+    /// Every discovered automation, without runs. Never null on the wire.
+    func listAutomations() async throws -> [Automation] {
+        try await get("/v1/automations")
+    }
+
+    /// The list row plus its last 20 runs, newest first. 404 is ambiguous
+    /// here (unknown name vs unmounted bridge); callers treat both as "not
+    /// available" since the name came from the list moments ago.
+    func automationDetail(_ name: String) async throws -> Automation {
+        try await get("/v1/automations/\(pathSegment(name))")
+    }
+
+    /// Starts a manual run; the 202 body carries the run id to poll. A 409
+    /// (one already in flight) surfaces as a ServerError callers classify
+    /// with `isBusy` — a notice, not a failure.
+    func runAutomation(_ name: String) async throws -> String {
+        let body: [String: String] = try decode(
+            await raw("/v1/automations/\(pathSegment(name))/run", method: "POST", body: nil),
+            from: "POST /v1/automations/\(name)/run")
+        guard let id = body["runId"] else {
+            throw ServerError(message: "run accepted but no runId returned", status: 0, body: Data())
+        }
+        return id
+    }
+
+    /// One run in full: summary + envelope + stderr tail + error. Polled
+    /// until `finished` is non-empty after a manual run.
+    func runDetail(_ id: String) async throws -> RunDetail {
+        try await get("/v1/runs/\(pathSegment(id))")
+    }
+
+    /// True when the server refused because a run is already in flight.
+    static func isBusy(_ error: Error) -> Bool {
+        (error as? ServerError)?.status == 409
+    }
+
+    /// Automation names come from manifest frontmatter, so unlike ids they
+    /// can hold characters that would break out of a path segment.
+    private func pathSegment(_ value: String) -> String {
+        value.addingPercentEncoding(
+            withAllowedCharacters: CharacterSet.urlPathAllowed.subtracting(
+                CharacterSet(charactersIn: "/?#"))) ?? value
+    }
+
     func createBot(displayName: String, systemPrompt: String, model: String) async throws -> Bot {
         try await send("/v1/bots", method: "POST", body: [
             "displayName": displayName, "systemPrompt": systemPrompt, "model": model,

@@ -64,10 +64,21 @@ From `swift/botnet/`:
   line); verify mixed open/closed states with `snapshot --details
   --collapse-memory`. State that must survive collapse (drafts) lives on
   BotDetails, not inside the content closure — collapse destroys content.
-- `SidebarView.swift` — the Services section, bot list, search, delete context
-  menu. Owns `SidebarSelection` (`.bot(id)` | `.service(kind)`) and
-  `ServiceKind`; ContentView switches the detail pane on that enum, so a new
-  service is a case plus a pane, never a sentinel id.
+- `SidebarView.swift` — search pinned on top, then an explorer tree of
+  collapsible sections (Services, Automations, Bots) with chevron headers,
+  per-section @AppStorage expansion, and a `collapsedOverride` init param the
+  Snapshot tool uses instead of writing UserDefaults. Owns `SidebarSelection`
+  (`.bot(id)` | `.service(kind)` | `.automation(name)`), `ServiceKind` and
+  `SidebarSection`; ContentView switches the detail pane on that enum, so a
+  new section is a SidebarSection case + rows + (if selectable) a selection
+  case plus a pane, never a sentinel id. A non-empty search force-reveals the
+  Bots section (chevron turns with it) without touching the persisted choice.
+- `AutomationView.swift` — one automation's pane (freshness badge, schedule
+  summary, scheduleError, Run now with poll-until-finished, runs list with
+  inline-disclosed RunDetail) plus `FolderOpener`, the open-in-Cursor /
+  reveal-in-Finder seam: its `launch`/`reveal` are static closure vars so a
+  scratch harness proves the exact `open -a Cursor <path>` argv and the
+  Finder fallback without launching anything.
 - `CalendarView.swift` — the Calendar service's pane: instances grouped by day
   (upcoming, then "Earlier"), each row showing its author. Grouping lives in
   `EventGroups`/`EventDay` in the same file, not in the view body. The pane
@@ -176,6 +187,28 @@ From `swift/botnet/`:
 - A multi-month grid check (a recurring series on several correct days across
   two months) doesn't fit 900pt: run `snapshot --calendar --month --height
   1250` so both month sections are in frame.
+- Automations wire shapes: a run's `started`/`finished` are RFC3339 STRINGS,
+  never Dates — `finished` is `""` while queued/running and would blow up any
+  date decoder. Decode as String with `startedAt`/`finishedAt` computed
+  helpers. The run envelope is lenient at the RunDetail layer (`try?` around
+  the typed decode) so an unknown future shape degrades to nil, while inside
+  RunEnvelope a present-but-wrong-typed key still throws — half an alien
+  envelope rendered as truth is worse than none.
+- Verifying against a scratch `stdd run` stack: the unix sockets fail with
+  `bind: invalid argument` when the root path exceeds sockaddr_un's ~104
+  bytes — the deep scratchpad path does. Use a short root (e.g.
+  /tmp/<task>-<port>). The trap: botnet's TCP routes still work (the
+  automations handler is mounted in-process), so the crash-looping runner is
+  invisible until a POST run never executes — grep the stdd log for
+  "invalid argument" before trusting the stack.
+- Seeding every sidebar freshness state needs only manual runs, thanks to
+  the service's precedence (unscheduled > never > pending > stale > failed >
+  ok): scheduled manifest + ok manual run → "ok"; scheduled + failed run →
+  "failed"; a scheduleError manifest → schedule nil → "unscheduled" even
+  with an error run; scheduled + no runs → "never".
+- Snapshot must not write UserDefaults to pose @AppStorage state (defaults
+  litter, cross-run pollution): give the view an override init param
+  (`collapsedOverride`) that wins over the stored value, nil in the app.
 - Markdown in bot bubbles: `Text(String)` renders literally — parse with
   `AttributedString(markdown:options:)` at `.inlineOnlyPreservingWhitespace`
   (keeps single newlines, leaves block syntax literal), raw-text fallback on

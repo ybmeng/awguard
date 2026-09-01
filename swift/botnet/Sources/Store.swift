@@ -29,6 +29,22 @@ final class AppStore: ObservableObject {
     // calendars, so the views drop the calendar chrome (chip row, picker,
     // manage button) and the pane renders exactly as it did before them.
     @Published private(set) var calendarsUnavailable = false
+    // The automations the bridge exposes, in the service's own order. Empty
+    // both before the first fetch and on a server without the routes; the
+    // sticky-ish flag below is what actually hides the nav section.
+    @Published private(set) var automations: [Automation] = []
+    // True once GET /v1/automations has 404'd: the bridge is unmounted (old
+    // server, standalone botnetd) and the whole nav section is absent. Cleared
+    // on a later success, so a restart onto a mounted server mid-run brings
+    // the section back on the next refresh.
+    @Published private(set) var automationsUnavailable = false
+    // Full run rows fetched for inline disclosure, by run id. Cached so
+    // reopening a row doesn't refetch a finished run (finished runs are
+    // immutable); an unfinished run's row is refetched by the poll loop.
+    @Published private(set) var runDetails: [String: RunDetail] = [:]
+    // Automation names with a manual run this client started still settling —
+    // what disables the Run now button between the POST and the poll's end.
+    @Published private(set) var manualRunsInFlight: Set<String> = []
     @Published var pendingBotIDs: Set<String> = []
     @Published var compactingBotIDs: Set<String> = []
     @Published var lastError: String?
@@ -48,6 +64,7 @@ final class AppStore: ObservableObject {
         }
         await prefetchConversations()
         await refreshEvents()
+        await refreshAutomations()
     }
 
     // A server that denormalizes the preview onto the bot has already told us
@@ -340,6 +357,103 @@ final class AppStore: ObservableObject {
             : error.localizedDescription
     }
 
+    // MARK: automations
+    //
+    // The stdd automations service owns the registry and the runs; botnet
+    // only bridges its read/run routes through. Same caching stance as the
+    // calendar: these calls hold the server's answers for the views and
+    // nothing else.
+
+    func refreshAutomations() async {
+        do {
+            automations = try await api.listAutomations()
+            automationsUnavailable = false
+        } catch {
+            guard !APIClient.isUnimplemented(error) else {
+                automations = []
+                automationsUnavailable = true
+                return
+            }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Re-reads one automation with its runs (the detail row) and splices it
+    /// over the list row, so the pane and the sidebar dot refresh together.
+    func loadAutomationDetail(_ name: String) async {
+        do {
+            var detail = try await api.automationDetail(name)
+            // The wire omits `runs` entirely for an automation with zero runs
+            // (Go's omitempty), and the decoder honestly leaves that nil. THIS
+            // is the one place absence provably means "no runs yet" — the
+            // detail endpoint always reports runs — so normalize here, and the
+            // pane's nil keeps meaning "detail not loaded yet".
+            detail.runs = detail.runs ?? []
+            if let i = automations.firstIndex(where: { $0.name == detail.name }) {
+                automations[i] = detail
+            } else {
+                automations.append(detail)
+            }
+        } catch {
+            guard !APIClient.isUnimplemented(error) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Fetches one run's full row for inline disclosure. Finished runs are
+    /// immutable server-side, so a cached one is returned without a refetch.
+    func loadRunDetail(_ id: String) async {
+        if let cached = runDetails[id], cached.summary.isFinished { return }
+        do {
+            runDetails[id] = try await api.runDetail(id)
+        } catch {
+            guard !APIClient.isUnimplemented(error) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Starts a manual run and waits for it to settle, then re-reads the
+    /// detail so the runs list and freshness reflect the outcome. Returns a
+    /// short transient notice for the pane to flash (a 409 is "already
+    /// running", not an error state), or nil when nothing needs saying.
+    func runNow(_ name: String) async -> String? {
+        guard !manualRunsInFlight.contains(name) else { return nil }
+        manualRunsInFlight.insert(name)
+        defer { manualRunsInFlight.remove(name) }
+        do {
+            let id = try await api.runAutomation(name)
+            await pollRun(id)
+            await loadAutomationDetail(name)
+            return nil
+        } catch {
+            // Either way the server knows more than the cache does now.
+            await loadAutomationDetail(name)
+            guard !APIClient.isBusy(error) else {
+                return "A run is already in flight — showing it below."
+            }
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Polls a started run until `finished` is non-empty, per the contract.
+    /// Giving up on the deadline leaves the run visibly unfinished — the
+    /// service owns that state and the next detail load settles it — same
+    /// stance as awaitReply below.
+    private func pollRun(_ id: String) async {
+        let deadline = Date().addingTimeInterval(Self.runTimeout)
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard let run = try? await api.runDetail(id) else { continue }
+            runDetails[id] = run
+            if run.summary.isFinished { return }
+        }
+    }
+
+    /// Comfortably past the runner's own subprocess timeout, so the service
+    /// decides how a stuck run ends, not this poll.
+    private static let runTimeout: TimeInterval = 900
+
     func compact(_ bot: Bot) async {
         guard !compactingBotIDs.contains(bot.id) else { return }
         compactingBotIDs.insert(bot.id)
@@ -454,6 +568,9 @@ final class AppStore: ObservableObject {
             // cached events as stale as the sidebar preview and for the same
             // reason: the server wrote and nobody told the client.
             await refreshEvents()
+            // Freshness dots age the same way: a scheduled fire can land while
+            // the user chats, and this settle is the one refresh moment.
+            await refreshAutomations()
             return
         }
     }
