@@ -163,7 +163,11 @@ struct AutomationView: View {
                         toggle(run)
                     }
                     if disclosedRunID == run.id {
-                        RunDetailBox(detail: store.runDetails[run.id])
+                        RunDetailBox(
+                            detail: store.runDetails[run.id],
+                            automationPath: automation.path,
+                            notify: flash
+                        )
                     }
                 }
             }
@@ -264,6 +268,11 @@ private struct RunRow: View {
 // already said so); the box says which state it is in rather than vanishing.
 private struct RunDetailBox: View {
     let detail: RunDetail?
+    /// The automation's absolute directory — artifact paths are relative to
+    /// it. Nil (service predating the bridge) leaves artifacts as plain text.
+    let automationPath: String?
+    /// Routes the Cursor-fallback notice to the pane's transient surface.
+    let notify: (String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -319,7 +328,11 @@ private struct RunDetailBox: View {
             .foregroundStyle(Palette.secondaryText)
             ForEach(artifacts, id: \.self) { artifact in
                 GridRow {
-                    Text(artifact.path).font(TypeScale.codeBlock)
+                    ArtifactPathCell(
+                        relPath: artifact.path,
+                        automationPath: automationPath,
+                        notify: notify
+                    )
                     Text("\(artifact.rows)").font(TypeScale.codeBlock)
                     Text(artifact.newest).font(TypeScale.codeBlock)
                 }
@@ -344,6 +357,49 @@ private struct RunDetailBox: View {
             Palette.chrome,
             in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
         )
+    }
+}
+
+// An artifact path that opens the file in Cursor when it actually exists on
+// this machine (envelopes outlive files — a deleted artifact, or a DB served
+// to another Mac, must not render a dead link). Existence is checked at
+// render time; a plain monospace path is the degraded form.
+private struct ArtifactPathCell: View {
+    let relPath: String
+    let automationPath: String?
+    let notify: (String) -> Void
+
+    @State private var hovering = false
+
+    private var absolutePath: String? {
+        guard let automationPath else { return nil }
+        let joined = automationPath + "/" + relPath
+        guard FileManager.default.fileExists(atPath: joined) else { return nil }
+        return joined
+    }
+
+    var body: some View {
+        if let absolutePath {
+            Button {
+                if !FolderOpener.openInCursor(absolutePath) {
+                    notify("Cursor didn't open — revealed the file in Finder instead.")
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(relPath)
+                        .font(TypeScale.codeBlock)
+                        .underline(hovering)
+                    Image(systemName: "arrow.up.forward.square")
+                        .font(TypeScale.messageMeta)
+                        .foregroundStyle(Palette.secondaryText)
+                }
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+            .help("Open \(absolutePath) in Cursor")
+        } else {
+            Text(relPath).font(TypeScale.codeBlock)
+        }
     }
 }
 
