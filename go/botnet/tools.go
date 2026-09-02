@@ -783,7 +783,7 @@ const projectToolName = "project"
 // instructive errors rather than silent drift, so the ladder is enforced and
 // not merely advertised.
 const projectLadder = `How to record something — take the FIRST rule that fits:
-1. A date in the future you must act by → kind=deadline with "due". The lead window defaults from the PROJECT, so set it once with "default_lead_days" on the project that holds this kind of date (passport renewals 180, visa renewals 90, company filings 60; anything else 30) rather than typing "lead_days" into every fact; "lead_days" is for the one fact that differs.
+1. A date in the future you must act by → kind=deadline with "due". The lead window comes from the PROJECT, so set it once with "default_lead_days" on the project that holds this kind of date (passport renewals 180, visa renewals 90, company filings 60; anything else 30) rather than typing "lead_days" into every fact; "lead_days" is for the one fact that differs, and "0" means "use the project's". Widening a project's default widens every fact still borrowing it, so fix the window in one place rather than editing facts.
 2. An obligation that repeats → kind=recurring with "due" (the FIRST occurrence), "rrule" and "tz".
 3. A step someone must complete → kind=milestone. If a HUMAN must act, set "blocker" to exactly what they must do, and clear it ("blocker": "") once they have. A blocked step cannot also be done.
 4. Only "what happened" or "what I learned" → kind=note. A note NEVER changes health, so if you are about to write a date into one, it is a deadline: go back to 1.
@@ -1317,7 +1317,7 @@ func renderProject(now time.Time, p Project, children []Project, facts []Fact) s
 	for i, f := range facts {
 		fmt.Fprintf(&b, "%d. [%s] %s", i+1, f.Kind, f.Title)
 		if !f.Due.IsZero() {
-			fmt.Fprintf(&b, "  due %s (lead %dd)", localRFC3339(f.Due), f.LeadDays)
+			fmt.Fprintf(&b, "  due %s (%s)", localRFC3339(f.Due), factLeadText(f))
 		}
 		if f.RRule != "" {
 			fmt.Fprintf(&b, "  (repeats: %s, %s)", f.RRule, f.TZ)
@@ -1338,6 +1338,17 @@ func renderProject(now time.Time, p Project, children []Project, facts []Fact) s
 		out += "\n" + noHealthPrompt
 	}
 	return out
+}
+
+// factLeadText names the window a fact is actually judged by, and says when it
+// is borrowed. A bot reading a bare "lead 180d" cannot tell a window the fact
+// owns from one it inherits, and would patch the fact when it meant to move the
+// project's default.
+func factLeadText(f Fact) string {
+	if f.LeadDays > 0 {
+		return fmt.Sprintf("lead %dd", f.LeadDays)
+	}
+	return fmt.Sprintf("lead %dd (project default)", f.EffectiveLeadDays)
 }
 
 // noHealthPrompt is what a project with nothing health-bearing ends with: the

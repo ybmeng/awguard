@@ -112,7 +112,7 @@ var factSignals = map[FactKind]func(f Fact, now time.Time) (ProjectHealth, time.
 		switch {
 		case !f.Due.After(now):
 			return HealthOverdue, f.Due
-		case !f.Due.AddDate(0, 0, -f.LeadDays).After(now):
+		case !f.Due.AddDate(0, 0, -f.EffectiveLeadDays).After(now):
 			return HealthDueSoon, f.Due
 		}
 		return HealthOK, f.Due
@@ -122,7 +122,7 @@ var factSignals = map[FactKind]func(f Fact, now time.Time) (ProjectHealth, time.
 		if !ok {
 			return HealthOK, time.Time{}
 		}
-		if !next.AddDate(0, 0, -f.LeadDays).After(now) {
+		if !next.AddDate(0, 0, -f.EffectiveLeadDays).After(now) {
 			return HealthDueSoon, next
 		}
 		return HealthOK, next
@@ -352,8 +352,30 @@ func leadOrGlobal(own int) int {
 // there is never a second opinion about what one project's facts mean.
 func hydrate(p *Project, facts []Fact, now time.Time) {
 	p.FactCount = len(facts)
+	// The window a fact inherits is the PROJECT's, so it can only be resolved
+	// here, where both are in hand — and it is resolved in place, so the
+	// forest's own copy of these facts carries the answer out to every reader.
+	resolveFactLeads(facts, p.EffectiveLeadDays)
 	p.Health, p.NextDue = projectHealth(facts, now)
 	p.Severity = severityFor(p.Health)
+}
+
+// leadFor is the fact-level half of the "0 means unset" rule, and the ONLY
+// place it is decided: the fact's own window when it set one, else the
+// project's effective answer.
+func leadFor(f Fact, projectLead int) int {
+	if f.LeadDays > 0 {
+		return f.LeadDays
+	}
+	return projectLead
+}
+
+// resolveFactLeads fills the derived EffectiveLeadDays across a project's
+// facts. It mutates in place, so a caller holding the slice sees it too.
+func resolveFactLeads(facts []Fact, projectLead int) {
+	for i := range facts {
+		facts[i].EffectiveLeadDays = leadFor(facts[i], projectLead)
+	}
 }
 
 // ── The tree ──────────────────────────────────────────────────────────────────
@@ -498,6 +520,11 @@ func (f *projectForest) rollUp(roots []*Project) {
 		if p.OwnerBot != "" {
 			p.EffectiveOwner = p.OwnerBot
 		}
+		// Only NOW is the inherited window known, and a fact's health depends
+		// on it — so own-fact health is judged here rather than in the first
+		// pass, before any child folds into it. The first pass's hydrate stands
+		// only for a project this walk never reaches.
+		hydrate(p, f.facts[p.ID], f.now)
 		for _, c := range f.children[p.ID] {
 			walk(c, p.EffectiveLeadDays, p.EffectiveOwner)
 			if healthRank[c.Health] > healthRank[p.Health] {
@@ -973,16 +1000,15 @@ func scanFact(sc interface{ Scan(...any) error }) (Fact, error) {
 }
 
 // CreateFact stores one fact on a project and returns it as stored. The id, the
-// author and both timestamps are stamped here; a dated kind created with no
-// lead takes the project's EFFECTIVE lead — its own threshold, the nearest
-// ancestor's, or the global 30 (a caller wanting no lead window patches it to
-// zero afterwards, which is the one way to say "exactly on the day"). The
-// project lookup, the projection and the insert share a transaction, so the
-// project cannot be deleted out from under the fact between them.
+// author and both timestamps are stamped here. The lead is stored EXACTLY as
+// given, 0 included: 0 means unset, and the project's window is applied at read
+// time (see the LeadDays DECISION in schema.go). Substituting it here is what
+// made create and patch disagree about the same number, so this path no longer
+// resolves anything. The project lookup, the projection and the insert share a
+// transaction, so the project cannot be deleted out from under the fact.
 //
-// The lead is read from the forest INSIDE that transaction rather than from a
-// bare row: the threshold is an answer about the tree, and deriving it here is
-// what keeps one derivation rather than a second copy of the inheritance rule.
+// The returned fact carries its resolved EffectiveLeadDays, so a caller that
+// writes and renders in one breath sees the same window every reader will.
 func (s *Store) CreateFact(projectID ProjectID, f Fact, createdBy string) (Fact, error) {
 	now := time.Now().UTC().Truncate(time.Second)
 	f.ID = FactID(newID("fct_"))
@@ -1000,9 +1026,6 @@ func (s *Store) CreateFact(projectID ProjectID, f Fact, createdBy string) (Fact,
 		if !ok {
 			return ErrNotFound
 		}
-		if f.LeadDays == 0 && !f.Due.IsZero() {
-			f.LeadDays = p.EffectiveLeadDays
-		}
 		// Validated against the fact as it will be STORED, lead included, so
 		// the write boundary judges the same value every reader will see.
 		if err := validateFact(f); err != nil {
@@ -1014,6 +1037,7 @@ func (s *Store) CreateFact(projectID ProjectID, f Fact, createdBy string) (Fact,
 		if f, err = projectFact(q, *p, f); err != nil {
 			return err
 		}
+		f.EffectiveLeadDays = leadFor(f, p.EffectiveLeadDays)
 		return insertFact(q, f)
 	})
 	if err != nil {
@@ -1096,6 +1120,18 @@ func (s *Store) UpdateFact(id FactID, p FactPatch) (Fact, error) {
 		if f, err = projectFact(q, project, f); err != nil {
 			return err
 		}
+		// getProject reads a bare row, whose EffectiveLeadDays is only the
+		// un-inherited answer; the tree's is what a reader gets, so resolve
+		// from the forest rather than from the row beside us.
+		forest, err := loadForest(q, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		lead := project.EffectiveLeadDays
+		if p, ok := forest.byID[f.ProjectID]; ok {
+			lead = p.EffectiveLeadDays
+		}
+		f.EffectiveLeadDays = leadFor(f, lead)
 		f.UpdatedAt = time.Now().UTC().Truncate(time.Second)
 		if _, err := q.Exec(
 			`UPDATE facts SET title = ?, due = ?, lead_days = ?, rrule = ?, tz = ?, done = ?,
@@ -1203,6 +1239,18 @@ func (s *Store) ListFacts(projectID ProjectID) ([]Fact, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The inherited window comes from the tree, and the sort below asks
+	// factSignals, which judges by it — so resolution has to precede ordering,
+	// not just rendering.
+	forest, err := s.forest()
+	if err != nil {
+		return nil, err
+	}
+	lead := defaultLeadDays
+	if p, ok := forest.byID[projectID]; ok {
+		lead = p.EffectiveLeadDays
+	}
+	resolveFactLeads(facts, lead)
 	now := time.Now().UTC()
 	dues := make(map[FactID]time.Time, len(facts))
 	for _, f := range facts {
@@ -1529,10 +1577,10 @@ func nudgeFactLine(now time.Time, f Fact) string {
 	local := due.Local()
 	if local.Before(now) {
 		return fmt.Sprintf("%s: due %s (%dd overdue, lead %dd)",
-			f.Title, local.Format(time.DateOnly), wholeDays(now.Sub(local)), f.LeadDays)
+			f.Title, local.Format(time.DateOnly), wholeDays(now.Sub(local)), f.EffectiveLeadDays)
 	}
 	return fmt.Sprintf("%s: due %s (in %dd, lead %dd)",
-		f.Title, local.Format(time.DateOnly), wholeDays(local.Sub(now)), f.LeadDays)
+		f.Title, local.Format(time.DateOnly), wholeDays(local.Sub(now)), f.EffectiveLeadDays)
 }
 
 // ── Calendar projection ───────────────────────────────────────────────────────

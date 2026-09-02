@@ -308,8 +308,9 @@ func TestTickNudgesTheOwnerOnce(t *testing.T) {
 	var f Fact
 	postExpect(t, http.StatusCreated, h.ts.URL+"/v1/projects/"+string(child.ID)+"/facts",
 		`{"kind":"deadline","title":"US passport expires","due":"`+due.Format(time.RFC3339)+`"}`, &f)
-	if f.LeadDays != 180 {
-		t.Fatalf("the seeded fact took lead %d, want the project's 180", f.LeadDays)
+	if f.LeadDays != 0 || f.EffectiveLeadDays != 180 {
+		t.Fatalf("the seeded fact = stored %d / effective %d, want 0 / the project's inherited 180",
+			f.LeadDays, f.EffectiveLeadDays)
 	}
 
 	// The first tick over a healthy forest records and says nothing: the fact

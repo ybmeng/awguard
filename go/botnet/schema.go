@@ -671,10 +671,33 @@ type Fact struct {
 	// rather than as the year 1.
 	Due time.Time `json:"due,omitempty"`
 
-	// LeadDays is how many days before Due the fact counts as due_soon. It
-	// defaults to 30 on a dated create when omitted, and must be >= 0; the
-	// undated kinds keep 0, having no window to open.
+	// LeadDays is this fact's OWN lead window, and 0 means UNSET — inherit the
+	// project's EffectiveLeadDays. It must be >= 0; the undated kinds keep 0,
+	// having no window to open.
+	//
+	// DECISION (0 is unset at BOTH write paths, resolved at READ time): create
+	// once substituted the project's lead into the stored row while a patch to
+	// 0 stored a literal 0, so the same number meant two things depending on
+	// which route wrote it and a fact could not round-trip through create. Now
+	// neither path substitutes: the row keeps what it was given, and
+	// EffectiveLeadDays below is the answer every reader uses. This mirrors
+	// Project.DefaultLeadDays and the wider "0 = unset" convention, and it is
+	// what lets a project's default move the meaning of every fact inheriting
+	// it — including its descendants' — with no migration and no write.
+	//
+	// The cost, accepted deliberately: a zero-day window is UNREPRESENTABLE. A
+	// fact due at an instant with no early warning cannot be expressed, because
+	// 0 is spent on "unset". Nothing has asked for one, and a lead of 1 is the
+	// nearest thing; buying it back would need a sentinel or a pointer here,
+	// which is a worse trade than the inheritance this buys.
 	LeadDays int `json:"leadDays"`
+
+	// EffectiveLeadDays is DERIVED at read time, never stored: LeadDays when it
+	// is set, otherwise the owning project's own EffectiveLeadDays, which is
+	// itself the nearest-ancestor answer. Health, due_soon and nextDue are
+	// computed from THIS field and never from LeadDays — one resolution, so a
+	// fact and the project it hangs under can never disagree about the window.
+	EffectiveLeadDays int `json:"effectiveLeadDays"`
 
 	RRule   string `json:"rrule,omitempty"`   // recurring only, and REQUIRED there; parseRRULE's subset
 	TZ      string `json:"tz,omitempty"`      // recurring only, and REQUIRED with RRule

@@ -23,8 +23,11 @@ func pt(y int, m time.Month, d int) time.Time {
 	return time.Date(y, m, d, 12, 0, 0, 0, time.UTC)
 }
 
+// deadlineFact is a fact as a READ path hands it to projectHealth: the lead
+// already resolved, since health is judged by the effective window and never by
+// the stored one (see the LeadDays DECISION in schema.go).
 func deadlineFact(due time.Time, lead int) Fact {
-	return Fact{Kind: FactDeadline, Title: "renew", Due: due, LeadDays: lead}
+	return Fact{Kind: FactDeadline, Title: "renew", Due: due, LeadDays: lead, EffectiveLeadDays: lead}
 }
 
 // TestProjectHealthPrecedence pins the derivation table: every precedence pair,
@@ -134,7 +137,7 @@ func TestProjectHealthRecurring(t *testing.T) {
 		Due:      pt(2026, time.March, 14),
 		RRule:    "FREQ=YEARLY",
 		TZ:       "Asia/Singapore",
-		LeadDays: 180,
+		LeadDays: 180, EffectiveLeadDays: 180,
 	}
 	next := pt(2027, time.March, 14)
 
@@ -164,7 +167,7 @@ func TestProjectHealthRecurring(t *testing.T) {
 		Due:      pt(2026, time.January, 31),
 		RRule:    "FREQ=MONTHLY;BYMONTHDAY=31",
 		TZ:       "UTC",
-		LeadDays: 60,
+		LeadDays: 60, EffectiveLeadDays: 60,
 	}
 	want := pt(2026, time.March, 31)
 	if h, n := projectHealth([]Fact{monthly}, pt(2026, time.February, 15)); h != HealthDueSoon || n == nil || !n.Equal(want) {
@@ -173,7 +176,7 @@ func TestProjectHealthRecurring(t *testing.T) {
 
 	// An exhausted series contributes no date and no urgency.
 	spent := Fact{Kind: FactRecurring, Title: "three filings", Due: pt(2026, time.January, 1),
-		RRule: "FREQ=YEARLY;COUNT=2", TZ: "UTC", LeadDays: 30}
+		RRule: "FREQ=YEARLY;COUNT=2", TZ: "UTC", LeadDays: 30, EffectiveLeadDays: 30}
 	if h, n := projectHealth([]Fact{spent}, pt(2030, time.January, 1)); h != HealthOK || n != nil {
 		t.Errorf("an exhausted series = %q / %v, want ok and no nextDue", h, n)
 	}
@@ -407,30 +410,35 @@ func TestFactValidation(t *testing.T) {
 	}
 }
 
-// TestFactLeadDaysDefault: a deadline created with no lead gets the 30-day
-// default, and an explicit zero survives as a real zero rather than being
-// re-defaulted.
+// TestFactLeadDaysDefault: a deadline created with no lead STORES 0 — the row
+// keeps what it was given — and reads back with the global 30 resolved onto it.
+// Storing the resolved number here is exactly what made create and patch
+// disagree; see the LeadDays DECISION in schema.go.
 func TestFactLeadDaysDefault(t *testing.T) {
 	s := newEventStore(t)
 	p := mustProject(t, s, "Passports", "")
 	due := pt(2027, time.March, 14)
 
 	f := mustFact(t, s, p.ID, Fact{Kind: FactDeadline, Title: "no lead given", Due: due}, userAuthor)
-	if f.LeadDays != defaultLeadDays {
-		t.Errorf("lead days = %d, want the %d-day default", f.LeadDays, defaultLeadDays)
+	if f.LeadDays != 0 {
+		t.Errorf("stored lead days = %d, want 0 — create must not bake a resolved lead into the row", f.LeadDays)
+	}
+	if f.EffectiveLeadDays != defaultLeadDays {
+		t.Errorf("effective lead days = %d, want the global %d", f.EffectiveLeadDays, defaultLeadDays)
 	}
 	zero := 0
 	cleared, err := s.UpdateFact(f.ID, FactPatch{LeadDays: &zero})
 	if err != nil {
 		t.Fatalf("patch lead: %v", err)
 	}
-	if cleared.LeadDays != 0 {
-		t.Errorf("lead days after an explicit zero = %d, want 0", cleared.LeadDays)
+	if cleared.LeadDays != 0 || cleared.EffectiveLeadDays != defaultLeadDays {
+		t.Errorf("after a patch to 0 = stored %d / effective %d, want 0 / %d — the same answer create gives",
+			cleared.LeadDays, cleared.EffectiveLeadDays, defaultLeadDays)
 	}
-	// A milestone has no lead to default; it stays zero.
+	// A milestone has no date, so it has no window to resolve.
 	m := mustFact(t, s, p.ID, Fact{Kind: FactMilestone, Title: "book the appointment"}, userAuthor)
 	if m.LeadDays != 0 {
-		t.Errorf("a milestone's lead = %d, want 0 — only dated kinds get the default", m.LeadDays)
+		t.Errorf("a milestone's lead = %d, want 0", m.LeadDays)
 	}
 }
 

@@ -150,10 +150,12 @@ func TestEffectiveLeadDaysInheritance(t *testing.T) {
 	_ = loose
 }
 
-// TestCreateFactTakesTheProjectsLead: a dated fact created with no lead takes
-// the project's EFFECTIVE lead, not the flat 30 — which is the whole point of
-// setting the default once on "Document Expirations". An explicit lead wins,
-// and an existing fact's stored lead never moves.
+// TestCreateFactTakesTheProjectsLead: a dated fact created with no lead is
+// JUDGED by the project's effective lead, not the flat 30 — which is the whole
+// point of setting the default once on "Document Expirations". It is resolved
+// at read time onto EffectiveLeadDays rather than baked into the row, so an
+// explicit lead still wins and moving the project's default now moves every
+// fact inheriting it (see the LeadDays DECISION in schema.go).
 func TestCreateFactTakesTheProjectsLead(t *testing.T) {
 	s := newEventStore(t)
 	root := mustProject(t, s, "Document Expirations", "")
@@ -165,31 +167,40 @@ func TestCreateFactTakesTheProjectsLead(t *testing.T) {
 	due := time.Now().UTC().AddDate(0, 0, 300)
 
 	inherited := mustFact(t, s, child.ID, Fact{Kind: FactDeadline, Title: "US passport expires", Due: due}, userAuthor)
-	if inherited.LeadDays != 180 {
-		t.Errorf("a fact created with no lead = %d, want the project's inherited 180", inherited.LeadDays)
+	if inherited.LeadDays != 0 {
+		t.Errorf("a fact created with no lead stored %d, want 0 — the row keeps what it was given", inherited.LeadDays)
+	}
+	if inherited.EffectiveLeadDays != 180 {
+		t.Errorf("a fact created with no lead is judged by %d, want the project's inherited 180", inherited.EffectiveLeadDays)
 	}
 	explicit := mustFact(t, s, child.ID,
 		Fact{Kind: FactDeadline, Title: "UK passport expires", Due: due, LeadDays: 45}, userAuthor)
-	if explicit.LeadDays != 45 {
-		t.Errorf("an explicit lead = %d, want the caller's 45", explicit.LeadDays)
+	if explicit.LeadDays != 45 || explicit.EffectiveLeadDays != 45 {
+		t.Errorf("an explicit lead = stored %d / effective %d, want 45 / 45", explicit.LeadDays, explicit.EffectiveLeadDays)
 	}
 	// A project with no default anywhere above it still gets the global one.
 	loose := mustProject(t, s, "Singapore Co", "")
 	global := mustFact(t, s, loose.ID, Fact{Kind: FactDeadline, Title: "annual return", Due: due}, userAuthor)
-	if global.LeadDays != defaultLeadDays {
-		t.Errorf("a fact under no default = %d, want the global %d", global.LeadDays, defaultLeadDays)
+	if global.EffectiveLeadDays != defaultLeadDays {
+		t.Errorf("a fact under no default is judged by %d, want the global %d", global.EffectiveLeadDays, defaultLeadDays)
 	}
-	// Changing the project's default does NOT rewrite the facts already stored.
+	// Changing the project's default rewrites NO row — and now moves what the
+	// inheriting facts mean, on the very next read. That is the point of
+	// resolving at read time rather than at write time.
 	sixty := 60
 	if _, err := s.UpdateProject(root.ID, ProjectPatch{DefaultLeadDays: &sixty}); err != nil {
 		t.Fatalf("change the default lead: %v", err)
 	}
-	after, err := s.GetFact(inherited.ID)
-	if err != nil {
-		t.Fatalf("get fact: %v", err)
+	after := factNamedInTest(t, s, child, "US passport expires")
+	if after.LeadDays != 0 {
+		t.Errorf("an inheriting fact's STORED lead = %d after the default moved, want it untouched at 0", after.LeadDays)
 	}
-	if after.LeadDays != 180 {
-		t.Errorf("an existing fact's lead = %d after the project default moved, want the stored 180", after.LeadDays)
+	if after.EffectiveLeadDays != 60 {
+		t.Errorf("an inheriting fact is now judged by %d, want the project's new 60", after.EffectiveLeadDays)
+	}
+	stillExplicit := factNamedInTest(t, s, child, "UK passport expires")
+	if stillExplicit.EffectiveLeadDays != 45 {
+		t.Errorf("a fact with its own window moved to %d; an explicit lead does not inherit", stillExplicit.EffectiveLeadDays)
 	}
 	// An undated kind keeps 0: it has no window to open.
 	note := mustFact(t, s, child.ID, Fact{Kind: FactNote, Title: "agent", Body: "phone number"}, userAuthor)
@@ -284,8 +295,8 @@ func TestProjectToolDefaultLeadDays(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list facts: %v", err)
 	}
-	if len(facts) != 1 || facts[0].LeadDays != 180 {
-		t.Fatalf("facts = %+v, want one fact with the inherited lead 180", facts)
+	if len(facts) != 1 || facts[0].LeadDays != 0 || facts[0].EffectiveLeadDays != 180 {
+		t.Fatalf("facts = %+v, want one fact storing 0 and judged by the inherited 180", facts)
 	}
 	// show names the effective lead too, so a model reading a project knows
 	// what window its next fact will take.

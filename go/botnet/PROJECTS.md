@@ -111,7 +111,7 @@ never orphaned into a top-level row the user never made.
 
 How early a date starts mattering is a property of the FOLDER of work, not of each fact: a
 passport is worth six months of warning, an invoice a fortnight. So a project carries
-`defaultLeadDays`, and every dated fact created under it with no lead of its own takes it.
+`defaultLeadDays`, and every dated fact under it with no lead of its own is judged by it.
 
 `effectiveLeadDays` is the derived answer — own `defaultLeadDays` when set, else the nearest
 ancestor that set one, else the global 30 — computed in the same forest pass that rolls health
@@ -125,11 +125,21 @@ threshold flows DOWN into it.
 | `China Q2 Visa` under it, `defaultLeadDays: 90` | 90, its own overrides |
 | `Singapore Co`, top level, unset | 30, the global default |
 
-It applies at CREATE time only. A fact's lead is stored on the fact, so raising a project's
-default never silently rewrites what the facts already under it mean — and a caller who wants no
-window at all patches that fact's `leadDays` to 0, which is still the one way to say "exactly on
-the day". `0` in `defaultLeadDays` means UNSET, so patching it to 0 clears the project's own
-threshold and the ancestor's applies again.
+It applies at READ time, not at create time. A fact's `leadDays` is its OWN window and `0` means
+UNSET, so a dated fact stores exactly what it was given and `effectiveLeadDays` — `leadDays` when
+set, else the project's answer above — is what health, `due_soon` and `nextDue` are judged by.
+Raising a project's default therefore changes what every fact still borrowing it means, on the
+next read, with no migration and no write to any fact row. A fact that named its own window is
+untouched by that.
+
+Both write paths obey the one rule. Create once substituted the project's lead into the row while
+a patch to 0 stored a literal 0, so the same number meant two different things depending on which
+route wrote it and a fact could not round-trip through create; neither path substitutes now.
+
+`0` in `defaultLeadDays` means UNSET the same way, so patching it to 0 clears the project's own
+threshold and the ancestor's applies again. The accepted cost of spending 0 on "unset" at both
+levels is that a zero-day window is UNREPRESENTABLE: a date with no early warning at all cannot
+be expressed, and a lead of 1 is the nearest thing.
 
 ## Owner and nudges
 
@@ -199,7 +209,7 @@ here verbatim, and if the two ever disagree, the tool description is right:
 
 ```
 How to record something — take the FIRST rule that fits:
-1. A date in the future you must act by → kind=deadline with "due". The lead window defaults from the PROJECT, so set it once with "default_lead_days" on the project that holds this kind of date (passport renewals 180, visa renewals 90, company filings 60; anything else 30) rather than typing "lead_days" into every fact; "lead_days" is for the one fact that differs.
+1. A date in the future you must act by → kind=deadline with "due". The lead window comes from the PROJECT, so set it once with "default_lead_days" on the project that holds this kind of date (passport renewals 180, visa renewals 90, company filings 60; anything else 30) rather than typing "lead_days" into every fact; "lead_days" is for the one fact that differs, and "0" means "use the project's". Widening a project's default widens every fact still borrowing it, so fix the window in one place rather than editing facts.
 2. An obligation that repeats → kind=recurring with "due" (the FIRST occurrence), "rrule" and "tz".
 3. A step someone must complete → kind=milestone. If a HUMAN must act, set "blocker" to exactly what they must do, and clear it ("blocker": "") once they have. A blocked step cannot also be done.
 4. Only "what happened" or "what I learned" → kind=note. A note NEVER changes health, so if you are about to write a date into one, it is a deadline: go back to 1.
