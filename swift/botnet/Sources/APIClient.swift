@@ -229,33 +229,39 @@ struct APIClient {
 
     // MARK: projects
     //
-    // A project's health, nextDue and factCount are derived server-side and
-    // read-only here — a PATCH carries only {name, goal}. Facts are typed, so
-    // their bodies are heterogeneous JSON ({done: bool, leadDays: int}) rather
-    // than the flat string maps the calendar routes use. 404 on any of these
-    // means a botnetd that predates projects, which callers hide.
+    // A project's health, severity, nextDue, factCount and childCount are
+    // derived server-side and read-only here — a PATCH carries only
+    // {name, goal, parentId}. Facts are typed, so their bodies are
+    // heterogeneous JSON ({done: bool, leadDays: int}) rather than the flat
+    // string maps the calendar routes use. 404 on any of these means a botnetd
+    // that predates projects, which callers hide.
 
-    /// Sorted by health precedence, then nextDue ascending, then name — the
-    /// server's order, which the sidebar renders as-is. Never null on the wire.
+    /// A FLAT array of every project, each carrying its parentId; the client
+    /// builds the tree. Sorted by severity/health precedence, then nextDue
+    /// ascending, then name — the server's order, which the tree preserves
+    /// within each sibling group. Never null on the wire.
     func listProjects() async throws -> [Project] {
         try await get("/v1/projects")
     }
 
-    /// The project plus its facts, sorted urgency-first server-side.
+    /// The project, its facts and its direct children, all sorted server-side.
     func project(_ id: String) async throws -> ProjectDetail {
         try await get("/v1/projects/\(id)")
     }
 
     /// createdBy is the server's call: a project posted here is "user".
     /// An empty goal is omitted rather than sent as "", matching the wire shape
-    /// a bot's tool call produces.
-    func createProject(name: String, goal: String) async throws -> Project {
+    /// a bot's tool call produces; an empty parentId likewise means top level,
+    /// and the server validates that a given one exists.
+    func createProject(name: String, goal: String, parentID: String = "") async throws -> Project {
         var body = ["name": name]
         if !goal.isEmpty { body["goal"] = goal }
+        if !parentID.isEmpty { body["parentId"] = parentID }
         return try await send("/v1/projects", method: "POST", body: body)
     }
 
-    /// `fields` is any subset of {name, goal}; an empty string clears the goal.
+    /// `fields` is any subset of {name, goal, parentId}; an empty string clears
+    /// the goal, and `parentId: ""` moves the project back to the top level.
     /// The derived fields are not patchable and must never appear here.
     func updateProject(_ id: String, fields: [String: String]) async throws -> Project {
         try await send("/v1/projects/\(id)", method: "PATCH", body: fields)

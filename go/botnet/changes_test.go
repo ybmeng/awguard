@@ -258,7 +258,7 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 	// used deliberately: a dated one also writes its projected event, which
 	// TestProjectedFactEmitsItsChangeRows covers.
 	mark = topSeq(t, s)
-	project, err := s.CreateProject("Passports", "keep every passport valid", string(bot.ID))
+	project, err := s.CreateProject(Project{Name: "Passports", Goal: "keep every passport valid"}, string(bot.ID))
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
@@ -299,12 +299,22 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 	expectRows(t, logAfter(t, s, mark),
 		[]changeRow{{"fact", string(milestone.ID), "destroyed"}}, "DeleteFact")
 
-	// DeleteProject CASCADES to its facts, as an explicit per-row DELETE, so a
-	// sync client is never left holding facts of a project it saw die.
+	// DeleteProject CASCADES to its whole SUBTREE and to every fact under it, as
+	// explicit per-row DELETEs, so a sync client is never left holding a fact —
+	// or a sub-project — of a project it saw die.
 	orphan, err := s.CreateFact(project.ID,
 		Fact{Kind: FactNote, Title: "agent", Body: "corpsec@example.com"}, string(bot.ID))
 	if err != nil {
 		t.Fatalf("create fact for the cascade: %v", err)
+	}
+	child, err := s.CreateProject(Project{Name: "US Passport", ParentID: project.ID}, string(bot.ID))
+	if err != nil {
+		t.Fatalf("create sub-project: %v", err)
+	}
+	childFact, err := s.CreateFact(child.ID,
+		Fact{Kind: FactMilestone, Title: "book the appointment"}, string(bot.ID))
+	if err != nil {
+		t.Fatalf("create sub-project fact: %v", err)
 	}
 	mark = topSeq(t, s)
 	if err := s.DeleteProject(project.ID); err != nil {
@@ -312,7 +322,9 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 	}
 	expectRows(t, logAfter(t, s, mark), []changeRow{
 		{"fact", string(orphan.ID), "destroyed"},
+		{"fact", string(childFact.ID), "destroyed"},
 		{"project", string(project.ID), "destroyed"},
+		{"project", string(child.ID), "destroyed"},
 	}, "DeleteProject")
 
 	// DeleteBot tombstones everything the bot owned: both messages, both

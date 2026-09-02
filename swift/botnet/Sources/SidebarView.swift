@@ -83,8 +83,25 @@ struct SidebarView: View {
     /// persisted state, so an offscreen render is deterministic and leaves no
     /// defaults litter behind. Nil in the app.
     var collapsedOverride: Set<SidebarSection>? = nil
+    /// Snapshot-only, same reasoning: which projects render disclosed. Nil in
+    /// the app, where the persisted set below decides.
+    var expandedProjectsOverride: Set<String>? = nil
 
-    @State private var query = ""
+    @State private var query: String
+
+    /// `initialQuery` is Snapshot-only, the same seam CalendarView uses: the
+    /// search field cannot be typed into offscreen, and force-revealed matches
+    /// are a rendered state worth proving.
+    init(selection: Binding<SidebarSelection?>, showNewBot: Binding<Bool>,
+         showNewProject: Binding<Bool>, collapsedOverride: Set<SidebarSection>? = nil,
+         expandedProjectsOverride: Set<String>? = nil, initialQuery: String = "") {
+        _selection = selection
+        _showNewBot = showNewBot
+        _showNewProject = showNewProject
+        self.collapsedOverride = collapsedOverride
+        self.expandedProjectsOverride = expandedProjectsOverride
+        _query = State(initialValue: initialQuery)
+    }
 
     // One key per section (not one dictionary) so a future section adds a
     // line here and nothing migrates. Defaults expanded: a fresh install
@@ -94,8 +111,35 @@ struct SidebarView: View {
     @AppStorage("sidebar.projectsExpanded") private var projectsExpanded = true
     @AppStorage("sidebar.botsExpanded") private var botsExpanded = true
 
+    // Which projects are disclosed, as ONE comma-joined string rather than a
+    // key per project: the set is unbounded and its members come and go, so a
+    // key each would litter defaults with every project ever expanded. Sorted
+    // on write so the stored value is stable to diff.
+    @AppStorage("sidebar.expandedProjects") private var expandedProjectIDs = ""
+
     private var searching: Bool {
         !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var expandedProjects: Set<String> {
+        if let expandedProjectsOverride { return expandedProjectsOverride }
+        return Set(expandedProjectIDs.split(separator: ",").map(String.init))
+    }
+
+    /// The whole Projects section's shape, from the ONE place that knows it.
+    /// The rows, the section's search-reveal and the empty state all read this,
+    /// so none of them walks parentId itself.
+    private var projectRowSpecs: [ProjectTree.Row] {
+        ProjectTree(store.projects).rows(expanded: expandedProjects, query: query)
+    }
+
+    private func toggleProject(_ id: String) {
+        // An override is a fixed render, not a state a click may edit — and
+        // writing here would put defaults litter back into the snapshot path.
+        guard expandedProjectsOverride == nil else { return }
+        var ids = expandedProjects
+        if !ids.insert(id).inserted { ids.remove(id) }
+        expandedProjectIDs = ids.sorted().joined(separator: ",")
     }
 
     private var visibleBots: [Bot] {
@@ -164,11 +208,20 @@ struct SidebarView: View {
         .background(Palette.chrome)
     }
 
-    /// Whether a section's rows draw. Only Bots is search-revealed: the
-    /// search searches bots, so a match must be visible even under a
-    /// collapsed header — the chevron turns with it, honestly.
+    /// Whether a section's rows draw. A search reveals the two sections it
+    /// actually searches — Bots and Projects — so a match is visible even under
+    /// a collapsed header; the chevron turns with it, honestly, and the
+    /// persisted choice comes back when the search clears. Projects reveals
+    /// only when the query MATCHES something, so an unrelated search does not
+    /// pop an empty section open.
     private func revealed(_ section: SidebarSection) -> Bool {
-        expansion(section).wrappedValue || (section == .bots && searching)
+        if expansion(section).wrappedValue { return true }
+        guard searching else { return false }
+        switch section {
+        case .bots: return true
+        case .projects: return !projectRowSpecs.isEmpty
+        case .services, .automations: return false
+        }
     }
 
     @ViewBuilder
@@ -223,21 +276,30 @@ struct SidebarView: View {
 
     @ViewBuilder
     private var projectRows: some View {
+        let rows = projectRowSpecs
         if store.projects.isEmpty {
-            Text("No projects yet.")
-                .font(TypeScale.rowMeta)
-                .foregroundStyle(Palette.secondaryText)
-                .padding(.vertical, Metric.rowVPad)
-                .padding(.horizontal, Metric.sidebarGutter)
+            placeholder("No projects yet.")
+        } else if rows.isEmpty {
+            // Only reachable while searching: the section has projects, none of
+            // them match. Saying so beats an expanded header over nothing.
+            placeholder("No projects match.")
         }
-        ForEach(store.projects) { project in
+        ForEach(rows) { row in
             ProjectRow(
-                project: project,
-                selected: selection?.projectID == project.id
-            ) {
-                selection = .project(project.id)
-            }
+                row: row,
+                selected: selection?.projectID == row.project.id,
+                select: { selection = .project(row.project.id) },
+                toggle: { toggleProject(row.project.id) }
+            )
         }
+    }
+
+    private func placeholder(_ text: String) -> some View {
+        Text(text)
+            .font(TypeScale.rowMeta)
+            .foregroundStyle(Palette.secondaryText)
+            .padding(.vertical, Metric.rowVPad)
+            .padding(.horizontal, Metric.sidebarGutter)
     }
 
     @ViewBuilder
@@ -395,53 +457,91 @@ private struct AutomationRow: View {
     }
 }
 
-// A project's sidebar row: health dot in the shared leading column, the name,
-// and how long until the next thing is due. Built like AutomationRow — the dot
-// says the same kind of thing — with the due text where a bot row keeps its
-// stamp, because "overdue 3d" is the one number worth reading from the list.
+// A project's sidebar row, one node of the tree: an indent per level, a
+// disclosure caret where there are children, the SEVERITY dot, the name, and
+// how long until the next thing is due. The row is handed a ProjectTree.Row and
+// never walks parentId itself — depth and disclosure are decided in one place.
+//
+// The caret is a SIBLING of the select button, not inside its label: a button
+// nested in another button's label swallows its own clicks, the same trap
+// SectionHeader's accessory slot works around.
 private struct ProjectRow: View {
-    let project: Project
+    let row: ProjectTree.Row
     let selected: Bool
     let select: () -> Void
+    let toggle: () -> Void
 
     @State private var hovering = false
 
+    private var project: Project { row.project }
+
     var body: some View {
-        Button(action: select) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(Palette.health(project.health))
-                    .frame(width: Metric.healthDot, height: Metric.healthDot)
-                    // The same leading width a bot's avatar takes, so project
-                    // names share the sidebar's one text column.
-                    .frame(width: Metric.avatarRow)
-                Text(project.name)
-                    .font(TypeScale.rowTitle)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-                if let due = project.nextDueText {
-                    Text(due)
-                        .font(TypeScale.rowMeta)
-                        // Overdue is the one state the list itself has to
-                        // shout; the rest stay quiet meta text.
-                        .foregroundStyle(project.health == "overdue"
-                                         ? Palette.healthOverdue : Palette.secondaryText)
-                        .lineLimit(1)
-                }
-            }
-            .foregroundStyle(Palette.primaryText)
-            .padding(.vertical, Metric.rowVPad)
-            .padding(.horizontal, Metric.sidebarGutter)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous))
-            .background(
-                background,
-                in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
-            )
+        HStack(spacing: 4) {
+            Color.clear
+                .frame(width: CGFloat(row.depth) * Metric.projectTreeIndent, height: 0)
+            disclosure
+            Button(action: select) { content }
+                .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
+        .padding(.vertical, Metric.rowVPad)
+        .padding(.horizontal, Metric.sidebarGutter)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            background,
+            in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
+        )
         .onHover { hovering = $0 }
-        .help("\(project.name) — \(project.healthLabel)")
+        // The severity is in the tooltip because the dot can only color it, and
+        // "S0" is the word the tool and the pane both use for this row.
+        .help("\(project.name) — \(project.severityText)")
+    }
+
+    // A leaf reserves the caret's width and draws nothing, so sibling names
+    // line up whether or not they have children.
+    @ViewBuilder
+    private var disclosure: some View {
+        if row.hasChildren {
+            Button(action: toggle) {
+                Image(systemName: "chevron.right")
+                    .font(TypeScale.sectionChevron)
+                    .foregroundStyle(Palette.secondaryText)
+                    .rotationEffect(.degrees(row.expanded ? 90 : 0))
+                    .frame(width: Metric.projectDisclosureWidth)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(row.expanded ? "Collapse \(project.name)" : "Expand \(project.name)")
+        } else {
+            Color.clear.frame(width: Metric.projectDisclosureWidth, height: 1)
+        }
+    }
+
+    private var content: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Palette.projectDot(severity: project.severity, health: project.health))
+                .frame(width: Metric.healthDot, height: Metric.healthDot)
+                // A compact dot column rather than the bot avatar's width: the
+                // caret column now does the aligning, and three levels of
+                // 30pt-plus leading would push a deep name off the row.
+                .frame(width: Metric.projectDisclosureWidth)
+            Text(project.name)
+                .font(TypeScale.rowTitle)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            if let due = project.nextDueText {
+                Text(due)
+                    .font(TypeScale.rowMeta)
+                    // Overdue is the one state the list itself has to
+                    // shout; the rest stay quiet meta text.
+                    .foregroundStyle(project.health == "overdue"
+                                     ? Palette.healthOverdue : Palette.secondaryText)
+                    .lineLimit(1)
+            }
+        }
+        .foregroundStyle(Palette.primaryText)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
     private var background: Color {

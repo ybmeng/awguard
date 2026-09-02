@@ -789,7 +789,8 @@ const projectLadder = `How to record something — take the FIRST rule that fits
 4. Only "what happened" or "what I learned" → kind=note. A note NEVER changes health, so if you are about to write a date into one, it is a deadline: go back to 1.
 5. Before "create" or "add_fact", run "show" on the project. Update the existing fact with update_fact rather than adding a twin — a duplicate title is refused.
 6. When a deadline is renewed (a new passport arrives), set "due" to the new date. Mark it done ONLY when the obligation itself no longer exists.
-7. Never mark anything done without evidence, and record that evidence as a note in the same turn.`
+7. Never mark anything done without evidence, and record that evidence as a note in the same turn.
+8. A document or entity with its own dates and notes under a bigger goal (Passport under Document Expirations) → a sub-project: "create" with "parent". A single date under a project → a fact.`
 
 // noteTitleLimit caps the title the "note" shorthand derives from the body: a
 // note is a paragraph, and its title is just the handle the list shows.
@@ -804,6 +805,8 @@ const noteTitleLimit = 60
 type projectArgs struct {
 	Command  string  `json:"command"`
 	Project  *string `json:"project"`
+	Parent   *string `json:"parent"`
+	NewName  *string `json:"new_name"`
 	Goal     *string `json:"goal"`
 	Kind     *string `json:"kind"`
 	Title    *string `json:"title"`
@@ -823,6 +826,10 @@ func (a projectArgs) ptr(name string) *string {
 	switch name {
 	case "project":
 		return a.Project
+	case "parent":
+		return a.Parent
+	case "new_name":
+		return a.NewName
 	case "goal":
 		return a.Goal
 	case "kind":
@@ -895,8 +902,17 @@ var projectCommands = []projectCommand{
 	{
 		name:     "create",
 		requires: []string{"project"},
-		doc:      `"create": starts a project. Requires "project" (its name); optional "goal".`,
-		run:      runProjectCreate,
+		doc: `"create": starts a project. Requires "project" (its name); optional "goal" and ` +
+			`"parent" (an existing project's name, making this one a sub-project of it).`,
+		run: runProjectCreate,
+	},
+	{
+		name:     "update",
+		requires: []string{"project"},
+		doc: `"update": changes a project itself, not its facts. Requires "project" plus any of ` +
+			`"new_name", "goal", "parent" (an existing project's name to move it under, or "none" to ` +
+			`make it top-level) — omitted fields are left alone.`,
+		run: runProjectUpdate,
 	},
 	{
 		name:     "add_fact",
@@ -966,7 +982,9 @@ func projectToolDef() wireTool {
 					"description": "The operation to perform.",
 				},
 				"project":   str(`A project, by name (case-insensitive). Required by every command but "list".`),
-				"goal":      str(`What the project is for, one line. Optional, for "create".`),
+				"parent":    str(`The project this one sits under, by name. Optional, for "create" and "update"; "none" makes it top-level again.`),
+				"new_name":  str(`A project's new name, for "update". Optional.`),
+				"goal":      str(`What the project is for, one line. Optional, for "create" and "update".`),
 				"kind":      str(`The kind of fact: ` + strings.Join(factKinds(), ", ") + `. Required for "add_fact".`),
 				"title":     str(`The fact's title for "add_fact"; the fact to change for "update_fact".`),
 				"new_title": str(`A fact's new title, for "update_fact". Optional.`),
@@ -1118,18 +1136,20 @@ func duplicateTitleError(title, project string) string {
 func wholeDays(d time.Duration) int { return int(d.Round(24*time.Hour) / (24 * time.Hour)) }
 
 // healthLine is the one-line state a mutating result ends with, e.g.
-// `Passports: due_soon, next due 2027-03-14 (in 193d)`.
+// `Passports: S1 due_soon, next due 2027-03-14 (in 193d)`. The severity band
+// leads, so a model reading one result knows how loud it is without holding a
+// table of five healths — and the value is the same string the app colours from.
 func healthLine(now time.Time, p Project) string {
 	if p.NextDue == nil {
-		return fmt.Sprintf("%s: %s", p.Name, p.Health)
+		return fmt.Sprintf("%s: %s %s", p.Name, p.Severity, p.Health)
 	}
 	due := p.NextDue.Local()
 	if due.Before(now) {
-		return fmt.Sprintf("%s: %s, next due %s (%dd overdue)",
-			p.Name, p.Health, due.Format(time.DateOnly), wholeDays(now.Sub(due)))
+		return fmt.Sprintf("%s: %s %s, next due %s (%dd overdue)",
+			p.Name, p.Severity, p.Health, due.Format(time.DateOnly), wholeDays(now.Sub(due)))
 	}
-	return fmt.Sprintf("%s: %s, next due %s (in %dd)",
-		p.Name, p.Health, due.Format(time.DateOnly), wholeDays(due.Sub(now)))
+	return fmt.Sprintf("%s: %s %s, next due %s (in %dd)",
+		p.Name, p.Severity, p.Health, due.Format(time.DateOnly), wholeDays(due.Sub(now)))
 }
 
 // withHealth appends the project's CURRENT health line to a result. Health is
@@ -1151,21 +1171,62 @@ func runProjectList(s *Store, _ BotID, _ projectArgs) (string, error) {
 	if len(projects) == 0 {
 		return "(no projects yet — 'create' starts one)", nil
 	}
+	return renderProjectTree(time.Now(), projects), nil
+}
+
+// renderProjectTree walks the server's FLAT, urgency-ordered array into the
+// indented tree a model reads as a shape: children under their parent, two
+// spaces per level, severity leading every line. The list is one call and the
+// nesting is derived here rather than fetched, exactly as the app derives it.
+//
+// The walk starts from the roots in the server's order and recurses in it, so
+// the tree is still "most urgent first" within each level; an orphaned pointer
+// makes a root, matching what the store's own derivation does with one.
+func renderProjectTree(now time.Time, projects []Project) string {
+	known := map[ProjectID]bool{}
+	for _, p := range projects {
+		known[p.ID] = true
+	}
+	byParent := map[ProjectID][]Project{}
+	var roots []Project
+	for _, p := range projects {
+		if p.ParentID != "" && known[p.ParentID] {
+			byParent[p.ParentID] = append(byParent[p.ParentID], p)
+			continue
+		}
+		roots = append(roots, p)
+	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "now: %s\n", localRFC3339(time.Now()))
+	fmt.Fprintf(&b, "now: %s\n", localRFC3339(now))
 	fmt.Fprintf(&b, "%d project(s), most urgent first:\n", len(projects))
-	for i, p := range projects {
-		fmt.Fprintf(&b, "%d. %s — %s", i+1, p.Name, p.Health)
+	drawn := map[ProjectID]bool{}
+	var walk func(p Project, depth int)
+	walk = func(p Project, depth int) {
+		if drawn[p.ID] {
+			return
+		}
+		drawn[p.ID] = true
+		fmt.Fprintf(&b, "%s- %s %s — %s", strings.Repeat("  ", depth), p.Severity, p.Name, p.Health)
 		if p.NextDue != nil {
 			fmt.Fprintf(&b, ", next due %s", localRFC3339(*p.NextDue))
 		}
-		fmt.Fprintf(&b, "  (%d fact(s))", p.FactCount)
+		fmt.Fprintf(&b, "  (%d fact(s)", p.FactCount)
+		if p.ChildCount > 0 {
+			fmt.Fprintf(&b, ", %d sub-project(s)", p.ChildCount)
+		}
+		b.WriteString(")")
 		if p.Goal != "" {
 			fmt.Fprintf(&b, "  — %s", p.Goal)
 		}
 		b.WriteString("\n")
+		for _, c := range byParent[p.ID] {
+			walk(c, depth+1)
+		}
 	}
-	return strings.TrimRight(b.String(), "\n"), nil
+	for _, r := range roots {
+		walk(r, 0)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func runProjectShow(s *Store, _ BotID, a projectArgs) (string, error) {
@@ -1174,11 +1235,11 @@ func runProjectShow(s *Store, _ BotID, a projectArgs) (string, error) {
 	if err != nil || errText != "" {
 		return errText, err
 	}
-	_, facts, err := s.GetProject(p.ID)
+	fresh, facts, children, err := s.GetProjectDetail(p.ID)
 	if err != nil {
 		return projectStoreError(err)
 	}
-	return renderProject(time.Now(), p, facts), nil
+	return renderProject(time.Now(), fresh, children, facts), nil
 }
 
 // healthBearing reports whether any fact can move the project's health at all.
@@ -1194,13 +1255,29 @@ func healthBearing(facts []Fact) bool {
 }
 
 // renderProject formats one project for the model: the current time first (the
-// anchor "due in three weeks" needs), then the header, then a line per fact in
-// the store's urgency-first order.
-func renderProject(now time.Time, p Project, facts []Fact) string {
+// anchor "due in three weeks" needs), then the header, then its DIRECT
+// sub-projects if it has any, then a line per fact in the store's urgency-first
+// order.
+//
+// The sub-projects come before the facts because they are the reason the
+// project's own health may not be explained by anything below: a parent showing
+// S0 with three quiet facts is telling the model to look at a child. Only
+// direct children are listed — a grandchild belongs on its own parent's page,
+// and the model gets there by showing that one.
+func renderProject(now time.Time, p Project, children []Project, facts []Fact) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "now: %s\n%s — %s", localRFC3339(now), p.Name, p.Health)
+	fmt.Fprintf(&b, "now: %s\n%s — %s %s", localRFC3339(now), p.Name, p.Severity, p.Health)
 	if p.Goal != "" {
 		fmt.Fprintf(&b, "\ngoal: %s", p.Goal)
+	}
+	if len(children) > 0 {
+		b.WriteString("\nSub-projects:")
+		for _, c := range children {
+			fmt.Fprintf(&b, "\n- %s %s — %s", c.Severity, c.Name, c.Health)
+			if c.NextDue != nil {
+				fmt.Fprintf(&b, ", next due %s", localRFC3339(*c.NextDue))
+			}
+		}
 	}
 	if len(facts) == 0 {
 		b.WriteString("\n(no facts yet — add_fact records one)")
@@ -1238,16 +1315,88 @@ func renderProject(now time.Time, p Project, facts []Fact) string {
 // model is told WHY there is no verdict and which kinds would produce one.
 const noHealthPrompt = "health unknown: add a deadline, recurring or milestone fact"
 
+// noParentWord is what a model writes to make a project top-level again. A
+// sentinel word rather than an empty string, because the flat schema's empty
+// value already means "field not supplied" everywhere else in this tool, and a
+// model that means "clear it" must be able to say so out loud.
+const noParentWord = "none"
+
+// parentArg resolves the "parent" name a model supplied into an id: "" when it
+// named none or wrote the sentinel, otherwise the named project, with the same
+// instructive error projectNamed gives for any unknown name. It reports whether
+// the field was SUPPLIED, so an update that never mentions a parent leaves the
+// one a project has.
+func parentArg(s *Store, a projectArgs) (id ProjectID, supplied bool, errText string, err error) {
+	raw, ok := a.given("parent")
+	if !ok {
+		return "", false, "", nil
+	}
+	if strings.TrimSpace(raw) == "" || strings.EqualFold(strings.TrimSpace(raw), noParentWord) {
+		return "", true, "", nil
+	}
+	parent, errText, err := projectNamed(s, raw)
+	if err != nil || errText != "" {
+		return "", true, errText, err
+	}
+	return parent.ID, true, "", nil
+}
+
 func runProjectCreate(s *Store, botID BotID, a projectArgs) (string, error) {
 	name, _ := a.field("project")
 	goal, _ := a.field("goal")
+	parent, _, errText, err := parentArg(s, a)
+	if err != nil || errText != "" {
+		return errText, err
+	}
 	// createdBy is the CALLING bot, stamped by the store — the model cannot
 	// name an author, so a project always says who really started it.
-	p, err := s.CreateProject(name, goal, string(botID))
+	p, err := s.CreateProject(Project{Name: name, Goal: goal, ParentID: parent}, string(botID))
 	if err != nil {
 		return projectStoreError(err)
 	}
-	return withHealth(s, p.ID, fmt.Sprintf("created project %q", p.Name))
+	text := fmt.Sprintf("created project %q", p.Name)
+	if p.ParentID != "" {
+		if under, _, err := s.GetProject(p.ParentID); err == nil {
+			text += fmt.Sprintf(" under %q", under.Name)
+		}
+	}
+	return withHealth(s, p.ID, text)
+}
+
+// runProjectUpdate is the project's own patch — the counterpart to update_fact,
+// and the only way a bot moves one project under another. There is still no
+// delete: renaming and re-parenting are reversible, so they are safe for a
+// cheap model in a way dropping a history is not.
+func runProjectUpdate(s *Store, _ BotID, a projectArgs) (string, error) {
+	name, _ := a.field("project")
+	p, errText, err := projectNamed(s, name)
+	if err != nil || errText != "" {
+		return errText, err
+	}
+	var patch ProjectPatch
+	// new_name is non-empty-only (a project must have a name); goal is
+	// clearable, so it reads the SUPPLIED value, empty included.
+	if v, ok := a.field("new_name"); ok {
+		patch.Name = &v
+	}
+	if v, ok := a.given("goal"); ok {
+		patch.Goal = &v
+	}
+	parent, supplied, errText, err := parentArg(s, a)
+	if err != nil || errText != "" {
+		return errText, err
+	}
+	if supplied {
+		patch.ParentID = &parent
+	}
+	if patch.Name == nil && patch.Goal == nil && patch.ParentID == nil {
+		return "error: 'update' needs at least one of new_name, goal, parent to change", nil
+	}
+	updated, err := s.UpdateProject(p.ID, patch)
+	if err != nil {
+		return projectStoreError(err)
+	}
+	return withHealth(s, updated.ID, fmt.Sprintf("updated project %q", updated.Name))
 }
 
 func runProjectAddFact(s *Store, botID BotID, a projectArgs) (string, error) {

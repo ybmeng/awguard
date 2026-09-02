@@ -702,6 +702,131 @@ struct DecodeCheck {
             }
         }
 
+        // Hierarchy and severity (rock 1). parentId is omitempty, so a
+        // top-level project sends NO key at all; a server that sends "" must
+        // read as the same thing, because the sidebar has exactly one notion
+        // of "root" and two spellings of it would split the tree in half.
+        let childProject = Data("""
+        {"id":"prj_01M1C0000000000000000011","name":"Passport","goal":"","parentId":"prj_01M1C0000000000000000010","createdBy":"user","createdAt":"2026-09-01T08:10:00Z","updatedAt":"2026-09-01T08:10:00Z","health":"overdue","severity":"S0","nextDue":"2026-08-20T00:00:00Z","factCount":2,"childCount":0}
+        """.utf8)
+        let rootProject = Data("""
+        {"id":"prj_01M1C0000000000000000010","name":"Document Expirations","goal":"Nothing lapses","createdBy":"user","createdAt":"2026-09-01T08:09:00Z","updatedAt":"2026-09-01T08:09:00Z","health":"overdue","severity":"S0","nextDue":"2026-08-20T00:00:00Z","factCount":0,"childCount":3}
+        """.utf8)
+        let emptyParentProject = Data("""
+        {"id":"prj_01M1C0000000000000000012","name":"Loose","goal":"","parentId":"","createdBy":"user","createdAt":"2026-09-01T08:11:00Z","updatedAt":"2026-09-01T08:11:00Z","health":"ok","severity":"S2","factCount":1,"childCount":0}
+        """.utf8)
+        await check("Project.parentId: present, absent and \"\" (absent and \"\" are both root)") {
+            let child = try decoder.decode(Project.self, from: childProject)
+            let root = try decoder.decode(Project.self, from: rootProject)
+            let empty = try decoder.decode(Project.self, from: emptyParentProject)
+            guard child.parentId == "prj_01M1C0000000000000000010", !child.isTopLevel,
+                  root.parentId == nil, root.isTopLevel,
+                  empty.parentId == nil, empty.isTopLevel
+            else {
+                throw NSError(domain: "decode-check", code: 48, userInfo: [
+                    NSLocalizedDescriptionKey: "parentId decoded wrong: \(child) / \(root) / \(empty)",
+                ])
+            }
+        }
+
+        // childCount is omitempty too: a leaf sends no key, and absent IS 0.
+        await check("Project.childCount: present, and absent reads as 0") {
+            let root = try decoder.decode(Project.self, from: rootProject)
+            let leaf = try decoder.decode(Project.self, from: bareProject)
+            guard root.childCount == 3, root.hasChildren,
+                  leaf.childCount == 0, !leaf.hasChildren
+            else {
+                throw NSError(domain: "decode-check", code: 49, userInfo: [
+                    NSLocalizedDescriptionKey: "childCount decoded wrong: \(root) / \(leaf)",
+                ])
+            }
+        }
+
+        // Severity is DERIVED from the rolled-up health, so it is a wire string
+        // for the same reason health is: an S3 from a newer server must render,
+        // not throw. A server that predates severity sends no key, which reads
+        // as "" — and that must not be mistaken for a real severity.
+        let severities = ["S0", "S1", "S2", "S7"]
+        await check("Project.severity: S0/S1/S2, an unknown value, and absent") {
+            for value in severities {
+                let data = Data("""
+                {"id":"prj_sev_\(value)","name":"Sev \(value)","goal":"","createdBy":"user","createdAt":"2026-09-01T08:12:00Z","updatedAt":"2026-09-01T08:12:00Z","health":"ok","severity":"\(value)","factCount":0}
+                """.utf8)
+                let p = try decoder.decode(Project.self, from: data)
+                guard p.severity == value, p.hasSeverity else {
+                    throw NSError(domain: "decode-check", code: 50, userInfo: [
+                        NSLocalizedDescriptionKey: "severity \(value) decoded as \(p.severity)",
+                    ])
+                }
+            }
+            // The pre-severity server: no key, and the app must know it has none
+            // rather than treating "" as a severity of its own.
+            let old = try decoder.decode(Project.self, from: bareProject)
+            guard old.severity.isEmpty, !old.hasSeverity else {
+                throw NSError(domain: "decode-check", code: 50, userInfo: [
+                    NSLocalizedDescriptionKey: "absent severity decoded as \(old.severity)",
+                ])
+            }
+        }
+
+        // GET /v1/projects/{id} gains `children`: the DIRECT children with
+        // their own derived fields. Absent (old server) and null (Go nil slice)
+        // are both an empty list, exactly like `facts`.
+        let detailWithChildren = Data("""
+        {"project":{"id":"prj_01M1C0000000000000000010","name":"Document Expirations","goal":"Nothing lapses","createdBy":"user","createdAt":"2026-09-01T08:09:00Z","updatedAt":"2026-09-01T08:09:00Z","health":"overdue","severity":"S0","nextDue":"2026-08-20T00:00:00Z","factCount":0,"childCount":2},"facts":null,"children":[{"id":"prj_01M1C0000000000000000011","name":"Passport","goal":"","parentId":"prj_01M1C0000000000000000010","createdBy":"user","createdAt":"2026-09-01T08:10:00Z","updatedAt":"2026-09-01T08:10:00Z","health":"overdue","severity":"S0","nextDue":"2026-08-20T00:00:00Z","factCount":2},{"id":"prj_01M1C0000000000000000013","name":"China Q2 Visa","goal":"","parentId":"prj_01M1C0000000000000000010","createdBy":"user","createdAt":"2026-09-01T08:13:00Z","updatedAt":"2026-09-01T08:13:00Z","health":"due_soon","severity":"S1","nextDue":"2026-09-20T00:00:00Z","factCount":1}]}
+        """.utf8)
+        let detailNullChildren = Data("""
+        {"project":{"id":"prj_01M1C0000000000000000011","name":"Passport","goal":"","parentId":"prj_01M1C0000000000000000010","createdBy":"user","createdAt":"2026-09-01T08:10:00Z","updatedAt":"2026-09-01T08:10:00Z","health":"overdue","severity":"S0","factCount":2},"facts":null,"children":null}
+        """.utf8)
+        await check("ProjectDetail.children: present, null and absent") {
+            let withKids = try decoder.decode(ProjectDetail.self, from: detailWithChildren)
+            let nullKids = try decoder.decode(ProjectDetail.self, from: detailNullChildren)
+            // `projectDetail` above predates the key entirely.
+            let absentKids = try decoder.decode(ProjectDetail.self, from: projectDetail)
+            guard withKids.children.count == 2,
+                  withKids.children[0].name == "Passport",
+                  withKids.children[0].severity == "S0",
+                  withKids.children[0].parentId == withKids.project.id,
+                  withKids.children[1].severity == "S1",
+                  nullKids.children.isEmpty, absentKids.children.isEmpty
+            else {
+                throw NSError(domain: "decode-check", code: 51, userInfo: [
+                    NSLocalizedDescriptionKey: "children decoded wrong: \(withKids) / \(nullKids) / \(absentKids)",
+                ])
+            }
+        }
+
+        // The tree is built ONCE from the flat list, and every view reads it —
+        // so the shape it produces is asserted here rather than eyeballed in a
+        // screenshot. The exhaustive cases (orphans, cycles, ordering) live in
+        // the scratchpad harness; this is the contract's own 3-level example.
+        await check("ProjectTree builds the contract's 3-level example") {
+            let flat = try decoder.decode([Project].self, from: Data("""
+            [{"id":"p1","name":"Document Expirations","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"overdue","severity":"S0","childCount":2},
+             {"id":"p2","name":"Passport","parentId":"p1","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"overdue","severity":"S0","childCount":1},
+             {"id":"p3","name":"Renewal appointment","parentId":"p2","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2"},
+             {"id":"p4","name":"China Q2 Visa","parentId":"p1","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"due_soon","severity":"S1"},
+             {"id":"p5","name":"Singapore Pte Ltd","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2"}]
+            """.utf8))
+            let tree = ProjectTree(flat)
+            guard tree.roots.map(\.id) == ["p1", "p5"],
+                  tree.children(of: "p1").map(\.id) == ["p2", "p4"],
+                  tree.depth(of: "p3") == 2, tree.depth(of: "p1") == 0,
+                  tree.subtree(of: "p1").map(\.id) == ["p1", "p2", "p3", "p4"],
+                  tree.rows(expanded: ["p1", "p2"]).map(\.project.id)
+                      == ["p1", "p2", "p3", "p4", "p5"],
+                  tree.rows(expanded: []).map(\.project.id) == ["p1", "p5"],
+                  // The Edit sheet's Parent picker: everything outside this
+                  // project's own subtree, so a cycle is never offered.
+                  tree.parentCandidates(for: "p2").map(\.project.id) == ["p1", "p4", "p5"],
+                  tree.parentCandidates(for: "p1").map(\.project.id) == ["p5"]
+            else {
+                throw NSError(domain: "decode-check", code: 52, userInfo: [
+                    NSLocalizedDescriptionKey: "tree shape wrong: roots \(tree.roots.map(\.id)), rows \(tree.rows(expanded: ["p1", "p2"]).map(\.project.id))",
+                ])
+            }
+        }
+
         // The four kinds the sheet offers are a Swift enum with a field table;
         // the table is what decides which inputs show, so it is checked here
         // rather than only by eye in a screenshot.
@@ -806,6 +931,48 @@ struct DecodeCheck {
                 do {
                     let projects = try await api.listProjects()
                     for p in projects { _ = try await api.project(p.id) }
+                } catch let e where APIClient.isUnimplemented(e) {}
+            }
+            // The flat list has to be a well-formed tree on its own: every
+            // parentId resolves inside it, and the server's childCount agrees
+            // with what the client can actually draw. A server that disagreed
+            // would render a project the sidebar silently hides. An older
+            // server sends neither field, which is a flat tree and passes.
+            await check("live /v1/projects is a consistent tree (parents resolve, childCount agrees)") {
+                do {
+                    let projects = try await api.listProjects()
+                    let tree = ProjectTree(projects)
+                    let ids = Set(projects.map(\.id))
+                    for p in projects {
+                        if let parent = p.parentId, !ids.contains(parent) {
+                            throw NSError(domain: "decode-check", code: 53, userInfo: [
+                                NSLocalizedDescriptionKey: "\(p.name) has parentId \(parent), which is not in the list",
+                            ])
+                        }
+                        guard tree.children(of: p.id).count == p.childCount else {
+                            throw NSError(domain: "decode-check", code: 53, userInfo: [
+                                NSLocalizedDescriptionKey: "\(p.name): server says childCount \(p.childCount), the list has \(tree.children(of: p.id).count)",
+                            ])
+                        }
+                        // The detail's own children must be the same set the
+                        // tree drew, or the pane's strip and the sidebar
+                        // disagree about what hangs under this project.
+                        let detail = try await api.project(p.id)
+                        guard Set(detail.children.map(\.id))
+                                == Set(tree.children(of: p.id).map(\.id)) else {
+                            throw NSError(domain: "decode-check", code: 53, userInfo: [
+                                NSLocalizedDescriptionKey: "\(p.name): detail children \(detail.children.map(\.name)) != list children \(tree.children(of: p.id).map(\.name))",
+                            ])
+                        }
+                    }
+                    // Every project is reachable from a root: an unreachable
+                    // one would exist on the wire and nowhere in the UI.
+                    let reachable = Set(tree.roots.flatMap { tree.subtree(of: $0.id) }.map(\.id))
+                    guard reachable == ids else {
+                        throw NSError(domain: "decode-check", code: 53, userInfo: [
+                            NSLocalizedDescriptionKey: "unreachable projects: \(ids.subtracting(reachable))",
+                        ])
+                    }
                 } catch let e where APIClient.isUnimplemented(e) {}
             }
             for b in bots {

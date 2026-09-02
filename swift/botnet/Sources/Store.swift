@@ -518,10 +518,13 @@ final class AppStore: ObservableObject {
 
     /// Returns the created project so the caller can select it; nil when the
     /// create failed, which keeps the sheet open with its draft.
-    func createProject(name: String, goal: String) async -> Project? {
+    func createProject(name: String, goal: String, parentID: String = "") async -> Project? {
         do {
-            let created = try await api.createProject(name: name, goal: goal)
+            let created = try await api.createProject(name: name, goal: goal, parentID: parentID)
             await refreshProjects()
+            // The parent's own detail now has one more child and possibly a
+            // worse rolled-up severity; its cached copy has neither.
+            if !parentID.isEmpty { await loadProject(parentID) }
             return created
         } catch {
             lastError = projectError(error, verb: "add a project")
@@ -547,6 +550,13 @@ final class AppStore: ObservableObject {
             // A rename re-sorts the list at equal health, and the server also
             // rewrites the projected events' titles — re-read rather than guess.
             await refreshProjects()
+            // A MOVE changes two other projects: the parent it left and the one
+            // it joined each gain or lose a child and re-roll their severity.
+            if fields["parentId"] != nil {
+                for parent in Set([project.parentId, updated.parentId].compactMap { $0 }) {
+                    await loadProject(parent)
+                }
+            }
             return true
         } catch {
             lastError = projectError(error, verb: "edit a project")
@@ -554,13 +564,18 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// The server cascades: the project's facts and their projected calendar
-    /// events go with it, so the cached events are stale afterwards too.
+    /// The server cascades the WHOLE SUBTREE: descendant projects, every fact
+    /// under them and their projected calendar events all go. Which rows that
+    /// removed is the server's answer, not a local guess, so the list is
+    /// re-read rather than spliced — and the parent it hung under re-rolls its
+    /// severity from what is left.
     func deleteProject(_ project: Project) async {
         do {
+            let subtree = ProjectTree(projects).subtree(of: project.id).map(\.id)
             try await api.deleteProject(project.id)
-            projects.removeAll { $0.id == project.id }
-            projectDetails[project.id] = nil
+            for id in subtree.isEmpty ? [project.id] : subtree { projectDetails[id] = nil }
+            await refreshProjects()
+            if let parent = project.parentId { await loadProject(parent) }
             await refreshEvents()
         } catch {
             lastError = projectError(error, verb: "delete a project")

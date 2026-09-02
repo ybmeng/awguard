@@ -447,12 +447,17 @@ private struct CalendarManageRow: View {
 
 // MARK: - Projects
 
-/// New project: a name and an optional goal, nothing else. Health, nextDue and
-/// factCount are derived server-side from facts that do not exist yet, so there
-/// is deliberately nothing to set for them here.
+/// New project: a name, an optional goal, and — when it was opened from a
+/// project's pane — the parent it hangs under. Health, severity, nextDue and
+/// the counts are derived server-side from facts and children that do not exist
+/// yet, so there is deliberately nothing to set for them here.
 struct NewProjectSheet: View {
     @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
+    /// Preset by "New Sub-project"; nil from the sidebar's "+". Fixed rather
+    /// than a picker: the pane you opened it from IS the answer, and offering
+    /// to change it there would be a second way to do what Edit already does.
+    var parent: Project? = nil
     /// Selects the created project, so making one lands you in its pane rather
     /// than back where you started.
     var onCreated: (Project) -> Void = { _ in }
@@ -471,15 +476,23 @@ struct NewProjectSheet: View {
             Form {
                 Section {
                     TextField("Name", text: $name)
+                    if let parent {
+                        LabeledContent("Parent", value: parent.name)
+                    }
                 }
                 Section("Goal") {
+                    // A grouped Form prints a TextField's label ahead of the
+                    // field and right-aligns what is left, so an empty label
+                    // pushes the goal text to the far edge of the box.
                     TextField("", text: $goal, axis: .vertical)
                         .lineLimit(3...8)
+                        .labelsHidden()
+                        .multilineTextAlignment(.leading)
                 }
             }
             .formStyle(.grouped)
             .frame(minWidth: 420, minHeight: 300)
-            .navigationTitle("New Project")
+            .navigationTitle(parent == nil ? "New Project" : "New Sub-project")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
@@ -489,7 +502,8 @@ struct NewProjectSheet: View {
                         saving = true
                         Task {
                             let created = await store.createProject(
-                                name: trimmedName, goal: cleaned(goal))
+                                name: trimmedName, goal: cleaned(goal),
+                                parentID: parent?.id ?? "")
                             saving = false
                             // A failed create (duplicate name) keeps the sheet
                             // open with the draft; the shared alert explains.
@@ -510,10 +524,10 @@ struct NewProjectSheet: View {
     }
 }
 
-/// Rename a project or restate its goal. Explicit Save, and only the changed
-/// fields go on the wire: projects are last-write-wins like events, so
-/// resending an untouched goal would clobber whatever a bot wrote to it while
-/// this sheet was open.
+/// Rename a project, restate its goal, or move it under a different parent.
+/// Explicit Save, and only the changed fields go on the wire: projects are
+/// last-write-wins like events, so resending an untouched goal would clobber
+/// whatever a bot wrote to it while this sheet was open.
 struct EditProjectSheet: View {
     @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
@@ -522,25 +536,47 @@ struct EditProjectSheet: View {
 
     @State private var name: String
     @State private var goal: String
+    /// "" is None, the top level — the same value the PATCH sends to clear it,
+    /// so the picker's selection needs no translation on the way out.
+    @State private var parentID: String
     @State private var saving = false
 
     init(project: Project) {
         self.project = project
         _name = State(initialValue: project.name)
         _goal = State(initialValue: project.goal)
+        _parentID = State(initialValue: project.parentId ?? "")
     }
 
     private var trimmedName: String { name.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    /// Rendered with each candidate's depth so two entries at different levels
+    /// stay tellable apart; which projects qualify is the tree's own rule.
+    private var candidates: [ProjectTree.Row] {
+        ProjectTree(store.projects).parentCandidates(for: project.id)
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     TextField("Name", text: $name)
+                    Picker("Parent", selection: $parentID) {
+                        Text("None (top level)").tag("")
+                        ForEach(candidates) { row in
+                            Text(String(repeating: "   ", count: row.depth) + row.project.name)
+                                .tag(row.project.id)
+                        }
+                    }
                 }
                 Section("Goal") {
+                    // A grouped Form prints a TextField's label ahead of the
+                    // field and right-aligns what is left, so an empty label
+                    // pushes the goal text to the far edge of the box.
                     TextField("", text: $goal, axis: .vertical)
                         .lineLimit(3...8)
+                        .labelsHidden()
+                        .multilineTextAlignment(.leading)
                 }
             }
             .formStyle(.grouped)
@@ -570,6 +606,9 @@ struct EditProjectSheet: View {
         if trimmedName != project.name { fields["name"] = trimmedName }
         let trimmedGoal = goal.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedGoal != project.goal { fields["goal"] = trimmedGoal }
+        // Only on a real move, and "" is how the wire says "back to the top
+        // level" — the key's presence is what asks for the change at all.
+        if parentID != (project.parentId ?? "") { fields["parentId"] = parentID }
         return fields
     }
 }
@@ -652,8 +691,11 @@ struct AddFactSheet: View {
                 }
                 if kind.fields.contains(.body) {
                     Section(kind == .note ? "Note" : "Details") {
+                        // Same label-slot trap as the Goal box above.
                         TextField("", text: $body_, axis: .vertical)
                             .lineLimit(3...8)
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
                     }
                 }
             }

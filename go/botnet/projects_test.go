@@ -183,7 +183,7 @@ func TestProjectHealthRecurring(t *testing.T) {
 
 func mustProject(t *testing.T, s *Store, name, goal string) Project {
 	t.Helper()
-	p, err := s.CreateProject(name, goal, userAuthor)
+	p, err := s.CreateProject(Project{Name: name, Goal: goal}, userAuthor)
 	if err != nil {
 		t.Fatalf("create project %q: %v", name, err)
 	}
@@ -204,7 +204,7 @@ func mustFact(t *testing.T, s *Store, id ProjectID, f Fact, by string) Fact {
 func TestProjectCRUDRoundTrip(t *testing.T) {
 	s := newEventStore(t)
 
-	p, err := s.CreateProject("  Passports  ", "keep every passport valid", "bot_ADA")
+	p, err := s.CreateProject(Project{Name: "  Passports  ", Goal: "keep every passport valid"}, "bot_ADA")
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -306,15 +306,15 @@ func TestProjectNameValidation(t *testing.T) {
 		{"blank", "   "},
 		{"too long", strings.Repeat("x", 65)},
 	} {
-		if _, err := s.CreateProject(c.arg, "", userAuthor); !errors.Is(err, ErrInvalid) {
+		if _, err := s.CreateProject(Project{Name: c.arg}, userAuthor); !errors.Is(err, ErrInvalid) {
 			t.Errorf("%s name: create = %v, want ErrInvalid", c.name, err)
 		}
 	}
-	if _, err := s.CreateProject(strings.Repeat("y", 64), "", userAuthor); err != nil {
+	if _, err := s.CreateProject(Project{Name: strings.Repeat("y", 64)}, userAuthor); err != nil {
 		t.Errorf("a 64-char name was rejected: %v", err)
 	}
 	for _, dup := range []string{"Passports", "passports", "  PASSPORTS  "} {
-		if _, err := s.CreateProject(dup, "", userAuthor); !errors.Is(err, ErrDuplicateName) {
+		if _, err := s.CreateProject(Project{Name: dup}, userAuthor); !errors.Is(err, ErrDuplicateName) {
 			t.Errorf("duplicate %q: create = %v, want ErrDuplicateName", dup, err)
 		}
 	}
@@ -1052,12 +1052,12 @@ func TestToolsEndpointIncludesProject(t *testing.T) {
 			enum = append(enum, v.(string))
 		}
 	}
-	want := "list,show,create,add_fact,update_fact,note"
+	want := "list,show,create,update,add_fact,update_fact,note"
 	if strings.Join(enum, ",") != want {
 		t.Errorf("command enum = %v, want %s", enum, want)
 	}
-	for _, field := range []string{"project", "goal", "kind", "title", "new_title", "due",
-		"lead_days", "rrule", "tz", "done", "blocker", "body"} {
+	for _, field := range []string{"project", "parent", "new_name", "goal", "kind", "title",
+		"new_title", "due", "lead_days", "rrule", "tz", "done", "blocker", "body"} {
 		spec, ok := props[field].(map[string]any)
 		if !ok {
 			t.Errorf("parameters miss the %q field", field)

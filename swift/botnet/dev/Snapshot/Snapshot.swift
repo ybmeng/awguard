@@ -15,6 +15,12 @@
 //   snapshot --project [--project-name <n>] # that project's pane
 //   snapshot --project --add-fact [--fact-kind deadline|recurring|milestone|note]
 //                                           # its Add Fact sheet, rendered flat
+//   snapshot --project --edit               # its Edit Project sheet (Parent
+//                                           # picker), rendered flat
+//   snapshot --expand-projects <names>      # sidebar tree disclosed at those
+//                                           # projects (comma-joined names)
+//   snapshot --sidebar-search <text>        # with that typed in the sidebar's
+//                                           # search, which force-reveals matches
 //   snapshot --collapse <sections>          # sidebar sections rendered
 //                                           # collapsed: services,automations,
 //                                           # projects,bots
@@ -40,9 +46,17 @@ private enum Pane {
     /// One automation's pane, optionally with a run's detail disclosed — a
     /// state a click can't produce offscreen.
     case automation(Automation, discloseRunID: String?)
-    /// One project's pane, or its Add Fact sheet drawn flat on the given kind
-    /// (a presented sheet needs a real window, same as the event editor).
-    case project(Project, addFactKind: FactKind?)
+    /// One project's pane, or one of its sheets drawn flat (a presented sheet
+    /// needs a real window, same as the event editor).
+    case project(Project, sheet: ProjectPaneSheet?)
+}
+
+/// Which of the project pane's sheets to draw flat beside the sidebar.
+private enum ProjectPaneSheet {
+    case addFact(FactKind)
+    /// Edit Project, whose Parent picker is the one place the subtree-exclusion
+    /// rule is visible — worth a render, not just a code read.
+    case edit
 }
 
 @main
@@ -95,7 +109,27 @@ struct Snapshot {
 
         render(store: store, bot: bot, pane: pane, dark: dark, details: details,
                collapseMemory: collapseMemory, collapsed: collapsedSections(),
+               expandedProjects: expandedProjects(store),
                size: CGSize(width: width, height: height), to: out)
+    }
+
+    /// --expand-projects' names, resolved to ids. Names rather than ids because
+    /// a project id is a ULID no one can type; loudly on no match, like
+    /// --project-name, so a typo cannot pass review as a collapsed tree.
+    @MainActor
+    private static func expandedProjects(_ store: AppStore) -> Set<String>? {
+        guard let raw = argument("--expand-projects") else { return nil }
+        var ids = Set<String>()
+        for part in raw.split(separator: ",") {
+            let name = String(part).trimmingCharacters(in: .whitespaces)
+            guard let match = store.projects.first(where: {
+                $0.name.caseInsensitiveCompare(name) == .orderedSame
+            }) else {
+                fail("no project named \(name) on the server (--expand-projects wants names, comma-joined)")
+            }
+            ids.insert(match.id)
+        }
+        return ids
     }
 
     /// --collapse's sections, parsed strictly: a typo'd section name must not
@@ -152,16 +186,17 @@ struct Snapshot {
                 }
                 project = first
             }
-            guard flags.contains("--add-fact") else { return .project(project, addFactKind: nil) }
+            if flags.contains("--edit") { return .project(project, sheet: .edit) }
+            guard flags.contains("--add-fact") else { return .project(project, sheet: nil) }
             // Loudly again: a typo'd kind would otherwise render the deadline
             // form and pass review as whatever kind was asked for.
             guard let raw = argument("--fact-kind") else {
-                return .project(project, addFactKind: .deadline)
+                return .project(project, sheet: .addFact(.deadline))
             }
             guard let kind = FactKind(rawValue: raw) else {
                 fail("unknown fact kind \(raw) (want one of \(FactKind.allCases.map(\.rawValue).joined(separator: ",")))")
             }
-            return .project(project, addFactKind: kind)
+            return .project(project, sheet: .addFact(kind))
         }
         guard flags.contains("--event-sheet") else {
             guard flags.contains("--calendar") else { return .chat }
@@ -200,6 +235,7 @@ struct Snapshot {
     @MainActor
     private static func render(store: AppStore, bot: Bot, pane: Pane, dark: Bool, details: Bool,
                                collapseMemory: Bool, collapsed: Set<SidebarSection>?,
+                               expandedProjects: Set<String>?,
                                size: CGSize, to path: String) {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
 
@@ -214,7 +250,9 @@ struct Snapshot {
 
         let content = HStack(spacing: 0) {
             SidebarView(selection: .constant(selection), showNewBot: .constant(false),
-                        showNewProject: .constant(false), collapsedOverride: collapsed)
+                        showNewProject: .constant(false), collapsedOverride: collapsed,
+                        expandedProjectsOverride: expandedProjects,
+                        initialQuery: argument("--sidebar-search") ?? "")
                 .frame(width: Metric.sidebarWidth)
             Rectangle().fill(Palette.hairline).frame(width: 1)
             switch pane {
@@ -232,16 +270,22 @@ struct Snapshot {
                 CalendarView(mode: .constant(mode), initialFilter: filter, initialQuery: query)
             case .automation(let automation, let runID):
                 AutomationView(automation: automation, initialDisclosedRunID: runID)
-            case .project(let project, let addFactKind):
-                // The pane, or its sheet drawn flat at the sheet's own size —
-                // a presented sheet needs a real window, same as the event
-                // editor, and its toolbar (Cancel/Add) will not appear.
-                if let addFactKind {
-                    AddFactSheet(project: project, initialKind: addFactKind)
+            case .project(let project, let sheet):
+                // The pane, or one of its sheets drawn flat at the sheet's own
+                // size — a presented sheet needs a real window, same as the
+                // event editor, and its toolbar (Cancel/Save) will not appear.
+                switch sheet {
+                case .addFact(let kind):
+                    AddFactSheet(project: project, initialKind: kind)
                         .frame(width: 460, height: 400)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Palette.chrome)
-                } else {
+                case .edit:
+                    EditProjectSheet(project: project)
+                        .frame(width: 460, height: 320)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Palette.chrome)
+                case nil:
                     ProjectView(project: project)
                 }
             case .eventSheet(let target):

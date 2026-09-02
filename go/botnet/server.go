@@ -844,11 +844,24 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request) {
 // are last-write-wins by decision, not by omission (see Project in schema.go).
 
 // projectInput is the wire body for POST and PATCH /v1/projects. Pointers make
-// PATCH partial: absent leaves a field alone, and "" is a real value clearing a
-// goal.
+// PATCH partial: absent leaves a field alone, and "" is a real value — clearing
+// a goal, or promoting a project to the top level.
 type projectInput struct {
-	Name *string `json:"name"`
-	Goal *string `json:"goal"`
+	Name     *string `json:"name"`
+	Goal     *string `json:"goal"`
+	ParentID *string `json:"parentId"`
+}
+
+// parent renders the body's parentId as the patch's optional field. It is its
+// own two lines because a *string and a *ProjectID are the same shape with
+// different meanings, and a conversion in a struct literal reads as a cast
+// rather than as "the caller named a parent".
+func (in projectInput) parent() *ProjectID {
+	if in.ParentID == nil {
+		return nil
+	}
+	id := ProjectID(*in.ParentID)
+	return &id
 }
 
 // factInput is the wire body for the fact routes. Every field is a pointer for
@@ -899,7 +912,11 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	if in.Goal != nil {
 		goal = *in.Goal
 	}
-	p, err := s.store.CreateProject(*in.Name, goal, userAuthor)
+	parent := ProjectID("")
+	if in.ParentID != nil {
+		parent = ProjectID(*in.ParentID)
+	}
+	p, err := s.store.CreateProject(Project{Name: *in.Name, Goal: goal, ParentID: parent}, userAuthor)
 	if err != nil {
 		writeErr(w, writeStatus(err), err)
 		return
@@ -907,11 +924,12 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, p)
 }
 
-// getProject returns one project WITH its facts, in the pane's urgency-first
-// order — one call renders the whole detail view, so the client never has to
-// re-sort or re-derive anything the server already decided.
+// getProject returns one project WITH its facts and its direct children, in the
+// pane's urgency-first order — one call renders the whole detail view, so the
+// client never has to re-sort or re-derive anything the server already decided.
+// children is always an array: a childless project answers [], never null.
 func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
-	p, facts, err := s.store.GetProject(ProjectID(r.PathValue("id")))
+	p, facts, children, err := s.store.GetProjectDetail(ProjectID(r.PathValue("id")))
 	if err != nil {
 		writeErr(w, writeStatus(err), err)
 		return
@@ -919,7 +937,10 @@ func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
 	if facts == nil {
 		facts = []Fact{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"project": p, "facts": facts})
+	if children == nil {
+		children = []Project{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"project": p, "facts": facts, "children": children})
 }
 
 func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
@@ -928,7 +949,8 @@ func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	p, err := s.store.UpdateProject(ProjectID(r.PathValue("id")), ProjectPatch{Name: in.Name, Goal: in.Goal})
+	p, err := s.store.UpdateProject(ProjectID(r.PathValue("id")),
+		ProjectPatch{Name: in.Name, Goal: in.Goal, ParentID: in.parent()})
 	if err != nil {
 		writeErr(w, writeStatus(err), err)
 		return
@@ -936,9 +958,9 @@ func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, p)
 }
 
-// deleteProject removes the project, its facts and their projected events —
-// real tombstones for all of them reach the change feed. The UI has already
-// confirmed the cascade, exactly as it does for a calendar.
+// deleteProject removes the project, its whole subtree, their facts and their
+// projected events — real tombstones for all of them reach the change feed. The
+// UI has already confirmed the cascade, exactly as it does for a calendar.
 func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.DeleteProject(ProjectID(r.PathValue("id"))); err != nil {
 		writeErr(w, writeStatus(err), err)
