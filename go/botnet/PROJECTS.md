@@ -60,6 +60,53 @@ Precedence is strict, in that order. Two boundaries are worth knowing:
 deadline is still outstanding, which is what the sidebar's "overdue 3d" renders from. A done
 fact is invisible to both answers.
 
+## Severity
+
+Every project also carries a `severity`: the same verdict collapsed into the three bands a
+person reads as colours, derived from the ROLLED-UP health by one table (`severityOf` in
+`projects.go`).
+
+| Severity | Health | Means |
+|---|---|---|
+| `S0` | `overdue` | act now |
+| `S1` | `blocked`, `due_soon` | should be doing |
+| `S2` | `ok`, `unknown` | tracked, not pressing |
+
+It is on the wire rather than computed by each client, because every client that renders a dot
+would otherwise carry its own copy of the mapping and disagree the moment a sixth health lands.
+A band a client does not recognise renders as the quiet one, never as an error.
+
+## Hierarchy
+
+A project may sit under one other, through `parentId` — the only authored part of the shape.
+Names stay GLOBALLY unique, so the name a user says out loud still addresses exactly one
+project and there is no path syntax for a model to get wrong.
+
+Three refusals at the write boundary, enforced once for both the REST face and the tool:
+
+| Refusal | Answer |
+|---|---|
+| the parent does not exist | `ErrNotFound` → 404 / an instructive error listing the projects that do |
+| a project under itself | `ErrInvalid` → 400 |
+| a project under its own descendant | `ErrInvalid` → 400, `moving "X" under "Y" would create a cycle` |
+
+A cycle is invalid rather than missing: every row named exists, it is the RELATION that is
+impossible — a ring has no root, so neither project would appear in any tree again.
+
+`health`, `severity` and `nextDue` ROLL UP: a parent's condition is the worst thing anywhere in
+its subtree and the nearest outstanding date in it, so the sidebar's dot means "something under
+here needs me". `factCount` does not roll up — it counts what was authored on that project —
+and `childCount` counts DIRECT children, which is what a disclosure chevron needs.
+
+The whole listing is two queries whatever the tree's shape: projects once, facts once, then one
+post-order pass. `GET /v1/projects` stays a flat array and the client builds the tree from
+`parentId`; `GET /v1/projects/{id}` adds a `children` array of the direct children, hydrated and
+ordered exactly like the list (`[]`, never `null`, when there are none).
+
+Deleting a project deletes its WHOLE subtree, every fact under it and every projected event, as
+per-row deletes — so the change feed carries a real tombstone for each, and a sub-project is
+never orphaned into a top-level row the user never made.
+
 ## Calendar projection
 
 Every undone `deadline` or `recurring` fact has exactly one event on the calendar named
@@ -86,6 +133,7 @@ How to record something — take the FIRST rule that fits:
 5. Before "create" or "add_fact", run "show" on the project. Update the existing fact with update_fact rather than adding a twin — a duplicate title is refused.
 6. When a deadline is renewed (a new passport arrives), set "due" to the new date. Mark it done ONLY when the obligation itself no longer exists.
 7. Never mark anything done without evidence, and record that evidence as a note in the same turn.
+8. A document or entity with its own dates and notes under a bigger goal (Passport under Document Expirations) → a sub-project: "create" with "parent". A single date under a project → a fact.
 ```
 
 Bots address projects and facts BY NAME; there is no id anywhere in the tool surface. A model
@@ -94,7 +142,8 @@ out loud. The cost is the ambiguity error, which is cheap and instructive.
 
 There are no delete commands. Deletion is UI-only, behind a confirmation — the same call already
 made for `delete_calendar`. A cheap model must not be able to drop a project's history, or to
-tick a fact off by removing it.
+tick a fact off by removing it. `update` (rename, re-goal, re-parent) is the exception that
+proves the rule: every one of those is reversible, which dropping a subtree is not.
 
 ## Guards
 

@@ -68,6 +68,30 @@ var healthRank = map[ProjectHealth]int{
 	HealthOverdue: 4,
 }
 
+// severityOf collapses the five healths into the three bands a person reads as
+// colours (see Severity in schema.go). It is a table for the same reason
+// healthRank is: the mapping is asked in the store, in the tool's every health
+// line and in the client's palette, and one table is what keeps those three
+// answers the same.
+var severityOf = map[ProjectHealth]Severity{
+	HealthOverdue: SeverityNow,
+	HealthBlocked: SeverityShould,
+	HealthDueSoon: SeverityShould,
+	HealthOK:      SeverityTracked,
+	HealthUnknown: SeverityTracked,
+}
+
+// severityFor is the table's only reader. A health this version does not know
+// bands as tracked rather than as "": a client has no colour for an empty
+// string, and an unrecognised state is by definition not one we can call
+// urgent.
+func severityFor(h ProjectHealth) Severity {
+	if s, ok := severityOf[h]; ok {
+		return s
+	}
+	return SeverityTracked
+}
+
 // factSignals is the per-kind health table: what ONE undone fact contributes —
 // a health level, and the instant it is next due (zero for the undated kinds).
 // This is the only place a kind's meaning lives, so a fifth kind is one entry
@@ -281,12 +305,12 @@ func validateProject(p Project) error {
 
 // ── Projects ──────────────────────────────────────────────────────────────────
 
-const projectColumns = `id, name, goal, created_by, created_at, updated_at`
+const projectColumns = `id, name, goal, parent_id, created_by, created_at, updated_at`
 
 func scanProject(sc interface{ Scan(...any) error }) (Project, error) {
 	var p Project
 	var createdAt, updatedAt string
-	if err := sc.Scan(&p.ID, &p.Name, &p.Goal, &p.CreatedBy, &createdAt, &updatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.Name, &p.Goal, &p.ParentID, &p.CreatedBy, &createdAt, &updatedAt); err != nil {
 		return Project{}, err
 	}
 	var err error
@@ -297,25 +321,281 @@ func scanProject(sc interface{ Scan(...any) error }) (Project, error) {
 		return Project{}, fmt.Errorf("parse updated_at: %w", err)
 	}
 	p.Health = HealthUnknown
+	p.Severity = severityFor(HealthUnknown)
 	return p, nil
 }
 
-// hydrate fills the derived fields from the project's facts. Every read path
-// goes through it, so a project can never be served with a health nobody
-// computed.
+// hydrate fills the derived fields from the project's OWN facts. It is the only
+// caller of projectHealth, and the rollup below starts from what it computed —
+// so a subtree's answer and a leaf's answer come from the same derivation, and
+// there is never a second opinion about what one project's facts mean.
 func hydrate(p *Project, facts []Fact, now time.Time) {
 	p.FactCount = len(facts)
 	p.Health, p.NextDue = projectHealth(facts, now)
+	p.Severity = severityFor(p.Health)
 }
 
-// CreateProject stores one project and returns it as stored. The id, the author
-// and both timestamps are stamped here, exactly as CreateEvent stamps an
+// ── The tree ──────────────────────────────────────────────────────────────────
+// Health rolls UP, so no project can be read in isolation: a parent's condition
+// is its own facts' worst plus every descendant's. That makes the whole forest
+// the unit of derivation, and loading it is deliberately TWO queries — every
+// project, every fact — rather than a walk that costs a query per node.
+
+// projectForest is one derivation pass over every project: own facts hydrated,
+// the subtree rolled up, severity banded, and both orderings (the flat list and
+// each project's children) already sorted the way they are served.
+type projectForest struct {
+	byID     map[ProjectID]*Project
+	children map[ProjectID][]*Project // direct children, in list order
+	sorted   []Project                // every project, most urgent first
+}
+
+// loadForest reads the projects and the facts once each and derives everything
+// the wire carries. It takes a dbtx so a write path can derive inside its own
+// transaction, and a `now` so a caller's clock is the one every project is
+// judged against.
+func loadForest(q dbtx, now time.Time) (*projectForest, error) {
+	rows, err := q.Query(`SELECT ` + projectColumns + ` FROM projects`)
+	if err != nil {
+		return nil, fmt.Errorf("list projects: %w", err)
+	}
+	defer rows.Close()
+	var nodes []*Project
+	for rows.Next() {
+		p, err := scanProject(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan project: %w", err)
+		}
+		nodes = append(nodes, &p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	facts, err := queryFacts(q, `ORDER BY rowid`)
+	if err != nil {
+		return nil, err
+	}
+	byProject := map[ProjectID][]Fact{}
+	for _, f := range facts {
+		byProject[f.ProjectID] = append(byProject[f.ProjectID], f)
+	}
+
+	f := &projectForest{byID: map[ProjectID]*Project{}, children: map[ProjectID][]*Project{}}
+	for _, p := range nodes {
+		hydrate(p, byProject[p.ID], now)
+		f.byID[p.ID] = p
+	}
+	// A pointer at a project that is gone makes an ORPHAN, and an orphan is a
+	// root: it must render somewhere, and the alternative is a row no tree
+	// contains. The write boundary keeps these out; a hand-edited database can
+	// still hold one.
+	var roots []*Project
+	for _, p := range nodes {
+		if parent, ok := f.byID[p.ParentID]; ok && parent != p {
+			f.children[p.ParentID] = append(f.children[p.ParentID], p)
+			continue
+		}
+		roots = append(roots, p)
+	}
+	for _, p := range nodes {
+		p.ChildCount = len(f.children[p.ID])
+	}
+	f.rollUp(roots)
+
+	f.sorted = make([]Project, 0, len(nodes))
+	for _, p := range nodes {
+		f.sorted = append(f.sorted, *p)
+	}
+	sortProjects(f.sorted)
+	for _, kids := range f.children {
+		sortProjectPtrs(kids)
+	}
+	return f, nil
+}
+
+// rollUp folds each subtree's worst health and nearest date into its root, in
+// ONE post-order walk of the forest — every project is visited once whatever
+// the depth. A project not reachable from any root can only be part of a stored
+// cycle, which the write boundary refuses; it keeps its own derived values
+// rather than hanging the read.
+func (f *projectForest) rollUp(roots []*Project) {
+	done := map[ProjectID]bool{}
+	var walk func(p *Project)
+	walk = func(p *Project) {
+		if done[p.ID] {
+			return
+		}
+		done[p.ID] = true
+		for _, c := range f.children[p.ID] {
+			walk(c)
+			if healthRank[c.Health] > healthRank[p.Health] {
+				p.Health = c.Health
+			}
+			if c.NextDue != nil && (p.NextDue == nil || c.NextDue.Before(*p.NextDue)) {
+				due := *c.NextDue
+				p.NextDue = &due
+			}
+		}
+		p.Severity = severityFor(p.Health)
+	}
+	for _, r := range roots {
+		walk(r)
+	}
+}
+
+// lessProject is the ONE ordering projects are served in, and it is the answer
+// to "what should I look at": the worst condition first, then the nearest date,
+// then the name. Both the flat list and a detail's children use it, so the
+// sidebar and the pane cannot disagree about which child is most urgent.
+func lessProject(a, b Project) bool {
+	if healthRank[a.Health] != healthRank[b.Health] {
+		return healthRank[a.Health] > healthRank[b.Health]
+	}
+	switch {
+	case a.NextDue != nil && b.NextDue != nil:
+		if !a.NextDue.Equal(*b.NextDue) {
+			return a.NextDue.Before(*b.NextDue)
+		}
+	case a.NextDue != nil:
+		return true // something dated outranks nothing dated
+	case b.NextDue != nil:
+		return false
+	}
+	return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+}
+
+func sortProjects(ps []Project) {
+	sort.SliceStable(ps, func(i, j int) bool { return lessProject(ps[i], ps[j]) })
+}
+
+func sortProjectPtrs(ps []*Project) {
+	sort.SliceStable(ps, func(i, j int) bool { return lessProject(*ps[i], *ps[j]) })
+}
+
+// childrenOf copies out one project's direct children, hydrated and ordered
+// like the list — the "children" block of the detail route.
+func (f *projectForest) childrenOf(id ProjectID) []Project {
+	out := make([]Project, 0, len(f.children[id]))
+	for _, c := range f.children[id] {
+		out = append(out, *c)
+	}
+	return out
+}
+
+// forest is the read path's entry point: derive everything, once, against the
+// caller's clock.
+func (s *Store) forest() (*projectForest, error) {
+	return loadForest(s.db, time.Now().UTC())
+}
+
+// ── Hierarchy rules ───────────────────────────────────────────────────────────
+
+// requireParentable is the parent pointer's whole validation, run at the write
+// boundary by BOTH the create and the update path so REST and the tool cannot
+// enforce different shapes. Three refusals, in the order a caller hits them:
+// the parent must exist (ErrNotFound → a 404, because the caller named a row
+// that is not there), a project may not be its own parent, and the move must
+// not close a loop. A loop is ErrInvalid rather than ErrNotFound: every row
+// named exists, it is the RELATION that is impossible.
+func requireParentable(q dbtx, child Project, parentID ProjectID) error {
+	if parentID == "" {
+		return nil
+	}
+	if parentID == child.ID {
+		return fmt.Errorf("%w: a project cannot be its own parent", ErrInvalid)
+	}
+	parent, err := getProject(q, parentID)
+	if errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("%w: no project %s to be the parent of %q", ErrNotFound, parentID, child.Name)
+	}
+	if err != nil {
+		return err
+	}
+	// Walk the PARENT's ancestors. Reaching the child means the child already
+	// contains its would-be parent, so the move would make a ring — and a ring
+	// has no root, so neither project would appear in any tree again.
+	seen := map[ProjectID]bool{parent.ID: true}
+	for at := parent; at.ParentID != ""; {
+		if at.ParentID == child.ID {
+			return fmt.Errorf("%w: moving %q under %q would create a cycle",
+				ErrInvalid, child.Name, parent.Name)
+		}
+		if seen[at.ParentID] {
+			break // a loop that was already stored upstream: not this move's doing
+		}
+		seen[at.ParentID] = true
+		next, err := getProject(q, at.ParentID)
+		if errors.Is(err, ErrNotFound) {
+			break // an orphaned pointer ends the chain, exactly as loadForest treats it
+		}
+		if err != nil {
+			return err
+		}
+		at = next
+	}
+	return nil
+}
+
+// subtreeIDs is the project and every descendant, parents before children. It
+// reads the whole (id, parent_id) column pair once rather than a query per
+// level, and the seen set means a stored cycle bounds the walk instead of
+// hanging a delete.
+func subtreeIDs(q dbtx, root ProjectID) ([]ProjectID, error) {
+	rows, err := q.Query(`SELECT id, parent_id FROM projects`)
+	if err != nil {
+		return nil, fmt.Errorf("read the project tree: %w", err)
+	}
+	defer rows.Close()
+	children := map[ProjectID][]ProjectID{}
+	for rows.Next() {
+		var id, parent ProjectID
+		if err := rows.Scan(&id, &parent); err != nil {
+			return nil, fmt.Errorf("scan the project tree: %w", err)
+		}
+		if parent != "" && parent != id {
+			children[parent] = append(children[parent], id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := []ProjectID{root}
+	seen := map[ProjectID]bool{root: true}
+	for i := 0; i < len(out); i++ {
+		for _, c := range children[out[i]] {
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// placeholders renders an id list as `?, ?, ?` plus its args, so a cascade is
+// one statement per table however wide the subtree — and one statement is what
+// makes SQLite fire the row triggers itself, per row, with no Go code
+// remembering to log anything.
+func placeholders[T ~string](ids []T) (string, []any) {
+	marks := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		marks[i], args[i] = "?", string(id)
+	}
+	return strings.Join(marks, ", "), args
+}
+
+// CreateProject stores one project and returns it as stored. It takes the
+// project rather than a widening list of strings — Name, Goal and ParentID are
+// the three authored fields, and CreateFact already reads this way. The id, the
+// author and both timestamps are stamped here, exactly as CreateEvent stamps an
 // event's; createdBy is a BotID for a tool write and "user" for a REST one.
-func (s *Store) CreateProject(name, goal, createdBy string) (Project, error) {
+func (s *Store) CreateProject(in Project, createdBy string) (Project, error) {
 	var p Project
 	err := s.tx(func(q dbtx) error {
 		var err error
-		p, err = createProject(q, name, goal, createdBy)
+		p, err = createProject(q, in, createdBy)
 		return err
 	})
 	if err != nil {
@@ -324,20 +604,22 @@ func (s *Store) CreateProject(name, goal, createdBy string) (Project, error) {
 	return p, nil
 }
 
-// createProject is the one insert path. The dup-name check and the insert share
-// the caller's transaction so they cannot interleave; the NOCASE unique index
-// is the structural backstop, and the check exists so a collision reports
-// ErrDuplicateName rather than a raw constraint violation.
-func createProject(q dbtx, name, goal, createdBy string) (Project, error) {
+// createProject is the one insert path. The dup-name check, the parent check
+// and the insert share the caller's transaction so they cannot interleave; the
+// NOCASE unique index is the structural backstop, and the check exists so a
+// collision reports ErrDuplicateName rather than a raw constraint violation.
+func createProject(q dbtx, in Project, createdBy string) (Project, error) {
 	now := time.Now().UTC().Truncate(time.Second)
 	p := Project{
 		ID:        ProjectID(newID("prj_")),
-		Name:      strings.TrimSpace(name),
-		Goal:      goal,
+		Name:      strings.TrimSpace(in.Name),
+		Goal:      in.Goal,
+		ParentID:  in.ParentID,
 		CreatedBy: createdBy,
 		CreatedAt: now,
 		UpdatedAt: now,
 		Health:    HealthUnknown,
+		Severity:  severityFor(HealthUnknown),
 	}
 	if err := validateProject(p); err != nil {
 		return Project{}, err
@@ -347,27 +629,45 @@ func createProject(q dbtx, name, goal, createdBy string) (Project, error) {
 	} else if !errors.Is(err, ErrNotFound) {
 		return Project{}, err
 	}
-	if _, err := q.Exec(`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?)`,
-		p.ID, p.Name, p.Goal, p.CreatedBy, fmtEventTime(p.CreatedAt), fmtEventTime(p.UpdatedAt)); err != nil {
+	// A brand-new id cannot be anyone's ancestor, so only the existence check
+	// can fire here — running the same guard anyway is what keeps create and
+	// update enforcing one rule rather than two that drift.
+	if err := requireParentable(q, p, p.ParentID); err != nil {
+		return Project{}, err
+	}
+	if _, err := q.Exec(`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Name, p.Goal, p.ParentID, p.CreatedBy,
+		fmtEventTime(p.CreatedAt), fmtEventTime(p.UpdatedAt)); err != nil {
 		return Project{}, fmt.Errorf("create project: %w", err)
 	}
 	return p, nil
 }
 
 // GetProject loads one project with its facts, both hydrated: the project's
-// health derived from exactly the facts returned beside it, and the facts in
-// the pane's urgency-first order.
+// health rolled up over its subtree, and the facts in the pane's urgency-first
+// order.
 func (s *Store) GetProject(id ProjectID) (Project, []Fact, error) {
-	p, err := getProject(s.db, id)
+	p, facts, _, err := s.GetProjectDetail(id)
+	return p, facts, err
+}
+
+// GetProjectDetail is GetProject plus the project's DIRECT children, hydrated
+// and ordered exactly as the listing orders them — the whole of what
+// GET /v1/projects/{id} serves, from one derivation pass.
+func (s *Store) GetProjectDetail(id ProjectID) (Project, []Fact, []Project, error) {
+	f, err := s.forest()
 	if err != nil {
-		return Project{}, nil, err
+		return Project{}, nil, nil, err
+	}
+	p, ok := f.byID[id]
+	if !ok {
+		return Project{}, nil, nil, ErrNotFound
 	}
 	facts, err := s.ListFacts(id)
 	if err != nil {
-		return Project{}, nil, err
+		return Project{}, nil, nil, err
 	}
-	hydrate(&p, facts, time.Now().UTC())
-	return p, facts, nil
+	return *p, facts, f.childrenOf(id), nil
 }
 
 func getProject(q dbtx, id ProjectID) (Project, error) {
@@ -385,16 +685,19 @@ func getProject(q dbtx, id ProjectID) (Project, error) {
 // resolves the name a model typed, since bots address projects by name and
 // never by id.
 func (s *Store) ProjectByName(name string) (Project, error) {
-	p, err := projectByName(s.db, name)
+	row, err := projectByName(s.db, name)
 	if err != nil {
 		return Project{}, err
 	}
-	facts, err := s.ListFacts(p.ID)
+	f, err := s.forest()
 	if err != nil {
 		return Project{}, err
 	}
-	hydrate(&p, facts, time.Now().UTC())
-	return p, nil
+	p, ok := f.byID[row.ID]
+	if !ok {
+		return Project{}, ErrNotFound
+	}
+	return *p, nil
 }
 
 func projectByName(q dbtx, name string) (Project, error) {
@@ -409,72 +712,31 @@ func projectByName(q dbtx, name string) (Project, error) {
 	return p, nil
 }
 
-// ListProjects returns every project, hydrated, most urgent first: health
-// precedence, then the nearest due date, then the name. The order IS the
-// answer to "what should I look at" — the sidebar renders it as given.
+// ListProjects returns every project as a FLAT array — the client builds the
+// tree from parentId — hydrated and most urgent first: health precedence, then
+// the nearest due date, then the name. The order IS the answer to "what should
+// I look at", and it is the ROLLED-UP condition that orders a parent, so a
+// project whose only trouble is three levels down still sorts to the top.
 //
-// Facts are read once for the whole list rather than per project, so a net with
-// many projects costs two queries.
+// The whole listing is two queries whatever the tree's shape: projects once,
+// facts once, then one pass to derive.
 func (s *Store) ListProjects() ([]Project, error) {
-	projects, err := s.queryProjects(`SELECT ` + projectColumns + ` FROM projects`)
+	f, err := s.forest()
 	if err != nil {
 		return nil, err
 	}
-	facts, err := queryFacts(s.db, `ORDER BY rowid`)
-	if err != nil {
-		return nil, err
-	}
-	byProject := map[ProjectID][]Fact{}
-	for _, f := range facts {
-		byProject[f.ProjectID] = append(byProject[f.ProjectID], f)
-	}
-	now := time.Now().UTC()
-	for i := range projects {
-		hydrate(&projects[i], byProject[projects[i].ID], now)
-	}
-	sort.SliceStable(projects, func(i, j int) bool {
-		a, b := projects[i], projects[j]
-		if healthRank[a.Health] != healthRank[b.Health] {
-			return healthRank[a.Health] > healthRank[b.Health]
-		}
-		switch {
-		case a.NextDue != nil && b.NextDue != nil:
-			if !a.NextDue.Equal(*b.NextDue) {
-				return a.NextDue.Before(*b.NextDue)
-			}
-		case a.NextDue != nil:
-			return true // something dated outranks nothing dated
-		case b.NextDue != nil:
-			return false
-		}
-		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
-	})
-	return projects, nil
-}
-
-func (s *Store) queryProjects(query string, args ...any) ([]Project, error) {
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list projects: %w", err)
-	}
-	defer rows.Close()
-	var out []Project
-	for rows.Next() {
-		p, err := scanProject(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan project: %w", err)
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
+	return f.sorted, nil
 }
 
 // ProjectPatch is the set of fields an update may change; a nil field is left
-// alone. No version to condition on — projects are last-write-wins, the same
-// DECISION calendars and events carry.
+// alone. ParentID is a pointer for the same reason the others are: a patch to
+// the empty id PROMOTES a project to the top level, which must not read the
+// same as leaving its parent alone. No version to condition on — projects are
+// last-write-wins, the same DECISION calendars and events carry.
 type ProjectPatch struct {
-	Name *string `json:"name"`
-	Goal *string `json:"goal"`
+	Name     *string    `json:"name"`
+	Goal     *string    `json:"goal"`
+	ParentID *ProjectID `json:"parentId"`
 }
 
 // UpdateProject applies a partial patch and returns the project as stored,
@@ -497,6 +759,9 @@ func (s *Store) UpdateProject(id ProjectID, p ProjectPatch) (Project, error) {
 		if p.Goal != nil {
 			out.Goal = *p.Goal
 		}
+		if p.ParentID != nil {
+			out.ParentID = *p.ParentID
+		}
 		if err := validateProject(out); err != nil {
 			return err
 		}
@@ -505,9 +770,14 @@ func (s *Store) UpdateProject(id ProjectID, p ProjectPatch) (Project, error) {
 		} else if err != nil && !errors.Is(err, ErrNotFound) {
 			return err
 		}
+		// Checked against the tree as it stands, BEFORE this row moves: the
+		// question is whether the new parent already sits inside this project.
+		if err := requireParentable(q, out, out.ParentID); err != nil {
+			return err
+		}
 		out.UpdatedAt = time.Now().UTC().Truncate(time.Second)
-		if _, err := q.Exec(`UPDATE projects SET name = ?, goal = ?, updated_at = ? WHERE id = ?`,
-			out.Name, out.Goal, fmtEventTime(out.UpdatedAt), id); err != nil {
+		if _, err := q.Exec(`UPDATE projects SET name = ?, goal = ?, parent_id = ?, updated_at = ? WHERE id = ?`,
+			out.Name, out.Goal, out.ParentID, fmtEventTime(out.UpdatedAt), id); err != nil {
 			return fmt.Errorf("update project: %w", err)
 		}
 		if renamed {
@@ -518,33 +788,42 @@ func (s *Store) UpdateProject(id ProjectID, p ProjectPatch) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
-	facts, err := s.ListFacts(id)
-	if err != nil {
-		return Project{}, err
-	}
-	hydrate(&out, facts, time.Now().UTC())
-	return out, nil
+	// Re-derived after the write, not patched in place: a reparent changes what
+	// this project's subtree IS, so its health is a different question than it
+	// was a statement ago.
+	out, _, err = s.GetProject(id)
+	return out, err
 }
 
-// DeleteProject removes a project, its facts AND the calendar events its facts
-// were projected onto, in one transaction. Each is an explicit DELETE on its
-// own table, and SQLite row triggers fire once per deleted row, so a sync
-// client gets a real tombstone for every fact and every event alongside the
-// project's own — exactly as DeleteCalendar cascades to its events.
+// DeleteProject removes a project, its WHOLE subtree, every one of their facts
+// AND the calendar events those facts were projected onto, in one transaction.
+//
+// DECISION (delete takes the subtree): a sub-project only exists inside its
+// parent, so leaving descendants behind would orphan them into top-level rows
+// the user never made — the DeleteCalendar cascade, one level deeper. Each
+// table is an explicit DELETE and SQLite row triggers fire once per deleted
+// row, so a sync client gets a real tombstone for every project, every fact and
+// every projected event, and never keeps a row whose owner is gone.
 func (s *Store) DeleteProject(id ProjectID) error {
 	return s.tx(func(q dbtx) error {
 		if _, err := getProject(q, id); err != nil {
 			return err
 		}
+		ids, err := subtreeIDs(q, id)
+		if err != nil {
+			return err
+		}
+		marks, args := placeholders(ids)
 		if _, err := q.Exec(
-			`DELETE FROM events WHERE id IN (SELECT event_id FROM facts WHERE project_id = ? AND event_id != '')`,
-			id); err != nil {
+			`DELETE FROM events WHERE id IN (
+			     SELECT event_id FROM facts WHERE project_id IN (`+marks+`) AND event_id != '')`,
+			args...); err != nil {
 			return fmt.Errorf("delete projected events: %w", err)
 		}
-		if _, err := q.Exec(`DELETE FROM facts WHERE project_id = ?`, id); err != nil {
+		if _, err := q.Exec(`DELETE FROM facts WHERE project_id IN (`+marks+`)`, args...); err != nil {
 			return fmt.Errorf("delete project facts: %w", err)
 		}
-		if _, err := q.Exec(`DELETE FROM projects WHERE id = ?`, id); err != nil {
+		if _, err := q.Exec(`DELETE FROM projects WHERE id IN (`+marks+`)`, args...); err != nil {
 			return fmt.Errorf("delete project: %w", err)
 		}
 		return nil

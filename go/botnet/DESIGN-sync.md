@@ -623,8 +623,8 @@ mutation.
 | `DeleteCalendar` (REST cascade) | calendar + its events | destroyed: one tombstone per event (the explicit `DELETE FROM events WHERE calendar_id = ?` fires the row trigger per row), then the calendar's own |
 | migrate step 7 (calendar backfill) | events (+ calendar) | updated per backfilled event, after the ensured Personal's created — a reconnecting client refetches rows whose calendarId just appeared |
 | `CreateProject` | project | created (both writers: `POST /v1/projects` and the `project` tool) |
-| `UpdateProject` | project | updated. A RENAME also emits event updated per projected fact, since the events carry the project's name in their titles |
-| `DeleteProject` (REST cascade) | project + its facts + their projected events | destroyed: one tombstone per projected event, then one per fact (both explicit per-row `DELETE`s, so the row triggers fire per row), then the project's own |
+| `UpdateProject` | project | updated. A RENAME also emits event updated per projected fact, since the events carry the project's name in their titles. A REPARENT emits only the project's own updated row — health and severity are derived, so no descendant's row changes |
+| `DeleteProject` (REST cascade) | the project's whole SUBTREE + all their facts + their projected events | destroyed: one tombstone per projected event, then one per fact, then one per project in the subtree (three explicit `DELETE ... IN (?, ?)`s, so the row triggers fire per row). A sub-project is never left orphaned |
 | `CreateFact` | fact | created. A dated, undone fact ALSO emits event created first (its calendar projection), and the first such fact ever ALSO emits calendar created for the ensured "Projects" calendar |
 | `UpdateFact` | fact | updated (a field-only patch still emits — row trigger). The projection rides the same transaction: event updated, or created when the fact became dated/undone, or destroyed when it was marked done |
 | `DeleteFact` | fact + its projected event | destroyed (event first, then the fact) |

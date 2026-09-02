@@ -199,7 +199,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_calendars_name ON calendars(name COLLATE N
 -- how it happens. A project is a name, a goal and its facts; its health is
 -- DERIVED from the facts on every read and deliberately has no column here —
 -- see the Project DECISIONs in schema.go. Name uniqueness is case-insensitive
--- and the index enforces it, exactly as calendars do.
+-- and the index enforces it, exactly as calendars do — globally, NOT per
+-- parent, so the name a user says out loud addresses one project whatever the
+-- hierarchy looks like. parent_id rides the guarded column list below.
 CREATE TABLE IF NOT EXISTS projects (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
@@ -349,6 +351,11 @@ END;
 		{"events", "tz", `TEXT NOT NULL DEFAULT ''`},
 		{"events", "automation", `TEXT NOT NULL DEFAULT ''`},
 		{"calendars", "executable", `INTEGER NOT NULL DEFAULT 0`},
+		// parent_id is the project hierarchy's only authored state (the Project
+		// DECISIONs in schema.go). '' is the real default and needs no backfill:
+		// every project written before hierarchy existed IS a top-level project,
+		// which is exactly what '' means.
+		{"projects", "parent_id", `TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, c := range added {
 		if err := s.addColumn(c.table, c.column, c.decl); err != nil {

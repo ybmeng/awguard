@@ -30,7 +30,7 @@ func TestProjectToolDescriptionCarriesTheLadder(t *testing.T) {
 	}
 	// A numbered ladder, not a paragraph: a model scanning for "which kind is
 	// this" needs discrete steps.
-	for _, step := range []string{"1.", "2.", "3.", "4.", "5.", "6.", "7."} {
+	for _, step := range []string{"1.", "2.", "3.", "4.", "5.", "6.", "7.", "8."} {
 		if !strings.Contains(doc, step) {
 			t.Errorf("tool description has no step %q — the ladder must be a numbered list", step)
 		}
@@ -308,7 +308,7 @@ func TestMutatingResultsEndWithHealth(t *testing.T) {
 	tb := NewBotToolbox(s, bot.ID, nil)
 
 	created := runProject(t, tb, `{"command":"create","project":"Passports","goal":"keep them valid"}`)
-	if !strings.HasSuffix(created, "Passports: unknown") {
+	if !strings.HasSuffix(created, "Passports: S2 unknown") {
 		t.Errorf("create = %q, want it to end with the new project's health line", created)
 	}
 
@@ -318,27 +318,27 @@ func TestMutatingResultsEndWithHealth(t *testing.T) {
 	// 20d, not 19: the count is to the NEAREST day, so the microseconds the
 	// write itself takes cannot shave a day off the answer.
 	last := lastLine(added)
-	for _, want := range []string{"Passports: due_soon", "next due", "(in 20d)"} {
+	for _, want := range []string{"Passports: S1 due_soon", "next due", "(in 20d)"} {
 		if !strings.Contains(last, want) {
 			t.Errorf("add_fact health line = %q, want it to contain %q", last, want)
 		}
 	}
 
 	noted := runProject(t, tb, `{"command":"note","project":"Passports","body":"the consulate takes walk-ins"}`)
-	if !strings.Contains(lastLine(noted), "Passports: due_soon") {
+	if !strings.Contains(lastLine(noted), "Passports: S1 due_soon") {
 		t.Errorf("note = %q, want it to end with the health line", noted)
 	}
 
 	updated := runProject(t, tb, `{"command":"update_fact","project":"Passports","title":"US passport expires","lead_days":"5"}`)
-	if !strings.Contains(lastLine(updated), "Passports: ok") {
+	if !strings.Contains(lastLine(updated), "Passports: S2 ok") {
 		t.Errorf("update_fact = %q, want the health line to show the narrowed lead took effect", updated)
 	}
 
 	// An overdue project counts the other way.
 	past := time.Now().UTC().AddDate(0, 0, -3).Format(time.RFC3339)
 	overdue := runProject(t, tb, `{"command":"update_fact","project":"Passports","title":"US passport expires","due":"`+past+`"}`)
-	if l := lastLine(overdue); !strings.Contains(l, "Passports: overdue") || !strings.Contains(l, "overdue)") {
-		t.Errorf("overdue health line = %q, want \"<name>: overdue, next due <date> (3d overdue)\"", l)
+	if l := lastLine(overdue); !strings.Contains(l, "Passports: S0 overdue") || !strings.Contains(l, "overdue)") {
+		t.Errorf("overdue health line = %q, want \"<name>: S0 overdue, next due <date> (3d overdue)\"", l)
 	}
 }
 

@@ -490,10 +490,31 @@ type Fireable struct {
 // DECISION (no If-Match): projects and facts are last-write-wins, the call
 // already made for Event, Calendar and Bot.Memory. There is no derived Version
 // field, so there is nothing for a client to send.
+//
+// DECISION (hierarchy is ONE parent pointer, not a path): a project sits under
+// at most one other, and names stay GLOBALLY unique — the tool addresses a
+// project by the name the user said out loud, and path addressing ("Document
+// Expirations/Passport") is a second syntax for a model to get wrong. The
+// pointer is validated at the write boundary: the parent must exist, must not
+// be the project itself, and must not already sit under it, because a cycle has
+// no root and would render in no tree at all.
+//
+// DECISION (health, severity and nextDue ROLL UP; factCount does not): a
+// parent's condition answers for its whole subtree, so the sidebar's dot means
+// "something under here needs me" rather than "this row has no facts of its
+// own". FactCount stays OWN facts, because it counts what was authored here,
+// and ChildCount counts DIRECT children so a client can draw a disclosure
+// chevron without walking the array twice. Every one of them is derived in the
+// single pass that hydrates a listing — never stored, never in the feed.
 type Project struct {
 	ID   ProjectID `json:"id"`
 	Name string    `json:"name"` // trimmed, non-empty, <= 64 chars, unique case-insensitively
 	Goal string    `json:"goal"` // free text, may be empty
+
+	// ParentID is the project this one sits under, "" for a top-level project.
+	// It is the only authored part of the hierarchy; everything else about the
+	// shape (children, counts, the rollup) is derived from these pointers.
+	ParentID ProjectID `json:"parentId,omitempty"`
 
 	// CreatedBy follows Event.CreatedBy exactly: a BotID for a tool write, the
 	// "user" sentinel for a REST one, stamped by the write path.
@@ -501,14 +522,33 @@ type Project struct {
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 
-	// Derived at read time from the project's facts — never stored, never
-	// synced. NextDue is the nearest OUTSTANDING due instant across the undone
-	// deadline and recurring facts (a passed deadline is still outstanding, and
-	// is what the "overdue 3d" line renders from); nil when nothing is dated.
-	Health    ProjectHealth `json:"health"`
-	NextDue   *time.Time    `json:"nextDue,omitempty"`
-	FactCount int           `json:"factCount"`
+	// Derived at read time from the project's facts AND its subtree's — never
+	// stored, never synced. NextDue is the nearest OUTSTANDING due instant
+	// across the undone deadline and recurring facts anywhere under here (a
+	// passed deadline is still outstanding, and is what the "overdue 3d" line
+	// renders from); nil when nothing in the subtree is dated.
+	Health     ProjectHealth `json:"health"`
+	Severity   Severity      `json:"severity"`
+	NextDue    *time.Time    `json:"nextDue,omitempty"`
+	FactCount  int           `json:"factCount"`
+	ChildCount int           `json:"childCount"`
 }
+
+// Severity is the derived urgency BAND a project falls in: three values,
+// because that is how many colours a person reads at a glance, where health has
+// five because that is how many reasons there are.
+//
+// DECISION (the band is on the wire, not computed by the client): every client
+// that renders a dot would otherwise carry its own copy of the health→colour
+// mapping, and the moment a sixth health lands they disagree. The server sends
+// the band; a client it does not recognise falls back to the quiet one.
+type Severity string
+
+const (
+	SeverityNow     Severity = "S0" // act now
+	SeverityShould  Severity = "S1" // should be doing
+	SeverityTracked Severity = "S2" // tracked, not pressing
+)
 
 // ProjectHealth is the derived one-word answer to "does this project need me".
 // The precedence is strict and lives in projectHealth().
