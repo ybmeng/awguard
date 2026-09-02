@@ -227,6 +227,66 @@ struct APIClient {
                 CharacterSet(charactersIn: "/?#"))) ?? value
     }
 
+    // MARK: projects
+    //
+    // A project's health, nextDue and factCount are derived server-side and
+    // read-only here — a PATCH carries only {name, goal}. Facts are typed, so
+    // their bodies are heterogeneous JSON ({done: bool, leadDays: int}) rather
+    // than the flat string maps the calendar routes use. 404 on any of these
+    // means a botnetd that predates projects, which callers hide.
+
+    /// Sorted by health precedence, then nextDue ascending, then name — the
+    /// server's order, which the sidebar renders as-is. Never null on the wire.
+    func listProjects() async throws -> [Project] {
+        try await get("/v1/projects")
+    }
+
+    /// The project plus its facts, sorted urgency-first server-side.
+    func project(_ id: String) async throws -> ProjectDetail {
+        try await get("/v1/projects/\(id)")
+    }
+
+    /// createdBy is the server's call: a project posted here is "user".
+    /// An empty goal is omitted rather than sent as "", matching the wire shape
+    /// a bot's tool call produces.
+    func createProject(name: String, goal: String) async throws -> Project {
+        var body = ["name": name]
+        if !goal.isEmpty { body["goal"] = goal }
+        return try await send("/v1/projects", method: "POST", body: body)
+    }
+
+    /// `fields` is any subset of {name, goal}; an empty string clears the goal.
+    /// The derived fields are not patchable and must never appear here.
+    func updateProject(_ id: String, fields: [String: String]) async throws -> Project {
+        try await send("/v1/projects/\(id)", method: "PATCH", body: fields)
+    }
+
+    /// CASCADES server-side: the project's facts and their projected calendar
+    /// events go with it. The UI confirms first; this call is unconditional.
+    func deleteProject(_ id: String) async throws {
+        _ = try await raw("/v1/projects/\(id)", method: "DELETE", body: nil)
+    }
+
+    /// `fields` carries `kind` and `title` plus whatever that kind allows —
+    /// the sheet builds it from FactKind.fields, so an illegal combination
+    /// never leaves the app and the server's 400 stays a backstop, not a
+    /// routine answer.
+    func createFact(_ projectID: String, fields: [String: Any]) async throws -> ProjectFact {
+        try await send("/v1/projects/\(projectID)/facts", method: "POST", json: fields)
+    }
+
+    /// Any subset of the create body plus `done`. Partial like an event PATCH,
+    /// and for the same reason: a bot's tool can write another field of the
+    /// same fact while an editor is open.
+    func updateFact(_ projectID: String, factID: String,
+                    fields: [String: Any]) async throws -> ProjectFact {
+        try await send("/v1/projects/\(projectID)/facts/\(factID)", method: "PATCH", json: fields)
+    }
+
+    func deleteFact(_ projectID: String, factID: String) async throws {
+        _ = try await raw("/v1/projects/\(projectID)/facts/\(factID)", method: "DELETE", body: nil)
+    }
+
     func createBot(displayName: String, systemPrompt: String, model: String) async throws -> Bot {
         try await send("/v1/bots", method: "POST", body: [
             "displayName": displayName, "systemPrompt": systemPrompt, "model": model,
@@ -306,6 +366,14 @@ struct APIClient {
     }
 
     private func send<T: Decodable>(_ path: String, method: String, body: [String: String]) async throws -> T {
+        let data = try JSONSerialization.data(withJSONObject: body)
+        return try decode(await raw(path, method: method, body: data), from: path)
+    }
+
+    /// The same send for a body whose values are not all strings — a fact
+    /// carries `done` as a JSON bool and `leadDays` as a number, and quoting
+    /// them would be a 400 at the server's typed write boundary.
+    private func send<T: Decodable>(_ path: String, method: String, json body: [String: Any]) async throws -> T {
         let data = try JSONSerialization.data(withJSONObject: body)
         return try decode(await raw(path, method: method, body: data), from: path)
     }

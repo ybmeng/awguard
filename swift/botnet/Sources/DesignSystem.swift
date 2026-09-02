@@ -64,6 +64,31 @@ enum Palette {
         }
     }
 
+    // A project's health. Its own four tokens rather than borrowed calendar
+    // ones: health is the app's only scale where a HUMAN gate (blocked) has to
+    // read as different in kind from a clock problem (overdue, due soon), so
+    // these have to be retunable without dragging the calendar's colors along.
+    // Same lift-for-dark rule as the calendar pair — a dot this small sinks
+    // into the dark ground otherwise.
+    static let healthOverdue = dynamic(light: 0xD23C31, dark: 0xF07068)
+    static let healthBlocked = dynamic(light: 0x8E5BD9, dark: 0xB48AF0)
+    static let healthDueSoon = dynamic(light: 0xE1830B, dark: 0xF0A03C)
+    static let healthOK = dynamic(light: 0x3D9B4E, dark: 0x62C273)
+
+    /// A project's health string to its dot color. Precedence order, loudest
+    /// first. "unknown" (zero facts) is a state, not a problem, so it shares
+    /// the neutral gray with any value this build doesn't know — the same
+    /// stance freshness(_:) takes.
+    static func health(_ wire: String) -> Color {
+        switch wire {
+        case "overdue": return healthOverdue
+        case "blocked": return healthBlocked
+        case "due_soon": return healthDueSoon
+        case "ok": return healthOK
+        default: return secondaryText // unknown, future values
+        }
+    }
+
     /// A run's status to its label color — the same temperature scale as the
     /// freshness dot: green for a clean envelope, orange for degraded and
     /// needs_human (the run spoke, but wants eyes), red for failed and for
@@ -128,6 +153,18 @@ enum Metric {
     /// as calendarListWidth: a run row's trailing fields must stay near the
     /// name, not a window's width away.
     static let automationListWidth: CGFloat = 680
+    /// The project pane's facts column, capped for the same reason: a fact's
+    /// due text and blocker chip belong beside its title, not a window away.
+    static let projectListWidth: CGFloat = 680
+    /// A project's health dot in the sidebar and in the pane's badge. Same size
+    /// family as freshnessDot, separate so the two can retune apart.
+    static let healthDot: CGFloat = 7
+    /// A fact row's leading kind glyph, fixed so every title starts at one x
+    /// whichever glyph the kind uses.
+    static let factGlyphWidth: CGFloat = 16
+    /// The done checkbox on a completable fact row, sized to sit beside
+    /// rowTitle text without becoming the loudest thing in the row.
+    static let factToggle: CGFloat = 14
     /// A disclosed run's stderr tail scrolls inside this rather than growing
     /// the row by up to 8KB of text.
     static let stderrMaxHeight: CGFloat = 160

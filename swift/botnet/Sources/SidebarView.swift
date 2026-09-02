@@ -9,11 +9,13 @@ import SwiftUI
 /// the two are separate cases rather than sentinel strings in a bot id — the
 /// detail pane switches on the case and never has to know which ids are real.
 /// An automation is keyed by its name: that IS its server-side identity (the
-/// registry has no other id).
+/// registry has no other id). A project, unlike an automation, does have an id
+/// and can be renamed, so it is keyed by id.
 enum SidebarSelection: Hashable {
     case bot(String)
     case service(ServiceKind)
     case automation(String)
+    case project(String)
 
     var botID: String? {
         guard case .bot(let id) = self else { return nil }
@@ -29,6 +31,11 @@ enum SidebarSelection: Hashable {
         guard case .automation(let name) = self else { return nil }
         return name
     }
+
+    var projectID: String? {
+        guard case .project(let id) = self else { return nil }
+        return id
+    }
 }
 
 /// The sidebar's collapsible sections, in render order. The rawValues are the
@@ -36,7 +43,7 @@ enum SidebarSelection: Hashable {
 /// persists under its own @AppStorage key so future sections slot in like
 /// folders.
 enum SidebarSection: String, CaseIterable {
-    case services, automations, bots
+    case services, automations, projects, bots
 
     var title: String { rawValue.capitalized }
 }
@@ -71,6 +78,7 @@ struct SidebarView: View {
     @EnvironmentObject var store: AppStore
     @Binding var selection: SidebarSelection?
     @Binding var showNewBot: Bool
+    @Binding var showNewProject: Bool
     /// Snapshot-only: render these sections collapsed regardless of the
     /// persisted state, so an offscreen render is deterministic and leaves no
     /// defaults litter behind. Nil in the app.
@@ -83,6 +91,7 @@ struct SidebarView: View {
     // should show everything it has.
     @AppStorage("sidebar.servicesExpanded") private var servicesExpanded = true
     @AppStorage("sidebar.automationsExpanded") private var automationsExpanded = true
+    @AppStorage("sidebar.projectsExpanded") private var projectsExpanded = true
     @AppStorage("sidebar.botsExpanded") private var botsExpanded = true
 
     private var searching: Bool {
@@ -102,6 +111,7 @@ struct SidebarView: View {
         switch section {
         case .services: return $servicesExpanded
         case .automations: return $automationsExpanded
+        case .projects: return $projectsExpanded
         case .bots: return $botsExpanded
         }
     }
@@ -117,6 +127,22 @@ struct SidebarView: View {
                     // automations routes (standalone botnetd, old server).
                     if !store.automationsUnavailable {
                         section(.automations) { automationRows }
+                    }
+                    // Absent the same way when the server has no /v1/projects.
+                    // The header carries the only New Project affordance, so it
+                    // cannot exist on a server that would 404 the create.
+                    if !store.projectsUnavailable {
+                        section(.projects) {
+                            Button { showNewProject = true } label: {
+                                Image(systemName: "plus")
+                                    .font(TypeScale.sectionChevron)
+                                    .foregroundStyle(Palette.secondaryText)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Create a project")
+                        } rows: {
+                            projectRows
+                        }
                     }
                     // Searching reveals matches through a collapsed Bots
                     // section (revealed: below); the persisted choice is
@@ -149,10 +175,23 @@ struct SidebarView: View {
     private func section<Rows: View>(
         _ section: SidebarSection, @ViewBuilder rows: () -> Rows
     ) -> some View {
+        self.section(section, accessory: { EmptyView() }, rows: rows)
+    }
+
+    /// The accessory sits in the header's trailing slot (the "+" that creates a
+    /// project), beside the collapse button rather than inside it — a button
+    /// nested in another button's label swallows its own clicks.
+    @ViewBuilder
+    private func section<Accessory: View, Rows: View>(
+        _ section: SidebarSection,
+        @ViewBuilder accessory: @escaping () -> Accessory,
+        @ViewBuilder rows: () -> Rows
+    ) -> some View {
         SectionHeader(
             title: section.title,
             expanded: expansion(section),
-            revealed: revealed(section)
+            revealed: revealed(section),
+            accessory: accessory
         )
         if revealed(section) {
             VStack(alignment: .leading, spacing: 2) { rows() }
@@ -178,6 +217,25 @@ struct SidebarView: View {
                 selected: selection?.automationName == automation.name
             ) {
                 selection = .automation(automation.name)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var projectRows: some View {
+        if store.projects.isEmpty {
+            Text("No projects yet.")
+                .font(TypeScale.rowMeta)
+                .foregroundStyle(Palette.secondaryText)
+                .padding(.vertical, Metric.rowVPad)
+                .padding(.horizontal, Metric.sidebarGutter)
+        }
+        ForEach(store.projects) { project in
+            ProjectRow(
+                project: project,
+                selected: selection?.projectID == project.id
+            ) {
+                selection = .project(project.id)
             }
         }
     }
@@ -237,37 +295,43 @@ struct SidebarView: View {
 // A section's chevron header row — caret plus label, the Explorer idiom.
 // `revealed` is what the caret shows (a search can reveal a collapsed Bots
 // section); clicking still toggles the persisted `expanded` choice.
-private struct SectionHeader: View {
+// The optional trailing accessory follows InspectorSection's shape: a sibling
+// of the collapse button, not part of its label, so its own clicks land.
+private struct SectionHeader<Accessory: View>: View {
     let title: String
     @Binding var expanded: Bool
     let revealed: Bool
+    @ViewBuilder let accessory: () -> Accessory
 
     @State private var hovering = false
 
     var body: some View {
-        Button { expanded.toggle() } label: {
-            HStack(spacing: 3) {
-                Image(systemName: "chevron.right")
-                    .font(TypeScale.sectionChevron)
-                    .rotationEffect(.degrees(revealed ? 90 : 0))
-                    .frame(width: Metric.sectionChevronWidth)
-                Text(title)
-                    .font(TypeScale.sectionLabel)
-                Spacer(minLength: 0)
+        HStack(spacing: 3) {
+            Button { expanded.toggle() } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "chevron.right")
+                        .font(TypeScale.sectionChevron)
+                        .rotationEffect(.degrees(revealed ? 90 : 0))
+                        .frame(width: Metric.sectionChevronWidth)
+                    Text(title)
+                        .font(TypeScale.sectionLabel)
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(Palette.secondaryText)
+                .contentShape(Rectangle())
             }
-            .foregroundStyle(Palette.secondaryText)
-            .padding(.vertical, 4)
-            .padding(.horizontal, 4)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous))
-            .background(
-                hovering ? Palette.rowHover : .clear,
-                in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
-            )
+            .buttonStyle(.plain)
+            .help(revealed ? "Collapse \(title)" : "Expand \(title)")
+            accessory()
         }
-        .buttonStyle(.plain)
+        .padding(.vertical, 4)
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            hovering ? Palette.rowHover : .clear,
+            in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
+        )
         .onHover { hovering = $0 }
-        .help(revealed ? "Collapse \(title)" : "Expand \(title)")
     }
 }
 
@@ -323,6 +387,61 @@ private struct AutomationRow: View {
                 }
             }
         }
+    }
+
+    private var background: Color {
+        if selected { return Palette.rowSelected }
+        return hovering ? Palette.rowHover : .clear
+    }
+}
+
+// A project's sidebar row: health dot in the shared leading column, the name,
+// and how long until the next thing is due. Built like AutomationRow — the dot
+// says the same kind of thing — with the due text where a bot row keeps its
+// stamp, because "overdue 3d" is the one number worth reading from the list.
+private struct ProjectRow: View {
+    let project: Project
+    let selected: Bool
+    let select: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: select) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Palette.health(project.health))
+                    .frame(width: Metric.healthDot, height: Metric.healthDot)
+                    // The same leading width a bot's avatar takes, so project
+                    // names share the sidebar's one text column.
+                    .frame(width: Metric.avatarRow)
+                Text(project.name)
+                    .font(TypeScale.rowTitle)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                if let due = project.nextDueText {
+                    Text(due)
+                        .font(TypeScale.rowMeta)
+                        // Overdue is the one state the list itself has to
+                        // shout; the rest stay quiet meta text.
+                        .foregroundStyle(project.health == "overdue"
+                                         ? Palette.healthOverdue : Palette.secondaryText)
+                        .lineLimit(1)
+                }
+            }
+            .foregroundStyle(Palette.primaryText)
+            .padding(.vertical, Metric.rowVPad)
+            .padding(.horizontal, Metric.sidebarGutter)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous))
+            .background(
+                background,
+                in: RoundedRectangle(cornerRadius: Metric.rowRadius, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help("\(project.name) — \(project.healthLabel)")
     }
 
     private var background: Color {

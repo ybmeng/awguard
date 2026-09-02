@@ -445,6 +445,278 @@ private struct CalendarManageRow: View {
     }
 }
 
+// MARK: - Projects
+
+/// New project: a name and an optional goal, nothing else. Health, nextDue and
+/// factCount are derived server-side from facts that do not exist yet, so there
+/// is deliberately nothing to set for them here.
+struct NewProjectSheet: View {
+    @EnvironmentObject var store: AppStore
+    @Environment(\.dismiss) private var dismiss
+    /// Selects the created project, so making one lands you in its pane rather
+    /// than back where you started.
+    var onCreated: (Project) -> Void = { _ in }
+
+    @State private var name = ""
+    @State private var goal = ""
+    @State private var saving = false
+
+    private var trimmedName: String { name.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        NavigationStack {
+            // Labelled rows, not a section header per field: a macOS Form puts
+            // a TextField's placeholder in the label slot, so a header above one
+            // prints the field's name twice the moment it has a value.
+            Form {
+                Section {
+                    TextField("Name", text: $name)
+                }
+                Section("Goal") {
+                    TextField("", text: $goal, axis: .vertical)
+                        .lineLimit(3...8)
+                }
+            }
+            .formStyle(.grouped)
+            .frame(minWidth: 420, minHeight: 300)
+            .navigationTitle("New Project")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(saving ? "Saving…" : "Create") {
+                        saving = true
+                        Task {
+                            let created = await store.createProject(
+                                name: trimmedName, goal: cleaned(goal))
+                            saving = false
+                            // A failed create (duplicate name) keeps the sheet
+                            // open with the draft; the shared alert explains.
+                            if let created {
+                                onCreated(created)
+                                dismiss()
+                            }
+                        }
+                    }
+                    .disabled(saving || trimmedName.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func cleaned(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Rename a project or restate its goal. Explicit Save, and only the changed
+/// fields go on the wire: projects are last-write-wins like events, so
+/// resending an untouched goal would clobber whatever a bot wrote to it while
+/// this sheet was open.
+struct EditProjectSheet: View {
+    @EnvironmentObject var store: AppStore
+    @Environment(\.dismiss) private var dismiss
+
+    let project: Project
+
+    @State private var name: String
+    @State private var goal: String
+    @State private var saving = false
+
+    init(project: Project) {
+        self.project = project
+        _name = State(initialValue: project.name)
+        _goal = State(initialValue: project.goal)
+    }
+
+    private var trimmedName: String { name.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Name", text: $name)
+                }
+                Section("Goal") {
+                    TextField("", text: $goal, axis: .vertical)
+                        .lineLimit(3...8)
+                }
+            }
+            .formStyle(.grouped)
+            .frame(minWidth: 420, minHeight: 300)
+            .navigationTitle("Project")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(saving ? "Saving…" : "Save") {
+                        saving = true
+                        Task {
+                            let saved = await store.updateProject(project, fields: changes)
+                            saving = false
+                            if saved { dismiss() }
+                        }
+                    }
+                    .disabled(saving || trimmedName.isEmpty)
+                }
+            }
+        }
+    }
+
+    private var changes: [String: String] {
+        var fields: [String: String] = [:]
+        if trimmedName != project.name { fields["name"] = trimmedName }
+        let trimmedGoal = goal.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedGoal != project.goal { fields["goal"] = trimmedGoal }
+        return fields
+    }
+}
+
+/// Add one typed fact. The kind picker is the whole form: `FactKind.fields` is
+/// the single table saying which inputs a kind takes, and the rows below read
+/// that set. Adding a kind is a case plus a row in that table — never another
+/// branch here — and an input the server would reject for this kind is never
+/// shown, so the contract's 400s stay a backstop rather than a routine answer.
+struct AddFactSheet: View {
+    @EnvironmentObject var store: AppStore
+    @Environment(\.dismiss) private var dismiss
+
+    let project: Project
+    /// Snapshot-only: open on this kind so the field table's effect on the form
+    /// can be rendered — the picker can't be clicked offscreen. Deadline in the
+    /// app, which is the kind a project usually starts with.
+    var initialKind: FactKind = .deadline
+
+    @State private var kind: FactKind
+    @State private var title = ""
+    @State private var due = AddFactSheet.defaultDue()
+    @State private var leadDays = 30
+    @State private var rrule = ""
+    @State private var tz = TimeZone.current.identifier
+    @State private var blocker = ""
+    @State private var body_ = ""
+    @State private var saving = false
+
+    init(project: Project, initialKind: FactKind = .deadline) {
+        self.project = project
+        self.initialKind = initialKind
+        _kind = State(initialValue: initialKind)
+    }
+
+    private var trimmedTitle: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    /// Recurring REQUIRES an rrule and a tz server-side, so the sheet refuses
+    /// to send one without them rather than surfacing the 400.
+    private var canSave: Bool {
+        guard !saving, !trimmedTitle.isEmpty else { return false }
+        guard kind.fields.contains(.rrule) else { return true }
+        return !rrule.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !tz.isEmpty
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Kind", selection: $kind) {
+                        ForEach(FactKind.allCases) { k in
+                            Text(k.title).tag(k)
+                        }
+                    }
+                    TextField("Title", text: $title)
+                    if kind.fields.contains(.due) {
+                        DatePicker(kind == .recurring ? "First due" : "Due",
+                                   selection: $due,
+                                   displayedComponents: [.date, .hourAndMinute])
+                    }
+                    if kind.fields.contains(.leadDays) {
+                        // The window that makes this fact "due soon". The
+                        // server's own default is 30 days.
+                        Stepper("Lead \(leadDays) days", value: $leadDays, in: 0...365)
+                    }
+                    if kind.fields.contains(.rrule) {
+                        // Typed verbatim: the rule IS the spec, and the server
+                        // parses its own subset. Paraphrasing it in a picker
+                        // would hide what actually recurs.
+                        TextField("Repeat rule", text: $rrule,
+                                  prompt: Text("FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=30"))
+                    }
+                    if kind.fields.contains(.tz) {
+                        TextField("Time zone", text: $tz)
+                    }
+                    if kind.fields.contains(.blocker) {
+                        TextField("Blocker", text: $blocker,
+                                  prompt: Text("who or what this waits on"))
+                    }
+                }
+                if kind.fields.contains(.body) {
+                    Section(kind == .note ? "Note" : "Details") {
+                        TextField("", text: $body_, axis: .vertical)
+                            .lineLimit(3...8)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .frame(minWidth: 460, minHeight: 400)
+            .navigationTitle("Add Fact")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(saving ? "Saving…" : "Add", action: save)
+                        .disabled(!canSave)
+                }
+            }
+        }
+    }
+
+    // A failed save keeps the sheet open with the draft intact; the error is
+    // already on its way to the one shared alert.
+    private func save() {
+        saving = true
+        Task {
+            let saved = await store.addFact(to: project.id, fields: wireFields())
+            saving = false
+            if saved { dismiss() }
+        }
+    }
+
+    /// The create body, built from the SAME field table the form reads — so a
+    /// key the picked kind doesn't allow can't reach the wire even if a stale
+    /// draft still holds a value for it.
+    private func wireFields() -> [String: Any] {
+        var fields: [String: Any] = ["kind": kind.rawValue, "title": trimmedTitle]
+        if kind.fields.contains(.due) { fields["due"] = APIClient.wireTime(due) }
+        if kind.fields.contains(.leadDays) { fields["leadDays"] = leadDays }
+        if kind.fields.contains(.rrule), !cleaned(rrule).isEmpty {
+            fields["rrule"] = cleaned(rrule)
+        }
+        if kind.fields.contains(.tz), !cleaned(tz).isEmpty { fields["tz"] = cleaned(tz) }
+        if kind.fields.contains(.blocker), !cleaned(blocker).isEmpty {
+            fields["blocker"] = cleaned(blocker)
+        }
+        if kind.fields.contains(.body), !cleaned(body_).isEmpty {
+            fields["body"] = cleaned(body_)
+        }
+        return fields
+    }
+
+    private func cleaned(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// A new deadline opens a month out at 9am: a due date typed today is
+    /// almost never today, and midnight would read as the day before in half
+    /// the world's timezones.
+    private static func defaultDue(now: Date = Date()) -> Date {
+        let calendar = Calendar.current
+        let month = calendar.date(byAdding: .month, value: 1, to: now) ?? now
+        return calendar.date(bySettingHour: 9, minute: 0, second: 0, of: month) ?? month
+    }
+}
+
 struct SettingsSheet: View {
     @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) private var dismiss

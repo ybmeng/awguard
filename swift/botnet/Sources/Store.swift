@@ -42,6 +42,19 @@ final class AppStore: ObservableObject {
     // reopening a row doesn't refetch a finished run (finished runs are
     // immutable); an unfinished run's row is refetched by the poll loop.
     @Published private(set) var runDetails: [String: RunDetail] = [:]
+    // The projects, in the server's own order (health precedence, then nextDue,
+    // then name). Empty both before the first fetch and on a server without the
+    // routes; the flag below is what actually hides the nav section.
+    @Published private(set) var projects: [Project] = []
+    // True once GET /v1/projects has 404'd: this botnetd predates projects and
+    // the whole nav section is absent, exactly the automations precedent.
+    // Cleared on a later success, so a restart onto a current server mid-run
+    // brings the section back on the next refresh.
+    @Published private(set) var projectsUnavailable = false
+    // One project's facts, by project id — the pane's data, fetched per open.
+    // Nil means "not loaded yet"; an empty ProjectDetail.facts means the
+    // project genuinely has none.
+    @Published private(set) var projectDetails: [String: ProjectDetail] = [:]
     // Automation names with a manual run this client started still settling —
     // what disables the Run now button between the POST and the poll's end.
     @Published private(set) var manualRunsInFlight: Set<String> = []
@@ -69,6 +82,7 @@ final class AppStore: ObservableObject {
         await prefetchConversations()
         await refreshEvents()
         await refreshAutomations()
+        await refreshProjects()
     }
 
     // A server that denormalizes the preview onto the bot has already told us
@@ -458,6 +472,152 @@ final class AppStore: ObservableObject {
     /// decides how a stuck run ends, not this poll.
     private static let runTimeout: TimeInterval = 900
 
+    // MARK: projects
+    //
+    // The server owns the projects and their facts, and DERIVES health, nextDue
+    // and factCount from the facts on every read. So every fact write is
+    // followed by a re-read rather than a local splice: the write's own response
+    // is one fact, and the numbers that moved because of it live on the project
+    // and on the list's ordering, which only the server can restate.
+
+    func refreshProjects() async {
+        do {
+            projects = try await api.listProjects()
+            projectsUnavailable = false
+        } catch {
+            guard !APIClient.isUnimplemented(error) else {
+                projects = []
+                projectsUnavailable = true
+                return
+            }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Re-reads one project with its facts (the pane's data) and splices the
+    /// returned row over the list entry, so the header badge and the sidebar
+    /// dot move together.
+    func loadProject(_ id: String) async {
+        do {
+            let detail = try await api.project(id)
+            projectDetails[id] = detail
+            if let i = projects.firstIndex(where: { $0.id == id }) {
+                projects[i] = detail.project
+            }
+        } catch {
+            guard !APIClient.isUnimplemented(error) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// The pane's facts. Nil until the first load — which is what tells
+    /// "still fetching" apart from "this project has no facts".
+    func facts(for projectID: String) -> [ProjectFact]? {
+        projectDetails[projectID]?.facts
+    }
+
+    /// Returns the created project so the caller can select it; nil when the
+    /// create failed, which keeps the sheet open with its draft.
+    func createProject(name: String, goal: String) async -> Project? {
+        do {
+            let created = try await api.createProject(name: name, goal: goal)
+            await refreshProjects()
+            return created
+        } catch {
+            lastError = projectError(error, verb: "add a project")
+            return nil
+        }
+    }
+
+    /// `fields` is only what the editor changed — projects are last-write-wins
+    /// like events, so resending an untouched field would clobber whatever a
+    /// bot's tool wrote to it while the sheet was open.
+    @discardableResult
+    func updateProject(_ project: Project, fields: [String: String]) async -> Bool {
+        guard !fields.isEmpty else { return true }
+        do {
+            let updated = try await api.updateProject(project.id, fields: fields)
+            if let i = projects.firstIndex(where: { $0.id == updated.id }) {
+                projects[i] = updated
+            }
+            if var detail = projectDetails[updated.id] {
+                detail.project = updated
+                projectDetails[updated.id] = detail
+            }
+            // A rename re-sorts the list at equal health, and the server also
+            // rewrites the projected events' titles — re-read rather than guess.
+            await refreshProjects()
+            return true
+        } catch {
+            lastError = projectError(error, verb: "edit a project")
+            return false
+        }
+    }
+
+    /// The server cascades: the project's facts and their projected calendar
+    /// events go with it, so the cached events are stale afterwards too.
+    func deleteProject(_ project: Project) async {
+        do {
+            try await api.deleteProject(project.id)
+            projects.removeAll { $0.id == project.id }
+            projectDetails[project.id] = nil
+            await refreshEvents()
+        } catch {
+            lastError = projectError(error, verb: "delete a project")
+        }
+    }
+
+    /// Returns whether the fact landed, so the sheet can stay open with the
+    /// draft intact when it didn't.
+    @discardableResult
+    func addFact(to projectID: String, fields: [String: Any]) async -> Bool {
+        do {
+            _ = try await api.createFact(projectID, fields: fields)
+            await reload(projectID)
+            return true
+        } catch {
+            lastError = projectError(error, verb: "add a fact")
+            return false
+        }
+    }
+
+    @discardableResult
+    func updateFact(_ fact: ProjectFact, fields: [String: Any]) async -> Bool {
+        guard !fields.isEmpty else { return true }
+        do {
+            _ = try await api.updateFact(fact.projectId, factID: fact.id, fields: fields)
+            await reload(fact.projectId)
+            return true
+        } catch {
+            lastError = projectError(error, verb: "edit a fact")
+            return false
+        }
+    }
+
+    func deleteFact(_ fact: ProjectFact) async {
+        do {
+            try await api.deleteFact(fact.projectId, factID: fact.id)
+            await reload(fact.projectId)
+        } catch {
+            lastError = projectError(error, verb: "delete a fact")
+        }
+    }
+
+    /// After a fact write: the pane's facts, the project's derived health, and
+    /// the list's health-precedence ordering are all stale at once, and the
+    /// projected calendar event may have been created, moved or deleted.
+    private func reload(_ projectID: String) async {
+        await loadProject(projectID)
+        await refreshProjects()
+        await refreshEvents()
+    }
+
+    private func projectError(_ error: Error, verb: String) -> String {
+        APIClient.isUnimplemented(error)
+            ? "This botnetd is too old to \(verb) — restart it from the current build."
+            : error.localizedDescription
+    }
+
     func compact(_ bot: Bot) async {
         guard !compactingBotIDs.contains(bot.id) else { return }
         compactingBotIDs.insert(bot.id)
@@ -575,6 +735,9 @@ final class AppStore: ObservableObject {
             // Freshness dots age the same way: a scheduled fire can land while
             // the user chats, and this settle is the one refresh moment.
             await refreshAutomations()
+            // And the reply may have run the project tool, which moves health
+            // and nextDue on rows the sidebar is already drawing.
+            await refreshProjects()
             return
         }
     }

@@ -547,6 +547,179 @@ struct DecodeCheck {
             _ = try decoder.decode([Automation].self, from: Data("[]".utf8))
         }
 
+        // Projects. A project's health, nextDue and factCount are DERIVED
+        // server-side and always sent; nextDue is omitted when nothing is due.
+        // health stays a wire string so a value this build doesn't know renders
+        // rather than throwing — Palette.health(_:) absorbs it.
+        let fullProject = Data("""
+        {"id":"prj_01M1C0000000000000000001","name":"China visa","goal":"Keep the visa valid through the Shanghai filing","createdBy":"user","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"overdue","nextDue":"2026-08-20T00:00:00Z","factCount":4}
+        """.utf8)
+        // Zero facts: no nextDue key at all, empty goal, health "unknown".
+        let bareProject = Data("""
+        {"id":"prj_01M1C0000000000000000002","name":"Passport","goal":"","createdBy":"bot_01M16K3W6TZ0EHQFPKZ490BDX2","createdAt":"2026-09-01T08:01:00Z","updatedAt":"2026-09-01T08:01:00Z","health":"unknown","factCount":0}
+        """.utf8)
+        await check("Project decodes with nextDue present and absent") {
+            let full = try decoder.decode(Project.self, from: fullProject)
+            let bare = try decoder.decode(Project.self, from: bareProject)
+            guard full.name == "China visa", full.health == "overdue",
+                  full.factCount == 4, full.isUserCreated,
+                  // Overdue: the nearest due instant is already behind the
+                  // project's own creation, which is what the row must say.
+                  let due = full.nextDue, due < full.createdAt,
+                  bare.nextDue == nil, bare.goal.isEmpty, bare.factCount == 0,
+                  bare.health == "unknown", bare.createdBy.hasPrefix("bot_")
+            else {
+                throw NSError(domain: "decode-check", code: 40, userInfo: [
+                    NSLocalizedDescriptionKey: "project decoded wrong: \(full) / \(bare)",
+                ])
+            }
+        }
+
+        // A health this build has never heard of must decode and reach the
+        // palette's fallback, never throw the whole list's decode.
+        let futureHealthProject = Data("""
+        {"id":"prj_01M1C0000000000000000003","name":"SG company","goal":"g","createdBy":"user","createdAt":"2026-09-01T08:02:00Z","updatedAt":"2026-09-01T08:02:00Z","health":"escalating","factCount":2}
+        """.utf8)
+        await check("Project with an unknown health value decodes") {
+            let p = try decoder.decode(Project.self, from: futureHealthProject)
+            guard p.health == "escalating", p.healthLabel == "escalating" else {
+                throw NSError(domain: "decode-check", code: 41, userInfo: [
+                    NSLocalizedDescriptionKey: "unknown health decoded wrong: \(p)",
+                ])
+            }
+        }
+
+        // Go marshals a *time.Time as null and a zero time.Time as year 1;
+        // either way the app must read "nothing due", never a year-1 date on
+        // the sidebar row.
+        let zeroNextDueProject = Data("""
+        {"id":"prj_01M1C0000000000000000004","name":"Zero","goal":"","createdBy":"user","createdAt":"2026-09-01T08:03:00Z","updatedAt":"2026-09-01T08:03:00Z","health":"ok","nextDue":"0001-01-01T00:00:00Z","factCount":1}
+        """.utf8)
+        await check("Project nextDue zero-time sentinel reads as nil") {
+            let p = try decoder.decode(Project.self, from: zeroNextDueProject)
+            guard p.nextDue == nil else {
+                throw NSError(domain: "decode-check", code: 42, userInfo: [
+                    NSLocalizedDescriptionKey: "zero nextDue decoded as \(String(describing: p.nextDue))",
+                ])
+            }
+        }
+        await check("empty project list decodes") {
+            _ = try decoder.decode([Project].self, from: Data("[]".utf8))
+        }
+
+        // Facts. Each kind carries a different subset of the optional keys, and
+        // the same build has to decode all four: due only on deadline/recurring,
+        // rrule+tz only on recurring, blocker only on milestone, body anywhere.
+        let deadlineFact = Data("""
+        {"id":"fct_01M1D0000000000000000001","projectId":"prj_01M1C0000000000000000001","kind":"deadline","title":"Visa expires","due":"2026-08-20T00:00:00Z","leadDays":45,"done":false,"body":"Renew at the Shanghai consulate","eventId":"evt_01M1A0000000000000000009","createdBy":"user","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z"}
+        """.utf8)
+        let recurringFact = Data("""
+        {"id":"fct_01M1D0000000000000000002","projectId":"prj_01M1C0000000000000000003","kind":"recurring","title":"Annual return","due":"2026-11-30T00:00:00Z","leadDays":30,"rrule":"FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=30","tz":"Asia/Singapore","done":false,"createdBy":"bot_01M16K3W6TZ0EHQFPKZ490BDX2","createdAt":"2026-09-01T08:02:00Z","updatedAt":"2026-09-01T08:02:00Z"}
+        """.utf8)
+        // Milestone: no due key at all, a blocker naming the human gate.
+        let milestoneFact = Data("""
+        {"id":"fct_01M1D0000000000000000003","projectId":"prj_01M1C0000000000000000001","kind":"milestone","title":"Lease signed","leadDays":0,"done":false,"blocker":"Landlord has not countersigned","createdBy":"user","createdAt":"2026-09-01T08:04:00Z","updatedAt":"2026-09-01T08:04:00Z"}
+        """.utf8)
+        // Note: no due, no blocker, body only — the minimum legal fact.
+        let noteFact = Data("""
+        {"id":"fct_01M1D0000000000000000004","projectId":"prj_01M1C0000000000000000001","kind":"note","title":"Consulate hours","leadDays":0,"done":false,"body":"Mon-Thu 09:00-11:30 only.","createdBy":"user","createdAt":"2026-09-01T08:05:00Z","updatedAt":"2026-09-01T08:05:00Z"}
+        """.utf8)
+        await check("ProjectFact: deadline/recurring carry due, milestone/note omit it") {
+            let deadline = try decoder.decode(ProjectFact.self, from: deadlineFact)
+            let recurring = try decoder.decode(ProjectFact.self, from: recurringFact)
+            let milestone = try decoder.decode(ProjectFact.self, from: milestoneFact)
+            let note = try decoder.decode(ProjectFact.self, from: noteFact)
+            guard deadline.kind == "deadline", deadline.due != nil,
+                  deadline.leadDays == 45, !deadline.done,
+                  deadline.body == "Renew at the Shanghai consulate",
+                  deadline.eventId == "evt_01M1A0000000000000000009",
+                  deadline.rrule == nil, deadline.tz == nil, deadline.blocker == nil,
+                  !deadline.isBlocked,
+                  recurring.due != nil, recurring.rrule?.hasPrefix("FREQ=YEARLY") == true,
+                  recurring.tz == "Asia/Singapore", recurring.leadDays == 30,
+                  recurring.eventId == nil, recurring.body == nil,
+                  milestone.due == nil, milestone.blocker == "Landlord has not countersigned",
+                  milestone.isBlocked, milestone.rrule == nil, milestone.tz == nil,
+                  note.due == nil, note.blocker == nil, !note.isBlocked,
+                  note.body == "Mon-Thu 09:00-11:30 only.", note.eventId == nil
+            else {
+                throw NSError(domain: "decode-check", code: 43, userInfo: [
+                    NSLocalizedDescriptionKey: "fact optionals decoded wrong: \(deadline) / \(recurring) / \(milestone) / \(note)",
+                ])
+            }
+        }
+
+        // Same zero-time rule as nextDue: a server that marshals an unset due as
+        // year 1 rather than omitting the key must still read as "no due date".
+        let zeroDueFact = Data("""
+        {"id":"fct_01M1D0000000000000000005","projectId":"prj_01M1C0000000000000000001","kind":"note","title":"Zero due","due":"0001-01-01T00:00:00Z","leadDays":0,"done":false,"createdBy":"user","createdAt":"2026-09-01T08:06:00Z","updatedAt":"2026-09-01T08:06:00Z"}
+        """.utf8)
+        await check("ProjectFact due zero-time sentinel reads as nil") {
+            let f = try decoder.decode(ProjectFact.self, from: zeroDueFact)
+            guard f.due == nil else {
+                throw NSError(domain: "decode-check", code: 44, userInfo: [
+                    NSLocalizedDescriptionKey: "zero due decoded as \(String(describing: f.due))",
+                ])
+            }
+        }
+
+        // A kind this build doesn't know must decode and render with the
+        // fallback glyph, exactly like an unknown health.
+        let futureKindFact = Data("""
+        {"id":"fct_01M1D0000000000000000006","projectId":"prj_01M1C0000000000000000001","kind":"audit","title":"Books reviewed","leadDays":0,"done":true,"createdBy":"user","createdAt":"2026-09-01T08:07:00Z","updatedAt":"2026-09-01T08:07:00Z"}
+        """.utf8)
+        await check("ProjectFact with an unknown kind decodes") {
+            let f = try decoder.decode(ProjectFact.self, from: futureKindFact)
+            guard f.kind == "audit", f.done, FactKind(rawValue: f.kind) == nil,
+                  !f.isCompletable
+            else {
+                throw NSError(domain: "decode-check", code: 45, userInfo: [
+                    NSLocalizedDescriptionKey: "unknown kind decoded wrong: \(f)",
+                ])
+            }
+        }
+
+        // GET /v1/projects/{id}: the project plus its facts, urgency-first as
+        // the server sorted them. A project with no facts sends `facts` as null
+        // (Go's nil slice), which must read as an empty list, not a decode
+        // failure — the pane says "no facts yet" off exactly that.
+        let projectDetail = Data("""
+        {"project":{"id":"prj_01M1C0000000000000000001","name":"China visa","goal":"Keep the visa valid","createdBy":"user","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"overdue","nextDue":"2026-08-20T00:00:00Z","factCount":2},"facts":[{"id":"fct_01M1D0000000000000000001","projectId":"prj_01M1C0000000000000000001","kind":"deadline","title":"Visa expires","due":"2026-08-20T00:00:00Z","leadDays":45,"done":false,"createdBy":"user","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z"},{"id":"fct_01M1D0000000000000000003","projectId":"prj_01M1C0000000000000000001","kind":"milestone","title":"Lease signed","leadDays":0,"done":false,"blocker":"Landlord has not countersigned","createdBy":"user","createdAt":"2026-09-01T08:04:00Z","updatedAt":"2026-09-01T08:04:00Z"}]}
+        """.utf8)
+        let emptyDetail = Data("""
+        {"project":{"id":"prj_01M1C0000000000000000002","name":"Passport","goal":"","createdBy":"user","createdAt":"2026-09-01T08:01:00Z","updatedAt":"2026-09-01T08:01:00Z","health":"unknown","factCount":0},"facts":null}
+        """.utf8)
+        await check("ProjectDetail decodes; a null facts list reads as empty") {
+            let detail = try decoder.decode(ProjectDetail.self, from: projectDetail)
+            let empty = try decoder.decode(ProjectDetail.self, from: emptyDetail)
+            guard detail.project.name == "China visa", detail.facts.count == 2,
+                  detail.facts[0].kind == "deadline", detail.facts[1].isBlocked,
+                  empty.facts.isEmpty, empty.project.factCount == 0
+            else {
+                throw NSError(domain: "decode-check", code: 46, userInfo: [
+                    NSLocalizedDescriptionKey: "project detail decoded wrong: \(detail) / \(empty)",
+                ])
+            }
+        }
+
+        // The four kinds the sheet offers are a Swift enum with a field table;
+        // the table is what decides which inputs show, so it is checked here
+        // rather than only by eye in a screenshot.
+        await check("FactKind field table matches the contract's validation") {
+            guard FactKind.deadline.fields == [.due, .leadDays, .body],
+                  FactKind.recurring.fields == [.due, .leadDays, .rrule, .tz, .body],
+                  FactKind.milestone.fields == [.blocker, .body],
+                  FactKind.note.fields == [.body],
+                  FactKind.allCases.count == 4,
+                  FactKind.deadline.isCompletable, FactKind.milestone.isCompletable,
+                  !FactKind.recurring.isCompletable, !FactKind.note.isCompletable
+            else {
+                throw NSError(domain: "decode-check", code: 47, userInfo: [
+                    NSLocalizedDescriptionKey: "FactKind field table drifted from the contract",
+                ])
+            }
+        }
+
         // The times the app sends back must be the RFC3339 form the server
         // parses, and must survive a round trip through its own decoder.
         await check("wireTime round-trips through the decoder") {
@@ -626,6 +799,14 @@ struct DecodeCheck {
             await check("live GET /v1/automations (404 = unmounted bridge, tolerated)") {
                 do { _ = try await api.listAutomations() }
                 catch let e where APIClient.isUnimplemented(e) {}
+            }
+            // Read-only, like every live probe here: the list, and the detail
+            // of whatever it returned. A 404 is an older server, not a failure.
+            await check("live GET /v1/projects (404 = older server, tolerated)") {
+                do {
+                    let projects = try await api.listProjects()
+                    for p in projects { _ = try await api.project(p.id) }
+                } catch let e where APIClient.isUnimplemented(e) {}
             }
             for b in bots {
                 await check("live GET /v1/bots/\(b.id)/messages") {

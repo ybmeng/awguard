@@ -20,6 +20,7 @@ struct ContentView: View {
     @EnvironmentObject var store: AppStore
     @State private var selection: SidebarSelection?
     @State private var showNewBot = false
+    @State private var showNewProject = false
     @State private var showSettings = false
     @State private var showDetails = false
     // Lives here rather than in BotDetails so the choice survives the inspector
@@ -31,7 +32,8 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(selection: $selection, showNewBot: $showNewBot)
+            SidebarView(selection: $selection, showNewBot: $showNewBot,
+                        showNewProject: $showNewProject)
                 .navigationSplitViewColumnWidth(min: 240, ideal: Metric.sidebarWidth, max: 380)
                 .toolbar {
                     ToolbarItem {
@@ -65,11 +67,24 @@ struct ContentView: View {
                 } else {
                     nothingSelected
                 }
+            case .project(let id)?:
+                // Same live-resolve rule as bots and automations: the project
+                // comes off store.projects at render time, so a refresh moves
+                // its health badge and a deleted project falls back rather
+                // than rendering a ghost.
+                if let project = store.projects.first(where: { $0.id == id }) {
+                    ProjectView(project: project)
+                } else {
+                    nothingSelected
+                }
             case .service(.artifacts)?, nil:
                 nothingSelected
             }
         }
         .sheet(isPresented: $showNewBot) { NewBotSheet() }
+        .sheet(isPresented: $showNewProject) {
+            NewProjectSheet { created in selection = .project(created.id) }
+        }
         .sheet(isPresented: $showSettings) { SettingsSheet() }
         .alert("Error", isPresented: Binding(
             get: { store.lastError != nil },

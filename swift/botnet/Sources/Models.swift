@@ -577,6 +577,223 @@ struct RunArtifact: Decodable, Hashable {
     var newest: String
 }
 
+// MARK: - Projects
+//
+// A project is what work is ABOUT: a goal plus typed, dated facts. Health and
+// nextDue are DERIVED server-side from the facts and never stored, the same way
+// an automation's freshness derives from its runs — so nothing here computes
+// them, and a client that disagreed with the server would just be wrong.
+
+// One project — mirrors go/botnet/schema.go's Project. `health` stays the wire
+// string (like a calendar's color and an automation's freshness): the closed set
+// is overdue|blocked|due_soon|ok|unknown today, and Palette.health(_:) absorbs a
+// value this build doesn't know rather than a decoder throwing on it.
+struct Project: Identifiable, Decodable, Hashable {
+    var id: String            // "prj_" + ULID
+    var name: String
+    var goal: String          // free text, may be empty
+    /// The bot id that created it, or `Event.userAuthor` for one made in the UI.
+    var createdBy: String
+    var createdAt: Date
+    var updatedAt: Date
+    /// Derived at read time from the facts; never patched, never sent back.
+    var health: String
+    /// The nearest upcoming due instant across the undone deadline and
+    /// recurring facts. Nil when nothing is pending.
+    var nextDue: Date?
+    var factCount: Int
+
+    var isUserCreated: Bool { createdBy == Event.userAuthor }
+    var hasGoal: Bool { !goal.isEmpty }
+
+    /// "due soon" — the wire value read as words. An unknown future value comes
+    /// through verbatim rather than being hidden behind a guess.
+    var healthLabel: String { health.replacingOccurrences(of: "_", with: " ") }
+
+    /// "in 12d" / "today" / "overdue 3d", or nil when nothing is due.
+    var nextDueText: String? { DueText.relative(nextDue) }
+
+    private enum Keys: String, CodingKey {
+        case id, name, goal, createdBy, createdAt, updatedAt, health, nextDue, factCount
+    }
+    // Every derived key is read leniently: Go's omitempty drops exactly the zero
+    // value, so an absent factCount IS 0 and an absent goal IS "". nextDue goes
+    // through nilIfServerZero as well, because a server marshalling an unset
+    // time.Time rather than a *time.Time sends year 1, not null, and a year-1
+    // date on a sidebar row would read as wildly overdue.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        goal = try c.decodeIfPresent(String.self, forKey: .goal) ?? ""
+        createdBy = try c.decodeIfPresent(String.self, forKey: .createdBy) ?? ""
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        health = try c.decodeIfPresent(String.self, forKey: .health) ?? ""
+        nextDue = try c.decodeIfPresent(Date.self, forKey: .nextDue)?.nilIfServerZero
+        factCount = try c.decodeIfPresent(Int.self, forKey: .factCount) ?? 0
+    }
+}
+
+// One typed fact on a project — mirrors go/botnet/schema.go's Fact. Which
+// optional keys ride along depends on `kind`: due on deadline/recurring, rrule
+// and tz on recurring, blocker on milestone, body anywhere. `kind` stays a wire
+// string for the same reason `health` does.
+struct ProjectFact: Identifiable, Decodable, Hashable {
+    var id: String            // "fct_" + ULID
+    var projectId: String
+    var kind: String
+    var title: String
+    /// The deadline's instant, or a recurring fact's FIRST occurrence. Absent
+    /// (and year-1) on a milestone or a note.
+    var due: Date?
+    /// Days before `due` that count as due_soon. Meaningless without a due.
+    var leadDays: Int
+    var rrule: String?
+    var tz: String?
+    /// Only a deadline or a milestone can be done; a done fact affects neither
+    /// health nor nextDue.
+    var done: Bool
+    /// Milestone only. Non-empty means the milestone waits on a human.
+    var blocker: String?
+    var body: String?
+    /// The projected calendar event, when the server keeps one for this fact.
+    /// Nil for milestones, notes, done facts, and a server that predates the
+    /// projection.
+    var eventId: String?
+    var createdBy: String
+    var createdAt: Date
+    var updatedAt: Date
+
+    var isUserCreated: Bool { createdBy == Event.userAuthor }
+    var isBlocked: Bool { !(blocker ?? "").isEmpty }
+    var isRecurring: Bool { !(rrule ?? "").isEmpty }
+    var hasBody: Bool { !(body ?? "").isEmpty }
+
+    /// Whether the row draws a done toggle. Keyed off the typed kind, so a kind
+    /// this build doesn't know gets no toggle rather than a PATCH the server
+    /// would reject.
+    var isCompletable: Bool { FactKind(rawValue: kind)?.isCompletable ?? false }
+
+    /// "in 12d" / "overdue 3d", or nil for a fact with no due date.
+    var dueText: String? { DueText.relative(due) }
+
+    private enum Keys: String, CodingKey {
+        case id, projectId, kind, title, due, leadDays, rrule, tz, done
+        case blocker, body, eventId, createdBy, createdAt, updatedAt
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        id = try c.decode(String.self, forKey: .id)
+        projectId = try c.decodeIfPresent(String.self, forKey: .projectId) ?? ""
+        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? ""
+        title = try c.decode(String.self, forKey: .title)
+        due = try c.decodeIfPresent(Date.self, forKey: .due)?.nilIfServerZero
+        leadDays = try c.decodeIfPresent(Int.self, forKey: .leadDays) ?? 0
+        rrule = try c.decodeIfPresent(String.self, forKey: .rrule)
+        tz = try c.decodeIfPresent(String.self, forKey: .tz)
+        done = try c.decodeIfPresent(Bool.self, forKey: .done) ?? false
+        blocker = try c.decodeIfPresent(String.self, forKey: .blocker)
+        body = try c.decodeIfPresent(String.self, forKey: .body)
+        eventId = try c.decodeIfPresent(String.self, forKey: .eventId)
+        createdBy = try c.decodeIfPresent(String.self, forKey: .createdBy) ?? ""
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+    }
+}
+
+/// GET /v1/projects/{id}: the project and its facts, already sorted
+/// urgency-first by the server. The pane renders them in exactly that order —
+/// the sort is the server's contract, and re-sorting here would be a second
+/// opinion nothing keeps in step.
+struct ProjectDetail: Decodable, Hashable {
+    var project: Project
+    /// A project with no facts sends `facts` as null (Go's nil slice), which is
+    /// an empty list, not a missing one.
+    var facts: [ProjectFact]
+
+    private enum Keys: String, CodingKey { case project, facts }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        project = try c.decode(Project.self, forKey: .project)
+        facts = try c.decodeIfPresent([ProjectFact].self, forKey: .facts) ?? []
+    }
+}
+
+/// The four fact kinds this build can author. Deliberately a Swift enum over
+/// the wire string: `fields` is the ONE table saying which inputs a kind takes,
+/// so the Add Fact sheet is driven by it rather than by four branches, and the
+/// contract's validation rules live in one readable place. A wire `kind` outside
+/// this set still decodes and renders — it just can't be authored here.
+enum FactKind: String, CaseIterable, Identifiable {
+    case deadline, recurring, milestone, note
+
+    var id: String { rawValue }
+
+    var title: String { rawValue.capitalized }
+
+    /// The row's leading glyph. A kind this build doesn't know falls back to a
+    /// neutral mark rather than borrowing another kind's meaning.
+    var symbol: String {
+        switch self {
+        case .deadline: return "calendar.badge.exclamationmark"
+        case .recurring: return "arrow.triangle.2.circlepath"
+        case .milestone: return "flag"
+        case .note: return "text.alignleft"
+        }
+    }
+
+    /// Which inputs the Add Fact sheet shows, mirroring the server's write
+    /// boundary: deadline requires a due, recurring requires due+rrule+tz,
+    /// milestone/note must carry no due at all, and only a milestone may carry
+    /// a blocker. Sending a field outside this set is a 400, so the sheet
+    /// cannot offer one.
+    var fields: Set<FactField> {
+        switch self {
+        case .deadline: return [.due, .leadDays, .body]
+        case .recurring: return [.due, .leadDays, .rrule, .tz, .body]
+        case .milestone: return [.blocker, .body]
+        case .note: return [.body]
+        }
+    }
+
+    /// Only a deadline or a milestone can be marked done; the server rejects
+    /// `done` on the other two.
+    var isCompletable: Bool { self == .deadline || self == .milestone }
+
+    /// The glyph for a wire kind, known or not.
+    static func symbol(for wire: String) -> String {
+        FactKind(rawValue: wire)?.symbol ?? "circle"
+    }
+}
+
+/// One input the Add Fact sheet can show. Its only job is to be the key in
+/// FactKind.fields; the sheet reads that set and nothing else decides layout.
+enum FactField: Hashable {
+    case due, leadDays, rrule, tz, blocker, body
+}
+
+/// How a due date reads on a row. One helper because the sidebar and the pane
+/// must phrase the same instant the same way; two copies would drift the moment
+/// one of them rounded differently.
+enum DueText {
+    /// "today" / "in 12d" / "overdue 3d", nil when there is no date. Whole
+    /// LOCAL days, so a due date reads the way a calendar reads it rather than
+    /// flipping at an arbitrary hour.
+    static func relative(_ due: Date?, now: Date = Date()) -> String? {
+        guard let due else { return nil }
+        let calendar = Calendar.current
+        let days = calendar.dateComponents(
+            [.day],
+            from: calendar.startOfDay(for: now),
+            to: calendar.startOfDay(for: due)
+        ).day ?? 0
+        if days == 0 { return "today" }
+        if days > 0 { return "in \(days)d" }
+        return "overdue \(-days)d"
+    }
+}
+
 // Decoded from GET /v1/models ({name, id}); mirrors go/lib/modelSelector.
 struct ModelOption: Identifiable, Codable, Hashable {
     var name: String

@@ -12,8 +12,12 @@
 //   snapshot --automation <name>            # that automation's pane
 //   snapshot --automation <name> --disclose-run <status|index>
 //                                           # with that run's detail disclosed
+//   snapshot --project [--project-name <n>] # that project's pane
+//   snapshot --project --add-fact [--fact-kind deadline|recurring|milestone|note]
+//                                           # its Add Fact sheet, rendered flat
 //   snapshot --collapse <sections>          # sidebar sections rendered
-//                                           # collapsed: services,automations,bots
+//                                           # collapsed: services,automations,
+//                                           # projects,bots
 //
 // It talks to whatever BOTNET_API points at, so point it at the demo server
 // from dev/seed-demo.sh rather than the real ~/.botnet/net.db.
@@ -36,6 +40,9 @@ private enum Pane {
     /// One automation's pane, optionally with a run's detail disclosed — a
     /// state a click can't produce offscreen.
     case automation(Automation, discloseRunID: String?)
+    /// One project's pane, or its Add Fact sheet drawn flat on the given kind
+    /// (a presented sheet needs a real window, same as the event editor).
+    case project(Project, addFactKind: FactKind?)
 }
 
 @main
@@ -67,6 +74,9 @@ struct Snapshot {
         if let name = argument("--automation") {
             await store.loadAutomationDetail(name)
         }
+        // And for the sidebar's Projects section / the project pane: the pane
+        // loads its facts in a .task, which the capture window would race.
+        await store.refreshProjects()
 
         guard let bot = store.bots.first else {
             fail("no bots at \(ProcessInfo.processInfo.environment["BOTNET_API"] ?? "the default port") — is the demo server running?")
@@ -78,6 +88,9 @@ struct Snapshot {
         // here for the same capture-window reason as loadTools above.
         if case .automation(_, let runID?) = pane {
             await store.loadRunDetail(runID)
+        }
+        if case .project(let project, _) = pane {
+            await store.loadProject(project.id)
         }
 
         render(store: store, bot: bot, pane: pane, dark: dark, details: details,
@@ -92,7 +105,7 @@ struct Snapshot {
         var sections = Set<SidebarSection>()
         for part in raw.split(separator: ",") {
             guard let section = SidebarSection(rawValue: String(part)) else {
-                fail("unknown sidebar section \(part) (want a comma-joined subset of services,automations,bots)")
+                fail("unknown sidebar section \(part) (want a comma-joined subset of services,automations,projects,bots)")
             }
             sections.insert(section)
         }
@@ -121,6 +134,34 @@ struct Snapshot {
                 }
             }
             return .automation(automation, discloseRunID: runID)
+        }
+        // Loudly on no match, like --filter-calendar: a typo'd project name
+        // must not pass review as whatever projects.first happened to be.
+        if flags.contains("--project") {
+            let project: Project
+            if let name = argument("--project-name") {
+                guard let match = store.projects.first(where: {
+                    $0.name.caseInsensitiveCompare(name) == .orderedSame
+                }) else {
+                    fail("no project named \(name) on the server (has /v1/projects landed?)")
+                }
+                project = match
+            } else {
+                guard let first = store.projects.first else {
+                    fail("no projects on the server (has /v1/projects landed?)")
+                }
+                project = first
+            }
+            guard flags.contains("--add-fact") else { return .project(project, addFactKind: nil) }
+            // Loudly again: a typo'd kind would otherwise render the deadline
+            // form and pass review as whatever kind was asked for.
+            guard let raw = argument("--fact-kind") else {
+                return .project(project, addFactKind: .deadline)
+            }
+            guard let kind = FactKind(rawValue: raw) else {
+                fail("unknown fact kind \(raw) (want one of \(FactKind.allCases.map(\.rawValue).joined(separator: ",")))")
+            }
+            return .project(project, addFactKind: kind)
         }
         guard flags.contains("--event-sheet") else {
             guard flags.contains("--calendar") else { return .chat }
@@ -166,13 +207,14 @@ struct Snapshot {
             switch pane {
             case .chat: return .bot(bot.id)
             case .automation(let automation, _): return .automation(automation.name)
+            case .project(let project, _): return .project(project.id)
             default: return .service(.calendar)
             }
         }()
 
         let content = HStack(spacing: 0) {
             SidebarView(selection: .constant(selection), showNewBot: .constant(false),
-                        collapsedOverride: collapsed)
+                        showNewProject: .constant(false), collapsedOverride: collapsed)
                 .frame(width: Metric.sidebarWidth)
             Rectangle().fill(Palette.hairline).frame(width: 1)
             switch pane {
@@ -190,6 +232,18 @@ struct Snapshot {
                 CalendarView(mode: .constant(mode), initialFilter: filter, initialQuery: query)
             case .automation(let automation, let runID):
                 AutomationView(automation: automation, initialDisclosedRunID: runID)
+            case .project(let project, let addFactKind):
+                // The pane, or its sheet drawn flat at the sheet's own size —
+                // a presented sheet needs a real window, same as the event
+                // editor, and its toolbar (Cancel/Add) will not appear.
+                if let addFactKind {
+                    AddFactSheet(project: project, initialKind: addFactKind)
+                        .frame(width: 460, height: 400)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Palette.chrome)
+                } else {
+                    ProjectView(project: project)
+                }
             case .eventSheet(let target):
                 // Held at the sheet's own size on the pane's ground, so the
                 // capture reads like the presented sheet rather than a form
