@@ -32,11 +32,20 @@ struct ChatView: View {
         }
         .background(Palette.chrome)
         .task(id: bot.id) { await store.loadConversation(bot.id) }
-        // An in-progress rename must never carry one bot's draft to another.
-        .onChange(of: bot.id) {
+        // ChatView keeps its identity across bot switches, so neither an
+        // in-progress rename nor unsent composer text may carry over: the
+        // outgoing draft is parked in the store and the incoming bot's own
+        // draft takes its place.
+        .onChange(of: bot.id) { oldID, newID in
+            saveDraft(draft, for: oldID)
+            draft = store.composerDrafts[newID] ?? ""
             renaming = false
             renameDraft = ""
         }
+        .onAppear { draft = store.composerDrafts[bot.id] ?? "" }
+        // Navigating to another surface (Calendar, settings) destroys this
+        // view; the store outlives it and keeps the draft.
+        .onDisappear { saveDraft(draft, for: bot.id) }
     }
 
     private var header: some View {
@@ -221,7 +230,16 @@ struct ChatView: View {
     private func sendDraft() {
         let text = draft
         draft = ""
+        store.composerDrafts[bot.id] = nil
         Task { await store.send(text, to: bot) }
+    }
+
+    // Whitespace-only reads as "nothing typed" and removes the key; anything
+    // else is stored verbatim — trimming here would eat text the user is
+    // mid-way through composing.
+    private func saveDraft(_ text: String, for id: String) {
+        store.composerDrafts[id] =
+            text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
     }
 }
 
