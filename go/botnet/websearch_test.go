@@ -58,8 +58,8 @@ func TestWebSearchToolOfferedWithCorrectShape(t *testing.T) {
 	if err := json.Unmarshal(sc.requests[0], &payload); err != nil {
 		t.Fatalf("decode request: %v", err)
 	}
-	if len(payload.Tools) != 3 {
-		t.Fatalf("offered %d tools, want 3 (memory, calendar, web_search): %s", len(payload.Tools), sc.requests[0])
+	if len(payload.Tools) != 4 {
+		t.Fatalf("offered %d tools, want 4 (memory, calendar, project, web_search): %s", len(payload.Tools), sc.requests[0])
 	}
 
 	// The memory tool is a function tool.
@@ -222,8 +222,8 @@ func TestToolsEndpointIncludesWebSearch(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&tools); err != nil {
 		t.Fatalf("decode tools: %v", err)
 	}
-	if len(tools) != 3 {
-		t.Fatalf("/v1/tools served %d tools, want 3 (memory, calendar, web_search)", len(tools))
+	if len(tools) != 4 {
+		t.Fatalf("/v1/tools served %d tools, want 4 (memory, calendar, project, web_search)", len(tools))
 	}
 	searchDef := tools[len(tools)-1]
 	var last map[string]json.RawMessage

@@ -379,8 +379,8 @@ func TestClientWebSearchToolOffered(t *testing.T) {
 	if err := json.Unmarshal(sc.requests[0], &payload); err != nil {
 		t.Fatalf("decode request: %v", err)
 	}
-	if len(payload.Tools) != 3 {
-		t.Fatalf("offered %d tools, want 3 (memory, calendar, web_search)", len(payload.Tools))
+	if len(payload.Tools) != 4 {
+		t.Fatalf("offered %d tools, want 4 (memory, calendar, project, web_search)", len(payload.Tools))
 	}
 	var searchTool struct {
 		Type     string `json:"type"`
@@ -580,7 +580,8 @@ func TestToolResultTruncatedInAudit(t *testing.T) {
 func TestToolsEndpointReflectsConfiguredSearch(t *testing.T) {
 	// No backend configured: the fallback server tool.
 	h := newHarness(t, &fakeLLM{})
-	storeTools := memoryToolName + "," + calendarToolName // ungated; always offered
+	// Ungated; always offered, in registry order.
+	storeTools := strings.Join([]string{memoryToolName, calendarToolName, projectToolName}, ",")
 	if got := toolNamesFromEndpoint(t, h.ts.URL+"/v1/tools"); got != storeTools+","+webSearchToolName {
 		t.Errorf("no-backend /v1/tools = %q, want the OpenRouter server tool fallback", got)
 	}

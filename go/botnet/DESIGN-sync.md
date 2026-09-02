@@ -622,6 +622,12 @@ mutation.
 | `UpdateCalendar` | calendar | updated |
 | `DeleteCalendar` (REST cascade) | calendar + its events | destroyed: one tombstone per event (the explicit `DELETE FROM events WHERE calendar_id = ?` fires the row trigger per row), then the calendar's own |
 | migrate step 7 (calendar backfill) | events (+ calendar) | updated per backfilled event, after the ensured Personal's created — a reconnecting client refetches rows whose calendarId just appeared |
+| `CreateProject` | project | created (both writers: `POST /v1/projects` and the `project` tool) |
+| `UpdateProject` | project | updated. A RENAME also emits event updated per projected fact, since the events carry the project's name in their titles |
+| `DeleteProject` (REST cascade) | project + its facts + their projected events | destroyed: one tombstone per projected event, then one per fact (both explicit per-row `DELETE`s, so the row triggers fire per row), then the project's own |
+| `CreateFact` | fact | created. A dated, undone fact ALSO emits event created first (its calendar projection), and the first such fact ever ALSO emits calendar created for the ensured "Projects" calendar |
+| `UpdateFact` | fact | updated (a field-only patch still emits — row trigger). The projection rides the same transaction: event updated, or created when the fact became dated/undone, or destroyed when it was marked done |
+| `DeleteFact` | fact + its projected event | destroyed (event first, then the fact) |
 
 Note `AppendMessage` also updates `bots.last_message_at`/`last_message_text`, so it emits
 **two** change rows (message created, bot updated). Easy to miss; the sidebar depends on it.
@@ -634,6 +640,16 @@ argument. **Instances and fireable are derived reads** (`GET /v1/instances`,
 `GET /v1/fireable` → `Store.Instances`/`Store.Fireable`): they expand recurring events at
 read time, write nothing, and are deliberately outside the change feed — a client that wants
 fresh instances refetches its window after an `events` change row.
+
+**Projects (2026-09-02) added TWO entities and NO derived rows.** `projects` and `facts` are
+trigger-captured exactly as calendars and events are, and the `ChangedIDs` struct gained a
+`projects` and a `facts` bucket (plus their `bucket()` cases, `emptyChangedIDs` entries and
+`sortAll` slots — an entity missing from either of the last two marshals as `null` or leaks
+map order). **Project health, `nextDue` and `factCount` are derived reads** computed by
+`projectHealth` on every `GET`: they write nothing and are deliberately outside the feed, so
+a client wanting current health refetches the project the feed named. The calendar events a
+fact projects are ordinary `events` rows and reach clients through the existing `event`
+bucket — no new entity, no new trigger.
 
 The startup sweep **should** emit change rows — a client reconnecting after a restart needs
 to see those failures, and the state token will have moved regardless.

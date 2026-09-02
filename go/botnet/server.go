@@ -99,6 +99,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/events", s.createEvent)
 	mux.HandleFunc("PATCH /v1/events/{id}", s.patchEvent)
 	mux.HandleFunc("DELETE /v1/events/{id}", s.deleteEvent)
+	mux.HandleFunc("GET /v1/projects", s.listProjects)
+	mux.HandleFunc("POST /v1/projects", s.createProject)
+	mux.HandleFunc("GET /v1/projects/{id}", s.getProject)
+	mux.HandleFunc("PATCH /v1/projects/{id}", s.patchProject)
+	mux.HandleFunc("DELETE /v1/projects/{id}", s.deleteProject)
+	mux.HandleFunc("POST /v1/projects/{id}/facts", s.createFact)
+	mux.HandleFunc("PATCH /v1/projects/{id}/facts/{factId}", s.patchFact)
+	mux.HandleFunc("DELETE /v1/projects/{id}/facts/{factId}", s.deleteFact)
 	mux.HandleFunc("GET /v1/instances", s.listInstances)
 	mux.HandleFunc("GET /v1/fireable", s.listFireable)
 	mux.HandleFunc("GET /v1/changes", s.getChanges)
@@ -823,6 +831,229 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ── Projects ──────────────────────────────────────────────────────────────────
+// The projects REST face: the user's half of a service whose other half is the
+// bot's project tool. Both write the same tables, so a fact a bot recorded and
+// one the user typed are indistinguishable afterwards except by createdBy.
+//
+// None of these routes existed before, so an old server 404s every one of them
+// — which is exactly the signal the app uses to hide the section, the same way
+// it treats a missing automations bridge.
+//
+// There is no If-Match here and no version on the wire: project and fact edits
+// are last-write-wins by decision, not by omission (see Project in schema.go).
+
+// projectInput is the wire body for POST and PATCH /v1/projects. Pointers make
+// PATCH partial: absent leaves a field alone, and "" is a real value clearing a
+// goal.
+type projectInput struct {
+	Name *string `json:"name"`
+	Goal *string `json:"goal"`
+}
+
+// factInput is the wire body for the fact routes. Every field is a pointer for
+// the same reason, and `due` arrives as a STRING rather than a time.Time so a
+// malformed one answers `due "next tuesday" is not an RFC3339 time...` instead
+// of encoding/json's message about a Go type.
+type factInput struct {
+	Kind     *string `json:"kind"` // create only; a fact's kind is not patchable
+	Title    *string `json:"title"`
+	Due      *string `json:"due"`
+	LeadDays *int    `json:"leadDays"`
+	RRule    *string `json:"rrule"`
+	TZ       *string `json:"tz"`
+	Done     *bool   `json:"done"`
+	Blocker  *string `json:"blocker"`
+	Body     *string `json:"body"`
+}
+
+// listProjects returns every project, most urgent first, with the sync token
+// the other collection GETs carry. Health, nextDue and factCount are derived
+// per project on this read — the sidebar draws itself from this one call.
+func (s *Server) listProjects(w http.ResponseWriter, _ *http.Request) {
+	s.stateHeader(w)
+	projects, err := s.store.ListProjects()
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	if projects == nil {
+		projects = []Project{}
+	}
+	writeJSON(w, http.StatusOK, projects)
+}
+
+// createProject adds a project from the UI. createdBy is the "user" sentinel,
+// never taken from the body.
+func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
+	var in projectInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if in.Name == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("name is required"))
+		return
+	}
+	goal := ""
+	if in.Goal != nil {
+		goal = *in.Goal
+	}
+	p, err := s.store.CreateProject(*in.Name, goal, userAuthor)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, p)
+}
+
+// getProject returns one project WITH its facts, in the pane's urgency-first
+// order — one call renders the whole detail view, so the client never has to
+// re-sort or re-derive anything the server already decided.
+func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
+	p, facts, err := s.store.GetProject(ProjectID(r.PathValue("id")))
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	if facts == nil {
+		facts = []Fact{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"project": p, "facts": facts})
+}
+
+func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
+	var in projectInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	p, err := s.store.UpdateProject(ProjectID(r.PathValue("id")), ProjectPatch{Name: in.Name, Goal: in.Goal})
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+// deleteProject removes the project, its facts and their projected events —
+// real tombstones for all of them reach the change feed. The UI has already
+// confirmed the cascade, exactly as it does for a calendar.
+func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteProject(ProjectID(r.PathValue("id"))); err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// createFact records one fact on a project. The kind's own rules (which fields
+// it requires, which it must never carry) live in the store, so this path
+// enforces exactly what the tool path does; ErrInvalid maps to 400.
+func (s *Server) createFact(w http.ResponseWriter, r *http.Request) {
+	var in factInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if in.Kind == nil || in.Title == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("kind and title are required"))
+		return
+	}
+	f := Fact{Kind: FactKind(*in.Kind), Title: *in.Title}
+	if in.Due != nil && *in.Due != "" {
+		due, err := eventTime("due", *in.Due)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		f.Due = due
+	}
+	for _, field := range []struct {
+		from *string
+		into *string
+	}{{in.RRule, &f.RRule}, {in.TZ, &f.TZ}, {in.Blocker, &f.Blocker}, {in.Body, &f.Body}} {
+		if field.from != nil {
+			*field.into = *field.from
+		}
+	}
+	if in.LeadDays != nil {
+		f.LeadDays = *in.LeadDays
+	}
+	if in.Done != nil {
+		f.Done = *in.Done
+	}
+	stored, err := s.store.CreateFact(ProjectID(r.PathValue("id")), f, userAuthor)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, stored)
+}
+
+// patchFact changes any subset of a fact's authored fields. The fact must
+// belong to the project in the path: a fact addressed through another project
+// is that project's 404, not someone else's row to edit.
+func (s *Server) patchFact(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.factOfProject(w, r); err != nil {
+		return
+	}
+	var in factInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if in.Kind != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf(
+			"a fact's kind is not patchable — delete it and add one of the kind you want"))
+		return
+	}
+	p := FactPatch{Title: in.Title, LeadDays: in.LeadDays, RRule: in.RRule, TZ: in.TZ,
+		Done: in.Done, Blocker: in.Blocker, Body: in.Body}
+	if in.Due != nil {
+		due, err := eventTime("due", *in.Due)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		p.Due = &due
+	}
+	f, err := s.store.UpdateFact(FactID(r.PathValue("factId")), p)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, f)
+}
+
+func (s *Server) deleteFact(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.factOfProject(w, r); err != nil {
+		return
+	}
+	if err := s.store.DeleteFact(FactID(r.PathValue("factId"))); err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// factOfProject resolves {factId} and checks it belongs to {id}, writing the
+// 404 itself so both fact routes share one ownership rule. A non-nil error
+// means the response has already been written.
+func (s *Server) factOfProject(w http.ResponseWriter, r *http.Request) (Fact, error) {
+	f, err := s.store.GetFact(FactID(r.PathValue("factId")))
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return Fact{}, err
+	}
+	if f.ProjectID != ProjectID(r.PathValue("id")) {
+		err := fmt.Errorf("%w: fact %s does not belong to project %s", ErrNotFound, f.ID, r.PathValue("id"))
+		writeErr(w, http.StatusNotFound, err)
+		return Fact{}, err
+	}
+	return f, nil
+}
+
 // sendMessage persists the user's turn and returns 202 immediately, WITHOUT
 // waiting on the model. That wait is the whole reason this is async: a live
 // model call takes seconds, and while the request blocked, the user's own
@@ -1019,7 +1250,7 @@ func writeStatus(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, ErrUnknownModel), errors.Is(err, ErrInvalid):
 		return http.StatusBadRequest
-	case errors.Is(err, ErrBusy), errors.Is(err, ErrIDConflict):
+	case errors.Is(err, ErrBusy), errors.Is(err, ErrIDConflict), errors.Is(err, ErrDuplicateName):
 		return http.StatusConflict
 	case errors.Is(err, ErrVersionMismatch):
 		return http.StatusPreconditionFailed

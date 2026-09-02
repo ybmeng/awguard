@@ -253,6 +253,68 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 		{"calendar", string(earnings.ID), "destroyed"},
 	}, "DeleteCalendar")
 
+	// The projects service. Health is derived and never stored, so nothing here
+	// emits on a read — only the two authored entities do. An undated fact is
+	// used deliberately: a dated one also writes its projected event, which
+	// TestProjectedFactEmitsItsChangeRows covers.
+	mark = topSeq(t, s)
+	project, err := s.CreateProject("Passports", "keep every passport valid", string(bot.ID))
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark),
+		[]changeRow{{"project", string(project.ID), "created"}}, "CreateProject")
+
+	mark = topSeq(t, s)
+	goal := "renew before every trip"
+	if _, err := s.UpdateProject(project.ID, ProjectPatch{Goal: &goal}); err != nil {
+		t.Fatalf("update project: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark),
+		[]changeRow{{"project", string(project.ID), "updated"}}, "UpdateProject")
+
+	mark = topSeq(t, s)
+	milestone, err := s.CreateFact(project.ID,
+		Fact{Kind: FactMilestone, Title: "book the appointment"}, string(bot.ID))
+	if err != nil {
+		t.Fatalf("create fact: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark),
+		[]changeRow{{"fact", string(milestone.ID), "created"}}, "CreateFact")
+
+	// A field-only UPDATE still fires the row trigger, the same property the
+	// memory and event writes above rely on.
+	mark = topSeq(t, s)
+	blocker := "waiting on the consulate"
+	if _, err := s.UpdateFact(milestone.ID, FactPatch{Blocker: &blocker}); err != nil {
+		t.Fatalf("update fact: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark),
+		[]changeRow{{"fact", string(milestone.ID), "updated"}}, "UpdateFact")
+
+	mark = topSeq(t, s)
+	if err := s.DeleteFact(milestone.ID); err != nil {
+		t.Fatalf("delete fact: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark),
+		[]changeRow{{"fact", string(milestone.ID), "destroyed"}}, "DeleteFact")
+
+	// DeleteProject CASCADES to its facts, as an explicit per-row DELETE, so a
+	// sync client is never left holding facts of a project it saw die.
+	orphan, err := s.CreateFact(project.ID,
+		Fact{Kind: FactNote, Title: "agent", Body: "corpsec@example.com"}, string(bot.ID))
+	if err != nil {
+		t.Fatalf("create fact for the cascade: %v", err)
+	}
+	mark = topSeq(t, s)
+	if err := s.DeleteProject(project.ID); err != nil {
+		t.Fatalf("delete project: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark), []changeRow{
+		{"fact", string(orphan.ID), "destroyed"},
+		{"project", string(project.ID), "destroyed"},
+	}, "DeleteProject")
+
 	// DeleteBot tombstones everything the bot owned: both messages, both
 	// segments, then the bot itself.
 	mark = topSeq(t, s)

@@ -195,6 +195,43 @@ CREATE TABLE IF NOT EXISTS calendars (
     updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_calendars_name ON calendars(name COLLATE NOCASE);
+-- The projects service: what work is ABOUT, as against the automations that say
+-- how it happens. A project is a name, a goal and its facts; its health is
+-- DERIVED from the facts on every read and deliberately has no column here —
+-- see the Project DECISIONs in schema.go. Name uniqueness is case-insensitive
+-- and the index enforces it, exactly as calendars do.
+CREATE TABLE IF NOT EXISTS projects (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    goal       TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(name COLLATE NOCASE);
+-- Facts are the project's only AUTHORED state. due is fixed-width RFC3339 UTC
+-- to the second like every other date the store range-compares, and '' when the
+-- kind carries no date, so "undated" is distinguishable from the year 1.
+-- event_id points at the projected calendar event, '' when the fact needs none.
+CREATE TABLE IF NOT EXISTS facts (
+    id         TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    kind       TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    due        TEXT NOT NULL DEFAULT '',
+    lead_days  INTEGER NOT NULL DEFAULT 0,
+    rrule      TEXT NOT NULL DEFAULT '',
+    tz         TEXT NOT NULL DEFAULT '',
+    done       INTEGER NOT NULL DEFAULT 0,
+    blocker    TEXT NOT NULL DEFAULT '',
+    body       TEXT NOT NULL DEFAULT '',
+    event_id   TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+-- Facts are always read a whole project at a time.
+CREATE INDEX IF NOT EXISTS idx_facts_project ON facts(project_id);
 -- Bookkeeping for one-shot migration steps; see once().
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -208,7 +245,7 @@ CREATE TABLE IF NOT EXISTS meta (
 -- cursor silently resolve to the wrong place instead of failing.
 CREATE TABLE IF NOT EXISTS change_log (
     seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity    TEXT NOT NULL, -- 'bot' | 'message' | 'segment' | 'event' | 'calendar'
+    entity    TEXT NOT NULL, -- 'bot' | 'message' | 'segment' | 'event' | 'calendar' | 'project' | 'fact'
     entity_id TEXT NOT NULL,
     op        TEXT NOT NULL  -- 'created' | 'updated' | 'destroyed'
 );
@@ -256,6 +293,24 @@ CREATE TRIGGER IF NOT EXISTS chg_calendar_updated AFTER UPDATE ON calendars BEGI
 END;
 CREATE TRIGGER IF NOT EXISTS chg_calendar_destroyed AFTER DELETE ON calendars BEGIN
     INSERT INTO change_log (entity, entity_id, op) VALUES ('calendar', OLD.id, 'destroyed');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_project_created AFTER INSERT ON projects BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('project', NEW.id, 'created');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_project_updated AFTER UPDATE ON projects BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('project', NEW.id, 'updated');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_project_destroyed AFTER DELETE ON projects BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('project', OLD.id, 'destroyed');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_fact_created AFTER INSERT ON facts BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('fact', NEW.id, 'created');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_fact_updated AFTER UPDATE ON facts BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('fact', NEW.id, 'updated');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_fact_destroyed AFTER DELETE ON facts BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('fact', OLD.id, 'destroyed');
 END;
 `
 	if _, err := s.db.Exec(schema); err != nil {
@@ -516,6 +571,12 @@ var ErrUnknownModel = errors.New("botnet: unknown model id")
 // ErrInvalid is returned when a write is rejected on its own merits rather than
 // for a missing row — an empty display name, say. The server maps it to 400.
 var ErrInvalid = errors.New("botnet: invalid")
+
+// ErrDuplicateName is returned when a write would take a name another row
+// already holds case-insensitively. It is deliberately NOT an ErrInvalid: the
+// value is well-formed and the caller fixes it by choosing another name, which
+// is a 409 rather than a 400 about a malformed field.
+var ErrDuplicateName = errors.New("botnet: that name is already taken")
 
 // ErrBusy is returned when a bot already has a reply in flight. At most one
 // awaiting turn per bot is a storage invariant rather than a convention, so a
@@ -1353,14 +1414,22 @@ func (s *Store) EnsurePersonalCalendar() (Calendar, error) {
 }
 
 func ensurePersonalCalendar(q dbtx) (Calendar, error) {
-	cal, err := calendarByName(q, personalCalendarName)
+	return ensureCalendar(q, personalCalendarName, "blue")
+}
+
+// ensureCalendar is the name-keyed ensure both defaults share: look the name up
+// case-insensitively, create it (non-executable, authored by "user") if it is
+// missing. Inside the caller's transaction, so two ensures cannot both insert.
+// An empty color is assigned by cycling, like any other unnamed create.
+func ensureCalendar(q dbtx, name, color string) (Calendar, error) {
+	cal, err := calendarByName(q, name)
 	if err == nil {
 		return cal, nil
 	}
 	if !errors.Is(err, ErrNotFound) {
 		return Calendar{}, err
 	}
-	return createCalendar(q, personalCalendarName, "blue", userAuthor, false)
+	return createCalendar(q, name, color, userAuthor, false)
 }
 
 // CalendarPatch is the set of fields an update may change; a nil field is left
@@ -1613,13 +1682,7 @@ func (s *Store) CreateEvent(e Event, createdBy string) (Event, error) {
 		if err := requireExecutable(q, e); err != nil {
 			return err
 		}
-		if _, err := q.Exec(
-			`INSERT INTO events (`+eventColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			e.ID, e.CalendarID, e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
-			e.CreatedBy, fmtEventTime(e.CreatedAt), fmtEventTime(e.UpdatedAt), e.RRule, e.TZ, e.Automation); err != nil {
-			return fmt.Errorf("create event: %w", err)
-		}
-		return nil
+		return insertEventRow(q, e)
 	})
 	if err != nil {
 		return Event{}, err
@@ -1691,13 +1754,7 @@ func (s *Store) UpdateEvent(id EventID, p EventPatch) (Event, error) {
 			return err
 		}
 		e.UpdatedAt = time.Now().UTC().Truncate(time.Second)
-		if _, err := q.Exec(
-			`UPDATE events SET calendar_id = ?, title = ?, starts_at = ?, ends_at = ?, location = ?, notes = ?, rrule = ?, tz = ?, automation = ?, updated_at = ? WHERE id = ?`,
-			e.CalendarID, e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
-			e.RRule, e.TZ, e.Automation, fmtEventTime(e.UpdatedAt), id); err != nil {
-			return fmt.Errorf("update event: %w", err)
-		}
-		return nil
+		return updateEventRow(q, e)
 	})
 	if err != nil {
 		return Event{}, err
@@ -1714,6 +1771,32 @@ func (s *Store) DeleteEvent(id EventID) error {
 	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// insertEventRow and updateEventRow are the two event-row writes, extracted so
+// the REST/tool path (CreateEvent, UpdateEvent) and the fact projection write
+// the SAME columns — a projected event that skipped a column would be a second,
+// subtly different kind of event.
+
+func insertEventRow(q dbtx, e Event) error {
+	if _, err := q.Exec(
+		`INSERT INTO events (`+eventColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, e.CalendarID, e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
+		e.CreatedBy, fmtEventTime(e.CreatedAt), fmtEventTime(e.UpdatedAt), e.RRule, e.TZ, e.Automation); err != nil {
+		return fmt.Errorf("create event: %w", err)
+	}
+	return nil
+}
+
+func updateEventRow(q dbtx, e Event) error {
+	if _, err := q.Exec(
+		`UPDATE events SET calendar_id = ?, title = ?, starts_at = ?, ends_at = ?, location = ?,
+		        notes = ?, rrule = ?, tz = ?, automation = ?, updated_at = ? WHERE id = ?`,
+		e.CalendarID, e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
+		e.RRule, e.TZ, e.Automation, fmtEventTime(e.UpdatedAt), e.ID); err != nil {
+		return fmt.Errorf("update event: %w", err)
 	}
 	return nil
 }

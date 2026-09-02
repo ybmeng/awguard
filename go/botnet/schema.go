@@ -8,6 +8,7 @@
 package botnet
 
 import (
+	"encoding/json"
 	"time"
 
 	modelselector "stdtools/go/lib/modelSelector"
@@ -20,6 +21,8 @@ type BotID string      // "bot_" + ULID
 type SegmentID string  // "seg_" + ULID
 type EventID string    // "evt_" + ULID
 type CalendarID string // "cal_" + ULID
+type ProjectID string  // "prj_" + ULID
+type FactID string     // "fct_" + ULID
 
 // ── Bot ──────────────────────────────────────────────────────────────────────
 // Minimal v0: a bot is a system prompt pointed at a model. That's enough to
@@ -455,6 +458,146 @@ type Fireable struct {
 	EventID     EventID   `json:"eventId"`
 	WindowStart time.Time `json:"windowStart"`
 	WindowEnd   time.Time `json:"windowEnd"`
+}
+
+// ── Project ───────────────────────────────────────────────────────────────────
+// The second SERVICE, and the counterpart to an automation: an automation is
+// HOW work happens, a Project is what work is ABOUT — a goal plus typed, dated
+// facts. A passport's expiry, a China visa's, a Shanghai company formation's
+// milestones (some blocked on a human), a Singapore entity's recurring
+// obligations: each is one project whose facts say what is true and when it
+// comes due.
+//
+// DECISION (state lives here, not in a directory): projects sit in the botnet
+// database beside bots and events, so a bot writes them through a tool, the
+// single-writer lock and the change feed cover them for free, and passport
+// numbers never land in a git-tracked file.
+//
+// DECISION (health is DERIVED, never stored): Health, NextDue and FactCount are
+// computed from the facts on every read — the same call already made for
+// Bot.Version and Bot.ModelValid, and the same shape automation freshness has.
+// Storing them would need a job to keep them true and would give the project a
+// second opinion about its own facts; deriving means a project cannot be stale
+// the moment the clock passes a deadline. They are consequently NOT in the
+// change feed: the fact write that moved health is what the feed announced, and
+// a client wanting current health refetches the project.
+//
+// DECISION (one precedence function): overdue > blocked > due_soon > ok >
+// unknown, encoded in projectHealth() and nowhere else. A handler deciding
+// health for itself is exactly how the sidebar row and the detail pane start
+// disagreeing about the same project.
+//
+// DECISION (no If-Match): projects and facts are last-write-wins, the call
+// already made for Event, Calendar and Bot.Memory. There is no derived Version
+// field, so there is nothing for a client to send.
+type Project struct {
+	ID   ProjectID `json:"id"`
+	Name string    `json:"name"` // trimmed, non-empty, <= 64 chars, unique case-insensitively
+	Goal string    `json:"goal"` // free text, may be empty
+
+	// CreatedBy follows Event.CreatedBy exactly: a BotID for a tool write, the
+	// "user" sentinel for a REST one, stamped by the write path.
+	CreatedBy string    `json:"createdBy"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+
+	// Derived at read time from the project's facts — never stored, never
+	// synced. NextDue is the nearest OUTSTANDING due instant across the undone
+	// deadline and recurring facts (a passed deadline is still outstanding, and
+	// is what the "overdue 3d" line renders from); nil when nothing is dated.
+	Health    ProjectHealth `json:"health"`
+	NextDue   *time.Time    `json:"nextDue,omitempty"`
+	FactCount int           `json:"factCount"`
+}
+
+// ProjectHealth is the derived one-word answer to "does this project need me".
+// The precedence is strict and lives in projectHealth().
+type ProjectHealth string
+
+const (
+	HealthOverdue ProjectHealth = "overdue"  // an undone deadline whose Due has arrived or passed
+	HealthBlocked ProjectHealth = "blocked"  // an undone milestone with a Blocker: it needs the human
+	HealthDueSoon ProjectHealth = "due_soon" // a dated fact inside its lead window
+	HealthOK      ProjectHealth = "ok"       // facts exist, none of the above
+	HealthUnknown ProjectHealth = "unknown"  // zero facts: nothing to be well or ill about
+)
+
+// FactKind is the closed set of shapes a fact takes. Which fields each kind
+// requires and which it may never carry is the factRules table in store.go —
+// one table, so a fifth kind is one entry rather than a new run of ifs.
+type FactKind string
+
+const (
+	FactDeadline  FactKind = "deadline"  // one dated obligation, tickable
+	FactRecurring FactKind = "recurring" // a dated obligation that repeats (RRULE + TZ)
+	FactMilestone FactKind = "milestone" // a step, tickable, optionally blocked on a human
+	FactNote      FactKind = "note"      // undated context
+)
+
+// Fact is one typed, dated thing that is true about a project. Facts are the
+// only authored state: everything the UI shows about a project's condition is
+// derived from them.
+//
+// DECISION (an undone dated fact is projected onto the calendar): every undone
+// deadline or recurring fact has exactly one Event on the calendar named
+// "Projects", maintained in the SAME transaction as the fact write (see
+// projectFact in store.go). That is what puts a passport expiry in the month
+// grid without a second scheduler, and it is why EventID exists here — the
+// pointer back to the projection, "" when the fact needs none. Marking a fact
+// done, or deleting it, deletes its event; the projection converges, so writing
+// the same fact twice yields one event, never two.
+//
+// DECISION (Due is the FIRST occurrence for a recurring fact): the same shape
+// Event uses, expanded by the same rrule.go expander — so "annual return, every
+// March" needs no second date field and no stored occurrence list, and health
+// reads the NEXT occurrence rather than the stored one.
+type Fact struct {
+	ID        FactID    `json:"id"`
+	ProjectID ProjectID `json:"projectId"`
+	Kind      FactKind  `json:"kind"`
+	Title     string    `json:"title"` // trimmed, non-empty, <= 120 chars
+
+	// Due is the instant for a deadline and the FIRST occurrence for a
+	// recurring fact; zero for a milestone or a note, and then omitted from the
+	// wire entirely (see MarshalJSON) so a client decodes "no date" as absent
+	// rather than as the year 1.
+	Due time.Time `json:"due,omitempty"`
+
+	// LeadDays is how many days before Due the fact counts as due_soon. It
+	// defaults to 30 on a dated create when omitted, and must be >= 0; the
+	// undated kinds keep 0, having no window to open.
+	LeadDays int `json:"leadDays"`
+
+	RRule   string `json:"rrule,omitempty"`   // recurring only, and REQUIRED there; parseRRULE's subset
+	TZ      string `json:"tz,omitempty"`      // recurring only, and REQUIRED with RRule
+	Done    bool   `json:"done"`              // deadline + milestone only; a done fact affects neither health nor nextDue
+	Blocker string `json:"blocker,omitempty"` // milestone only; non-empty means it is waiting on a human
+	Body    string `json:"body,omitempty"`    // the note's text, or details for any other kind
+
+	// EventID is the projected calendar event, "" when the fact needs none.
+	// It is the write path's to maintain, never the caller's.
+	EventID EventID `json:"eventId,omitempty"`
+
+	CreatedBy string    `json:"createdBy"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// MarshalJSON omits a zero Due entirely. encoding/json's omitempty does not
+// apply to a struct, so the tag above cannot do it alone, and a milestone
+// serialized with "due":"0001-01-01T00:00:00Z" would make every client invent a
+// sentinel check. The shadow type sheds this method and keeps every other tag.
+func (f Fact) MarshalJSON() ([]byte, error) {
+	type fact Fact
+	var due *time.Time
+	if !f.Due.IsZero() {
+		d := f.Due
+		due = &d
+	}
+	return json.Marshal(struct {
+		fact
+		Due *time.Time `json:"due,omitempty"`
+	}{fact(f), due})
 }
 
 // ── PrivateBotNet ─────────────────────────────────────────────────────────────

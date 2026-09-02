@@ -1,0 +1,969 @@
+package botnet
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+)
+
+// The projects service, split out of store.go: what work is ABOUT, as against
+// the automations that say how it happens. Everything a project IS lives here —
+// the derived health, the per-kind rules, the two entities' storage, and the
+// calendar projection — while the `projects`/`facts` tables and their change-log
+// triggers stay in store.go's migrate, beside every other table's.
+
+// ── Projects and facts ────────────────────────────────────────────────────────
+// The projects service. A project is a name, a goal and its facts; everything
+// the UI shows about its condition — health, the next due date, the fact count
+// — is DERIVED here on read and has no column (see the Project DECISIONs in
+// schema.go). Every write is an ordinary INSERT/UPDATE/DELETE, so the
+// chg_project_*/chg_fact_* triggers capture it with no Go code remembering to.
+
+// defaultLeadDays is the due_soon window a dated fact gets when its creator
+// named none. Thirty days is long enough to act on a passport renewal and
+// short enough that a project is not permanently amber.
+const defaultLeadDays = 30
+
+// day is the unit lead windows and recurrence lookaheads are expressed in.
+const day = 24 * time.Hour
+
+// projectedEventDuration is how long a projected fact occupies the calendar. A
+// deadline is an instant, not an appointment, so the hour is purely so the
+// month grid has something to draw and the expander has a non-empty interval.
+const projectedEventDuration = time.Hour
+
+// Due times store like every other date the store range-compares: fixed-width
+// RFC3339 UTC to the second (the Event DECISION). The zero time stores as '' so
+// "this kind carries no date" is distinguishable from a fact dated at the year
+// 1 — fmtEventTime alone would write a real-looking 0001-01-01 instant.
+
+func fmtDueTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return fmtEventTime(t)
+}
+
+func parseDueTime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	return parseEventTime(s)
+}
+
+// ── Derived health ────────────────────────────────────────────────────────────
+
+// healthRank encodes the precedence overdue > blocked > due_soon > ok >
+// unknown. It is a table rather than an ordered switch so "which is worse" is
+// one comparison wherever it is asked.
+var healthRank = map[ProjectHealth]int{
+	HealthUnknown: 0,
+	HealthOK:      1,
+	HealthDueSoon: 2,
+	HealthBlocked: 3,
+	HealthOverdue: 4,
+}
+
+// factSignals is the per-kind health table: what ONE undone fact contributes —
+// a health level, and the instant it is next due (zero for the undated kinds).
+// This is the only place a kind's meaning lives, so a fifth kind is one entry
+// and no read path grows a branch.
+//
+// DECISION (the deadline boundary is half-open at both ends): due_soon covers
+// [Due-lead, Due) and overdue covers [Due, ∞), matching the half-open
+// convention Fireable already uses. A strict "Due < now" would leave the
+// instant of the deadline itself in neither band, so a passport reported fine
+// on the exact day it expired.
+//
+// DECISION (a recurring fact is never overdue): its health comes from the NEXT
+// occurrence, which by construction has not happened — a Singapore annual
+// return filed every March is not overdue in April, it is due next March. An
+// exhausted series (COUNT/UNTIL spent) contributes nothing at all.
+var factSignals = map[FactKind]func(f Fact, now time.Time) (ProjectHealth, time.Time){
+	FactDeadline: func(f Fact, now time.Time) (ProjectHealth, time.Time) {
+		switch {
+		case !f.Due.After(now):
+			return HealthOverdue, f.Due
+		case !f.Due.AddDate(0, 0, -f.LeadDays).After(now):
+			return HealthDueSoon, f.Due
+		}
+		return HealthOK, f.Due
+	},
+	FactRecurring: func(f Fact, now time.Time) (ProjectHealth, time.Time) {
+		next, ok := nextOccurrence(f, now)
+		if !ok {
+			return HealthOK, time.Time{}
+		}
+		if !next.AddDate(0, 0, -f.LeadDays).After(now) {
+			return HealthDueSoon, next
+		}
+		return HealthOK, next
+	},
+	FactMilestone: func(f Fact, _ time.Time) (ProjectHealth, time.Time) {
+		if f.Blocker != "" {
+			return HealthBlocked, time.Time{}
+		}
+		return HealthOK, time.Time{}
+	},
+	FactNote: func(Fact, time.Time) (ProjectHealth, time.Time) { return HealthOK, time.Time{} },
+}
+
+// projectHealth derives a project's condition and its nearest outstanding due
+// instant from its facts. It is THE precedence function — handlers call it and
+// never re-decide — and it is a pure read: nothing here writes or caches.
+//
+// A done fact is invisible to both answers. Zero facts is unknown rather than
+// ok, because a project with nothing in it is not healthy, it is unstated.
+func projectHealth(facts []Fact, now time.Time) (ProjectHealth, *time.Time) {
+	if len(facts) == 0 {
+		return HealthUnknown, nil
+	}
+	worst := HealthOK
+	var next time.Time
+	for _, f := range facts {
+		if f.Done {
+			continue
+		}
+		signal, ok := factSignals[f.Kind]
+		if !ok {
+			continue // a kind this version does not know: skip, never fail
+		}
+		health, due := signal(f, now)
+		if healthRank[health] > healthRank[worst] {
+			worst = health
+		}
+		if !due.IsZero() && (next.IsZero() || due.Before(next)) {
+			next = due
+		}
+	}
+	if next.IsZero() {
+		return worst, nil
+	}
+	return worst, &next
+}
+
+// recurringLookaheads are the windows nextOccurrence tries in order. Expansion
+// costs O(window), so the common monthly answer is found in the first, short
+// one; the long tails exist for a yearly rule with an INTERVAL.
+var recurringLookaheads = []time.Duration{45 * day, 400 * day, 1500 * day, 4000 * day}
+
+// nextOccurrence is the first occurrence of a recurring fact at or after now,
+// found with the SAME expander the calendar uses — one recurrence engine, so a
+// fact and its projected event can never disagree about when the next filing
+// is. It reports false when the series is exhausted.
+//
+// An unparseable rule also reports false rather than erroring: validateFact
+// keeps those out of the store, so reaching it means the row is already
+// inconsistent, and a health read is not the place to fail a whole listing.
+func nextOccurrence(f Fact, now time.Time) (time.Time, bool) {
+	ev := Event{StartsAt: f.Due, EndsAt: f.Due.Add(projectedEventDuration), RRule: f.RRule, TZ: f.TZ}
+	for _, ahead := range recurringLookaheads {
+		instances, err := expandEvent(ev, now, now.Add(ahead))
+		if err != nil {
+			return time.Time{}, false
+		}
+		for _, in := range instances {
+			// expandEvent's window keeps an occurrence already running; the
+			// NEXT one is the first that has not started. It comes back
+			// anchored in the fact's own zone — UTC here, so nextDue
+			// serializes as "…Z" like every other instant on the wire.
+			if !in.StartsAt.Before(now) {
+				return in.StartsAt.UTC(), true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+// ── Validation ────────────────────────────────────────────────────────────────
+
+// factRules is the per-kind table of which optional fields a kind REQUIRES and
+// which it merely ALLOWS. Anything set but not allowed is rejected, so an
+// illegal state — a note with a recurrence, a recurring obligation someone can
+// tick off once and forget — is never stored, and never silently coerced.
+// `conflicts` is the third kind of rule: two fields that are each legal alone
+// but contradict each other together. "waiting on the lawyer" and "finished"
+// are two claims about the same step, and storing both would render a project
+// that says one thing in the health dot and the opposite in the row.
+var factRules = map[FactKind]struct {
+	required, allowed []string
+	conflicts         [][2]string
+}{
+	FactDeadline:  {required: []string{"due"}, allowed: []string{"due", "done"}},
+	FactRecurring: {required: []string{"due", "rrule", "tz"}, allowed: []string{"due", "rrule", "tz"}},
+	FactMilestone: {allowed: []string{"done", "blocker"}, conflicts: [][2]string{{"blocker", "done"}}},
+	FactNote:      {},
+}
+
+// factOptionalFields names the fields factRules governs, each with its "was it
+// supplied" test — what lets the rules above be two lists of names rather than
+// a per-kind branch. title, body and leadDays are common to every kind and are
+// checked separately.
+var factOptionalFields = []struct {
+	name string
+	set  func(Fact) bool
+}{
+	{"due", func(f Fact) bool { return !f.Due.IsZero() }},
+	{"rrule", func(f Fact) bool { return f.RRule != "" }},
+	{"tz", func(f Fact) bool { return f.TZ != "" }},
+	{"done", func(f Fact) bool { return f.Done }},
+	{"blocker", func(f Fact) bool { return f.Blocker != "" }},
+}
+
+// factKinds lists the kinds in a stable order, for the enum and the errors.
+func factKinds() []string {
+	return []string{string(FactDeadline), string(FactRecurring), string(FactMilestone), string(FactNote)}
+}
+
+// validateFact is the ONE place a fact's rules live, so the REST handler and
+// the bot's project tool cannot end up enforcing different ones. It runs on the
+// fact as it would be STORED, so a patch is checked against the merged result
+// rather than against the fields it happened to carry.
+func validateFact(f Fact) error {
+	rule, ok := factRules[f.Kind]
+	if !ok {
+		return fmt.Errorf("%w: kind %q is not one of %s", ErrInvalid, f.Kind, strings.Join(factKinds(), ", "))
+	}
+	if strings.TrimSpace(f.Title) == "" {
+		return fmt.Errorf("%w: title must not be empty", ErrInvalid)
+	}
+	if len([]rune(f.Title)) > 120 {
+		return fmt.Errorf("%w: title must be at most 120 characters", ErrInvalid)
+	}
+	if f.LeadDays < 0 {
+		return fmt.Errorf("%w: leadDays must be 0 or more, not %d", ErrInvalid, f.LeadDays)
+	}
+	set := map[string]bool{}
+	for _, field := range factOptionalFields {
+		set[field.name] = field.set(f)
+		if set[field.name] && !slices.Contains(rule.allowed, field.name) {
+			return fmt.Errorf("%w: %s is not allowed on a %s fact", ErrInvalid, field.name, f.Kind)
+		}
+	}
+	for _, need := range rule.required {
+		if !set[need] {
+			return fmt.Errorf("%w: a %s fact requires a %s", ErrInvalid, f.Kind, need)
+		}
+	}
+	for _, pair := range rule.conflicts {
+		if set[pair[0]] && set[pair[1]] {
+			return fmt.Errorf("%w: a %s fact cannot have both %s and %s — a step waiting on someone is not "+
+				"finished; clear the blocker first", ErrInvalid, f.Kind, pair[0], pair[1])
+		}
+	}
+	if f.RRule != "" {
+		if _, err := parseRRULE(f.RRule); err != nil {
+			return fmt.Errorf("%w: rrule: %v", ErrInvalid, err)
+		}
+	}
+	if f.TZ != "" {
+		if _, err := time.LoadLocation(f.TZ); err != nil {
+			return fmt.Errorf("%w: unknown tz %q (want an IANA id like \"Asia/Singapore\")", ErrInvalid, f.TZ)
+		}
+	}
+	return nil
+}
+
+// validateProject holds a project's own two rules, for the same reason.
+func validateProject(p Project) error {
+	if p.Name == "" {
+		return fmt.Errorf("%w: name must not be empty", ErrInvalid)
+	}
+	if len([]rune(p.Name)) > 64 {
+		return fmt.Errorf("%w: name must be at most 64 characters", ErrInvalid)
+	}
+	return nil
+}
+
+// ── Projects ──────────────────────────────────────────────────────────────────
+
+const projectColumns = `id, name, goal, created_by, created_at, updated_at`
+
+func scanProject(sc interface{ Scan(...any) error }) (Project, error) {
+	var p Project
+	var createdAt, updatedAt string
+	if err := sc.Scan(&p.ID, &p.Name, &p.Goal, &p.CreatedBy, &createdAt, &updatedAt); err != nil {
+		return Project{}, err
+	}
+	var err error
+	if p.CreatedAt, err = parseEventTime(createdAt); err != nil {
+		return Project{}, fmt.Errorf("parse created_at: %w", err)
+	}
+	if p.UpdatedAt, err = parseEventTime(updatedAt); err != nil {
+		return Project{}, fmt.Errorf("parse updated_at: %w", err)
+	}
+	p.Health = HealthUnknown
+	return p, nil
+}
+
+// hydrate fills the derived fields from the project's facts. Every read path
+// goes through it, so a project can never be served with a health nobody
+// computed.
+func hydrate(p *Project, facts []Fact, now time.Time) {
+	p.FactCount = len(facts)
+	p.Health, p.NextDue = projectHealth(facts, now)
+}
+
+// CreateProject stores one project and returns it as stored. The id, the author
+// and both timestamps are stamped here, exactly as CreateEvent stamps an
+// event's; createdBy is a BotID for a tool write and "user" for a REST one.
+func (s *Store) CreateProject(name, goal, createdBy string) (Project, error) {
+	var p Project
+	err := s.tx(func(q dbtx) error {
+		var err error
+		p, err = createProject(q, name, goal, createdBy)
+		return err
+	})
+	if err != nil {
+		return Project{}, err
+	}
+	return p, nil
+}
+
+// createProject is the one insert path. The dup-name check and the insert share
+// the caller's transaction so they cannot interleave; the NOCASE unique index
+// is the structural backstop, and the check exists so a collision reports
+// ErrDuplicateName rather than a raw constraint violation.
+func createProject(q dbtx, name, goal, createdBy string) (Project, error) {
+	now := time.Now().UTC().Truncate(time.Second)
+	p := Project{
+		ID:        ProjectID(newID("prj_")),
+		Name:      strings.TrimSpace(name),
+		Goal:      goal,
+		CreatedBy: createdBy,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Health:    HealthUnknown,
+	}
+	if err := validateProject(p); err != nil {
+		return Project{}, err
+	}
+	if existing, err := projectByName(q, p.Name); err == nil {
+		return Project{}, fmt.Errorf("%w: a project named %q already exists", ErrDuplicateName, existing.Name)
+	} else if !errors.Is(err, ErrNotFound) {
+		return Project{}, err
+	}
+	if _, err := q.Exec(`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Name, p.Goal, p.CreatedBy, fmtEventTime(p.CreatedAt), fmtEventTime(p.UpdatedAt)); err != nil {
+		return Project{}, fmt.Errorf("create project: %w", err)
+	}
+	return p, nil
+}
+
+// GetProject loads one project with its facts, both hydrated: the project's
+// health derived from exactly the facts returned beside it, and the facts in
+// the pane's urgency-first order.
+func (s *Store) GetProject(id ProjectID) (Project, []Fact, error) {
+	p, err := getProject(s.db, id)
+	if err != nil {
+		return Project{}, nil, err
+	}
+	facts, err := s.ListFacts(id)
+	if err != nil {
+		return Project{}, nil, err
+	}
+	hydrate(&p, facts, time.Now().UTC())
+	return p, facts, nil
+}
+
+func getProject(q dbtx, id ProjectID) (Project, error) {
+	p, err := scanProject(q.QueryRow(`SELECT `+projectColumns+` FROM projects WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Project{}, ErrNotFound
+	}
+	if err != nil {
+		return Project{}, fmt.Errorf("get project: %w", err)
+	}
+	return p, nil
+}
+
+// ProjectByName finds a project case-insensitively — how the project tool
+// resolves the name a model typed, since bots address projects by name and
+// never by id.
+func (s *Store) ProjectByName(name string) (Project, error) {
+	p, err := projectByName(s.db, name)
+	if err != nil {
+		return Project{}, err
+	}
+	facts, err := s.ListFacts(p.ID)
+	if err != nil {
+		return Project{}, err
+	}
+	hydrate(&p, facts, time.Now().UTC())
+	return p, nil
+}
+
+func projectByName(q dbtx, name string) (Project, error) {
+	p, err := scanProject(q.QueryRow(
+		`SELECT `+projectColumns+` FROM projects WHERE name = ? COLLATE NOCASE`, strings.TrimSpace(name)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Project{}, ErrNotFound
+	}
+	if err != nil {
+		return Project{}, fmt.Errorf("project by name: %w", err)
+	}
+	return p, nil
+}
+
+// ListProjects returns every project, hydrated, most urgent first: health
+// precedence, then the nearest due date, then the name. The order IS the
+// answer to "what should I look at" — the sidebar renders it as given.
+//
+// Facts are read once for the whole list rather than per project, so a net with
+// many projects costs two queries.
+func (s *Store) ListProjects() ([]Project, error) {
+	projects, err := s.queryProjects(`SELECT ` + projectColumns + ` FROM projects`)
+	if err != nil {
+		return nil, err
+	}
+	facts, err := queryFacts(s.db, `ORDER BY rowid`)
+	if err != nil {
+		return nil, err
+	}
+	byProject := map[ProjectID][]Fact{}
+	for _, f := range facts {
+		byProject[f.ProjectID] = append(byProject[f.ProjectID], f)
+	}
+	now := time.Now().UTC()
+	for i := range projects {
+		hydrate(&projects[i], byProject[projects[i].ID], now)
+	}
+	sort.SliceStable(projects, func(i, j int) bool {
+		a, b := projects[i], projects[j]
+		if healthRank[a.Health] != healthRank[b.Health] {
+			return healthRank[a.Health] > healthRank[b.Health]
+		}
+		switch {
+		case a.NextDue != nil && b.NextDue != nil:
+			if !a.NextDue.Equal(*b.NextDue) {
+				return a.NextDue.Before(*b.NextDue)
+			}
+		case a.NextDue != nil:
+			return true // something dated outranks nothing dated
+		case b.NextDue != nil:
+			return false
+		}
+		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+	})
+	return projects, nil
+}
+
+func (s *Store) queryProjects(query string, args ...any) ([]Project, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list projects: %w", err)
+	}
+	defer rows.Close()
+	var out []Project
+	for rows.Next() {
+		p, err := scanProject(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan project: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ProjectPatch is the set of fields an update may change; a nil field is left
+// alone. No version to condition on — projects are last-write-wins, the same
+// DECISION calendars and events carry.
+type ProjectPatch struct {
+	Name *string `json:"name"`
+	Goal *string `json:"goal"`
+}
+
+// UpdateProject applies a partial patch and returns the project as stored,
+// hydrated. The read, the dup-name check, the write and the projected events'
+// retitling share one transaction: last-write-wins is about which value
+// survives, not about letting a concurrent patch clobber a field it never
+// named, and a rename must not leave the calendar showing the old project name.
+func (s *Store) UpdateProject(id ProjectID, p ProjectPatch) (Project, error) {
+	var out Project
+	err := s.tx(func(q dbtx) error {
+		var err error
+		if out, err = getProject(q, id); err != nil {
+			return err
+		}
+		renamed := false
+		if p.Name != nil && strings.TrimSpace(*p.Name) != out.Name {
+			out.Name = strings.TrimSpace(*p.Name)
+			renamed = true
+		}
+		if p.Goal != nil {
+			out.Goal = *p.Goal
+		}
+		if err := validateProject(out); err != nil {
+			return err
+		}
+		if existing, err := projectByName(q, out.Name); err == nil && existing.ID != id {
+			return fmt.Errorf("%w: a project named %q already exists", ErrDuplicateName, existing.Name)
+		} else if err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		out.UpdatedAt = time.Now().UTC().Truncate(time.Second)
+		if _, err := q.Exec(`UPDATE projects SET name = ?, goal = ?, updated_at = ? WHERE id = ?`,
+			out.Name, out.Goal, fmtEventTime(out.UpdatedAt), id); err != nil {
+			return fmt.Errorf("update project: %w", err)
+		}
+		if renamed {
+			return retitleProjectedEvents(q, out)
+		}
+		return nil
+	})
+	if err != nil {
+		return Project{}, err
+	}
+	facts, err := s.ListFacts(id)
+	if err != nil {
+		return Project{}, err
+	}
+	hydrate(&out, facts, time.Now().UTC())
+	return out, nil
+}
+
+// DeleteProject removes a project, its facts AND the calendar events its facts
+// were projected onto, in one transaction. Each is an explicit DELETE on its
+// own table, and SQLite row triggers fire once per deleted row, so a sync
+// client gets a real tombstone for every fact and every event alongside the
+// project's own — exactly as DeleteCalendar cascades to its events.
+func (s *Store) DeleteProject(id ProjectID) error {
+	return s.tx(func(q dbtx) error {
+		if _, err := getProject(q, id); err != nil {
+			return err
+		}
+		if _, err := q.Exec(
+			`DELETE FROM events WHERE id IN (SELECT event_id FROM facts WHERE project_id = ? AND event_id != '')`,
+			id); err != nil {
+			return fmt.Errorf("delete projected events: %w", err)
+		}
+		if _, err := q.Exec(`DELETE FROM facts WHERE project_id = ?`, id); err != nil {
+			return fmt.Errorf("delete project facts: %w", err)
+		}
+		if _, err := q.Exec(`DELETE FROM projects WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("delete project: %w", err)
+		}
+		return nil
+	})
+}
+
+// ── Facts ─────────────────────────────────────────────────────────────────────
+
+const factColumns = `id, project_id, kind, title, due, lead_days, rrule, tz, done, blocker, body, event_id, created_by, created_at, updated_at`
+
+func scanFact(sc interface{ Scan(...any) error }) (Fact, error) {
+	var f Fact
+	var due, createdAt, updatedAt string
+	var done int
+	if err := sc.Scan(&f.ID, &f.ProjectID, &f.Kind, &f.Title, &due, &f.LeadDays, &f.RRule, &f.TZ,
+		&done, &f.Blocker, &f.Body, &f.EventID, &f.CreatedBy, &createdAt, &updatedAt); err != nil {
+		return Fact{}, err
+	}
+	f.Done = done != 0
+	var err error
+	if f.Due, err = parseDueTime(due); err != nil {
+		return Fact{}, fmt.Errorf("parse due: %w", err)
+	}
+	if f.CreatedAt, err = parseEventTime(createdAt); err != nil {
+		return Fact{}, fmt.Errorf("parse created_at: %w", err)
+	}
+	if f.UpdatedAt, err = parseEventTime(updatedAt); err != nil {
+		return Fact{}, fmt.Errorf("parse updated_at: %w", err)
+	}
+	return f, nil
+}
+
+// CreateFact stores one fact on a project and returns it as stored. The id, the
+// author and both timestamps are stamped here; a dated kind created with no
+// lead takes the 30-day default (a caller wanting no lead window patches it to
+// zero afterwards, which is the one way to say "exactly on the day"). The
+// project lookup, the projection and the insert share a transaction, so the
+// project cannot be deleted out from under the fact between them.
+func (s *Store) CreateFact(projectID ProjectID, f Fact, createdBy string) (Fact, error) {
+	now := time.Now().UTC().Truncate(time.Second)
+	f.ID = FactID(newID("fct_"))
+	f.ProjectID = projectID
+	f.CreatedBy = createdBy
+	f.CreatedAt, f.UpdatedAt = now, now
+	f.Title = strings.TrimSpace(f.Title)
+	f.Due = f.Due.UTC().Truncate(time.Second)
+	if f.LeadDays == 0 && !f.Due.IsZero() {
+		f.LeadDays = defaultLeadDays
+	}
+	if err := validateFact(f); err != nil {
+		return Fact{}, err
+	}
+	err := s.tx(func(q dbtx) error {
+		p, err := getProject(q, projectID)
+		if err != nil {
+			return err
+		}
+		if err := requireUniqueTitle(q, projectID, "", f.Title); err != nil {
+			return err
+		}
+		if f, err = projectFact(q, p, f); err != nil {
+			return err
+		}
+		return insertFact(q, f)
+	})
+	if err != nil {
+		return Fact{}, err
+	}
+	return f, nil
+}
+
+func insertFact(q dbtx, f Fact) error {
+	if _, err := q.Exec(
+		`INSERT INTO facts (`+factColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.ID, f.ProjectID, f.Kind, f.Title, fmtDueTime(f.Due), f.LeadDays, f.RRule, f.TZ,
+		boolInt(f.Done), f.Blocker, f.Body, f.EventID, f.CreatedBy,
+		fmtEventTime(f.CreatedAt), fmtEventTime(f.UpdatedAt)); err != nil {
+		return fmt.Errorf("create fact: %w", err)
+	}
+	return nil
+}
+
+// FactPatch is the set of fields an update may change; a nil field is left
+// alone. Kind is deliberately absent: a fact's kind is what its other fields
+// mean, so changing it would reinterpret every one of them at once — delete and
+// re-add instead.
+type FactPatch struct {
+	Title    *string    `json:"title"`
+	Due      *time.Time `json:"due"`
+	LeadDays *int       `json:"leadDays"`
+	RRule    *string    `json:"rrule"`
+	TZ       *string    `json:"tz"`
+	Done     *bool      `json:"done"`
+	Blocker  *string    `json:"blocker"` // "" clears: the milestone is no longer waiting on anyone
+	Body     *string    `json:"body"`
+}
+
+// UpdateFact applies a partial patch and returns the fact as stored. The read,
+// the validation, the projection and the write share a transaction, so a
+// concurrent patch cannot be merged into a stale copy and the fact's calendar
+// event can never be left describing the previous version of it.
+func (s *Store) UpdateFact(id FactID, p FactPatch) (Fact, error) {
+	var f Fact
+	err := s.tx(func(q dbtx) error {
+		var err error
+		if f, err = getFact(q, id); err != nil {
+			return err
+		}
+		if p.Title != nil {
+			f.Title = strings.TrimSpace(*p.Title)
+		}
+		if p.Due != nil {
+			f.Due = p.Due.UTC().Truncate(time.Second)
+		}
+		if p.LeadDays != nil {
+			f.LeadDays = *p.LeadDays
+		}
+		if p.RRule != nil {
+			f.RRule = *p.RRule
+		}
+		if p.TZ != nil {
+			f.TZ = *p.TZ
+		}
+		if p.Done != nil {
+			f.Done = *p.Done
+		}
+		if p.Blocker != nil {
+			f.Blocker = *p.Blocker
+		}
+		if p.Body != nil {
+			f.Body = *p.Body
+		}
+		if err := validateFact(f); err != nil {
+			return err
+		}
+		if err := requireUniqueTitle(q, f.ProjectID, f.ID, f.Title); err != nil {
+			return err
+		}
+		project, err := getProject(q, f.ProjectID)
+		if err != nil {
+			return err
+		}
+		if f, err = projectFact(q, project, f); err != nil {
+			return err
+		}
+		f.UpdatedAt = time.Now().UTC().Truncate(time.Second)
+		if _, err := q.Exec(
+			`UPDATE facts SET title = ?, due = ?, lead_days = ?, rrule = ?, tz = ?, done = ?,
+			        blocker = ?, body = ?, event_id = ?, updated_at = ? WHERE id = ?`,
+			f.Title, fmtDueTime(f.Due), f.LeadDays, f.RRule, f.TZ, boolInt(f.Done),
+			f.Blocker, f.Body, f.EventID, fmtEventTime(f.UpdatedAt), id); err != nil {
+			return fmt.Errorf("update fact: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return Fact{}, err
+	}
+	return f, nil
+}
+
+// DeleteFact removes one fact and the calendar event it was projected onto, or
+// reports ErrNotFound if there was none. The tombstones a sync client learns
+// them by come from the triggers, not from here.
+func (s *Store) DeleteFact(id FactID) error {
+	return s.tx(func(q dbtx) error {
+		f, err := getFact(q, id)
+		if err != nil {
+			return err
+		}
+		if f.EventID != "" {
+			if _, err := q.Exec(`DELETE FROM events WHERE id = ?`, f.EventID); err != nil {
+				return fmt.Errorf("delete projected event: %w", err)
+			}
+		}
+		if _, err := q.Exec(`DELETE FROM facts WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("delete fact: %w", err)
+		}
+		return nil
+	})
+}
+
+// GetFact loads one fact by id.
+func (s *Store) GetFact(id FactID) (Fact, error) { return getFact(s.db, id) }
+
+// factByTitle finds a project's fact by title, case-insensitively — the way the
+// project tool addresses one, and therefore the uniqueness the guard below
+// enforces.
+func factByTitle(q dbtx, projectID ProjectID, title string) (Fact, error) {
+	f, err := scanFact(q.QueryRow(
+		`SELECT `+factColumns+` FROM facts WHERE project_id = ? AND title = ? COLLATE NOCASE ORDER BY rowid`,
+		projectID, strings.TrimSpace(title)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Fact{}, ErrNotFound
+	}
+	if err != nil {
+		return Fact{}, fmt.Errorf("fact by title: %w", err)
+	}
+	return f, nil
+}
+
+// requireUniqueTitle refuses a title another fact of the same project already
+// holds, on both create and rename. A bot addresses a fact BY TITLE, so a twin
+// makes BOTH copies unaddressable by the very tool that wrote them — this is
+// what keeps a model's "add" from silently becoming a second copy of the fact it
+// should have updated. Pass the fact's own id on a rename, so renaming a fact to
+// its own title is not a collision with itself.
+//
+// DECISION (a Go check, not a unique index): a database written before this
+// guard can already hold a pair, and `CREATE UNIQUE INDEX` over it would fail
+// and leave the whole database unopenable. A Go check refuses new twins while
+// old ones stay readable and repairable — and the tool's ambiguity error is what
+// keeps a legacy pair from being silently edited at random.
+func requireUniqueTitle(q dbtx, projectID ProjectID, self FactID, title string) error {
+	existing, err := factByTitle(q, projectID, title)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if existing.ID == self {
+		return nil
+	}
+	return fmt.Errorf("%w: a fact titled %q already exists in this project", ErrDuplicateName, existing.Title)
+}
+
+func getFact(q dbtx, id FactID) (Fact, error) {
+	f, err := scanFact(q.QueryRow(`SELECT `+factColumns+` FROM facts WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Fact{}, ErrNotFound
+	}
+	if err != nil {
+		return Fact{}, fmt.Errorf("get fact: %w", err)
+	}
+	return f, nil
+}
+
+// ListFacts returns a project's facts URGENCY-FIRST, which is the order the
+// detail pane renders top to bottom: undone dated facts by when they are next
+// due, then the milestones waiting on a human, then the rest of the open
+// milestones, then notes, then everything already done.
+//
+// The SQL orders by rowid DESCENDING and the sort below is stable, so every
+// undated band comes out newest-first for free — created_at is second-truncated
+// and would tie for facts written in the same second, and two ULIDs minted in
+// the same millisecond do not order by insertion either.
+func (s *Store) ListFacts(projectID ProjectID) ([]Fact, error) {
+	facts, err := queryFacts(s.db, `WHERE project_id = ? ORDER BY rowid DESC`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	dues := make(map[FactID]time.Time, len(facts))
+	for _, f := range facts {
+		if signal, ok := factSignals[f.Kind]; ok {
+			_, due := signal(f, now)
+			dues[f.ID] = due
+		}
+	}
+	sort.SliceStable(facts, func(i, j int) bool {
+		a, b := facts[i], facts[j]
+		if factBand(a) != factBand(b) {
+			return factBand(a) < factBand(b)
+		}
+		if factBand(a) == bandDated && !dues[a.ID].Equal(dues[b.ID]) {
+			return dues[a.ID].Before(dues[b.ID])
+		}
+		return false
+	})
+	return facts, nil
+}
+
+// The urgency bands ListFacts sorts into. They are the pane's reading order.
+const (
+	bandDated     = iota // undone deadline or recurring: the dated work
+	bandBlocked          // undone milestone waiting on a human
+	bandMilestone        // the rest of the open milestones
+	bandNote             // undated context
+	bandDone             // finished, kept for the record
+)
+
+func factBand(f Fact) int {
+	switch {
+	case f.Done:
+		return bandDone
+	case f.Kind == FactDeadline || f.Kind == FactRecurring:
+		return bandDated
+	case f.Kind == FactMilestone && f.Blocker != "":
+		return bandBlocked
+	case f.Kind == FactMilestone:
+		return bandMilestone
+	}
+	return bandNote
+}
+
+// queryFacts is the one fact read, taking a dbtx so the projection walks can
+// run inside the transaction that is rewriting them.
+func queryFacts(q dbtx, where string, args ...any) ([]Fact, error) {
+	rows, err := q.Query(`SELECT `+factColumns+` FROM facts `+where, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list facts: %w", err)
+	}
+	defer rows.Close()
+	var out []Fact
+	for rows.Next() {
+		f, err := scanFact(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan fact: %w", err)
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// ── Calendar projection ───────────────────────────────────────────────────────
+// Every UNDONE deadline or recurring fact has exactly one Event on the calendar
+// named "Projects", so a passport expiry appears in the month grid the user
+// already reads without a second scheduler and without a sync job.
+//
+// DECISION (maintained in the fact's own transaction, by ONE function): every
+// write path calls projectFact and nothing else touches the projection. That is
+// what makes it converge — writing the same fact twice yields one event, a fact
+// marked done loses its event, and a dangling pointer (the user deleted the
+// event in the Calendar panel, which is legal: it is an ordinary event row)
+// repairs itself on the next write.
+//
+// DECISION (the projection OWNS the row): the event's calendar, title, times,
+// notes and rule are rewritten from the fact on every write, so moving a
+// projected event in the UI does not stick. The fact is the truth; the event is
+// its shadow. Deleting the event is the one edit that survives, because it is
+// indistinguishable from the row never having existed — and the next fact write
+// simply projects a fresh one.
+
+// projectsCalendarName is the name the projection's ensure keys on — a name,
+// not a flag, exactly as the Personal default is (see Calendar in schema.go).
+const projectsCalendarName = "Projects"
+
+func ensureProjectsCalendar(q dbtx) (Calendar, error) {
+	return ensureCalendar(q, projectsCalendarName, "")
+}
+
+// factNeedsEvent reports whether a fact belongs on the calendar at all: an
+// undone, dated obligation does; a milestone, a note and anything already done
+// do not.
+func factNeedsEvent(f Fact) bool {
+	return !f.Done && (f.Kind == FactDeadline || f.Kind == FactRecurring)
+}
+
+// projectedTitle is what the calendar shows: the project name carries the
+// context "renew" alone would not.
+func projectedTitle(p Project, f Fact) string { return p.Name + ": " + f.Title }
+
+// projectFact brings the fact's calendar event into line with the fact and
+// returns the fact with its EventID as it now stands. It is called from every
+// fact write path INSIDE that write's transaction, and it is the only place the
+// projection is decided.
+func projectFact(q dbtx, p Project, f Fact) (Fact, error) {
+	now := time.Now().UTC().Truncate(time.Second)
+	if !factNeedsEvent(f) {
+		if f.EventID != "" {
+			if _, err := q.Exec(`DELETE FROM events WHERE id = ?`, f.EventID); err != nil {
+				return Fact{}, fmt.Errorf("delete projected event: %w", err)
+			}
+			f.EventID = ""
+		}
+		return f, nil
+	}
+	// The ensure runs only here — on a WRITE that needs the calendar — so a net
+	// of milestones and notes never grows one, and a read never creates state.
+	cal, err := ensureProjectsCalendar(q)
+	if err != nil {
+		return Fact{}, err
+	}
+	ev := Event{
+		CalendarID: cal.ID,
+		Title:      projectedTitle(p, f),
+		StartsAt:   f.Due,
+		EndsAt:     f.Due.Add(projectedEventDuration),
+		Notes:      f.Body,
+		RRule:      f.RRule,
+		TZ:         f.TZ,
+		CreatedBy:  f.CreatedBy,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if f.EventID != "" {
+		existing, err := getEvent(q, f.EventID)
+		if err == nil {
+			ev.ID, ev.CreatedAt = existing.ID, existing.CreatedAt
+			return f, updateEventRow(q, ev)
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return Fact{}, err
+		}
+		// The pointer dangles: the event was deleted out from under the fact.
+		// Project a fresh one rather than failing a write over it.
+	}
+	ev.ID = EventID(newID("evt_"))
+	f.EventID = ev.ID
+	return f, insertEventRow(q, ev)
+}
+
+// retitleProjectedEvents rewrites the titles of a renamed project's projected
+// events, in the transaction that renamed it — the events carry the project's
+// name, so skipping this would leave the calendar naming a project that no
+// longer exists. A fact whose event has since been deleted simply matches no
+// row; the next fact write repairs it.
+func retitleProjectedEvents(q dbtx, p Project) error {
+	facts, err := queryFacts(q, `WHERE project_id = ? AND event_id != '' ORDER BY rowid`, p.ID)
+	if err != nil {
+		return err
+	}
+	now := fmtEventTime(time.Now().UTC().Truncate(time.Second))
+	for _, f := range facts {
+		if _, err := q.Exec(`UPDATE events SET title = ?, updated_at = ? WHERE id = ?`,
+			projectedTitle(p, f), now, f.EventID); err != nil {
+			return fmt.Errorf("retitle projected event: %w", err)
+		}
+	}
+	return nil
+}

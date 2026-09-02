@@ -147,17 +147,21 @@ func TestToolLoopReadReplaceAnswer(t *testing.T) {
 
 	// Request 0 advertised the memory FUNCTION tool — flat schema with the strict
 	// command enum and a description spelling out the commands — alongside the
-	// calendar function tool (pinned in calendar_test.go) and the web_search
-	// SERVER tool (its own shape is pinned in websearch_test.go).
+	// calendar and project function tools (pinned in calendar_test.go and
+	// projects_test.go) and the web_search SERVER tool (its own shape is pinned
+	// in websearch_test.go).
 	first := sc.request(t, 0)
-	if len(first.Tools) != 3 || first.Tools[0].Function.Name != "memory" {
-		t.Fatalf("tools advertised = %+v, want memory, calendar, web_search", first.Tools)
+	if len(first.Tools) != 4 || first.Tools[0].Function.Name != "memory" {
+		t.Fatalf("tools advertised = %+v, want memory, calendar, project, web_search", first.Tools)
 	}
 	if first.Tools[1].Function.Name != calendarToolName {
 		t.Errorf("second tool = %q, want %q", first.Tools[1].Function.Name, calendarToolName)
 	}
-	if first.Tools[2].Type != webSearchToolName {
-		t.Errorf("third tool type = %q, want %q", first.Tools[2].Type, webSearchToolName)
+	if first.Tools[2].Function.Name != projectToolName {
+		t.Errorf("third tool = %q, want %q", first.Tools[2].Function.Name, projectToolName)
+	}
+	if first.Tools[3].Type != webSearchToolName {
+		t.Errorf("fourth tool type = %q, want %q", first.Tools[3].Type, webSearchToolName)
 	}
 	fn := first.Tools[0].Function
 	props, _ := fn.Parameters["properties"].(map[string]any)
@@ -297,7 +301,7 @@ func TestMemoryToolValidation(t *testing.T) {
 
 	cases := []struct{ name, tool, args, want string }{
 		{"unknown tool", "launch_missiles", `{}`,
-			"error: unknown tool 'launch_missiles' — valid: memory, calendar, web_search"},
+			"error: unknown tool 'launch_missiles' — valid: memory, calendar, project, web_search"},
 		{"bad json", "memory", `not json`,
 			`error: arguments must be a JSON object like {"command": "read"}`},
 		{"missing command", "memory", `{}`,

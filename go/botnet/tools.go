@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -751,6 +753,680 @@ func renderCalendar(now, from, to time.Time, instances []Instance, names map[Cal
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// ── project ───────────────────────────────────────────────────────────────────
+// The bot's half of the projects service, in the same command-registry shape
+// the memory and calendar tools use. projectCommands is THE registry — the
+// enum, the advertised description and the dispatch all derive from it.
+//
+// DECISION (bots address projects and facts by NAME): there is no id anywhere
+// in this surface. A model that has to carry a prj_ id between turns loses it;
+// a project name is what the user said out loud, and a fact is resolved by its
+// title within its project. The cost is the ambiguity error below, which is
+// cheap and instructive.
+//
+// DECISION (no delete commands): deletion is UI-only, behind a confirmation —
+// the delete_calendar precedent. A cheap model must not be able to drop a
+// project's whole history, or tick a fact off by removing it.
+
+// projectToolName is the tool the model calls to read and write projects.
+const projectToolName = "project"
+
+// projectLadder is the decision procedure a bot follows to file something, and
+// it is the SOURCE OF TRUTH for how this tool is used — PROJECTS.md quotes it,
+// never the other way round.
+//
+// DECISION (encode the usage pattern, do not hope for it): bots operate
+// projects, not the user, and a mid-tier model asked to "record this" defaults
+// to a note, which is the one kind that changes nothing. A numbered ladder in
+// the description costs a few hundred tokens per turn and removes the whole
+// class of judgment calls; the guards below then make the four known misuses
+// instructive errors rather than silent drift, so the ladder is enforced and
+// not merely advertised.
+const projectLadder = `How to record something — take the FIRST rule that fits:
+1. A date in the future you must act by → kind=deadline with "due" and "lead_days" (passport renewals 180, visa renewals 90, company filings 60; anything else 30).
+2. An obligation that repeats → kind=recurring with "due" (the FIRST occurrence), "rrule" and "tz".
+3. A step someone must complete → kind=milestone. If a HUMAN must act, set "blocker" to exactly what they must do, and clear it ("blocker": "") once they have. A blocked step cannot also be done.
+4. Only "what happened" or "what I learned" → kind=note. A note NEVER changes health, so if you are about to write a date into one, it is a deadline: go back to 1.
+5. Before "create" or "add_fact", run "show" on the project. Update the existing fact with update_fact rather than adding a twin — a duplicate title is refused.
+6. When a deadline is renewed (a new passport arrives), set "due" to the new date. Mark it done ONLY when the obligation itself no longer exists.
+7. Never mark anything done without evidence, and record that evidence as a note in the same turn.`
+
+// noteTitleLimit caps the title the "note" shorthand derives from the body: a
+// note is a paragraph, and its title is just the handle the list shows.
+const noteTitleLimit = 60
+
+// projectArgs is the flat argument object every command shares — flat strings
+// for the same reason calendarArgs is, including the booleans and the day
+// count, since a type mix is exactly what mid-tier models fumble. The fields
+// are POINTERS so an absent one and an explicitly empty one are different
+// answers: clearing a blocker is "blocker": "", which must not read the same as
+// leaving it alone.
+type projectArgs struct {
+	Command  string  `json:"command"`
+	Project  *string `json:"project"`
+	Goal     *string `json:"goal"`
+	Kind     *string `json:"kind"`
+	Title    *string `json:"title"`
+	NewTitle *string `json:"new_title"`
+	Due      *string `json:"due"`
+	LeadDays *string `json:"lead_days"`
+	RRule    *string `json:"rrule"`
+	TZ       *string `json:"tz"`
+	Done     *string `json:"done"`
+	Blocker  *string `json:"blocker"`
+	Body     *string `json:"body"`
+}
+
+// ptr resolves one flat field by its wire name — the single switch the two
+// accessors below share, so `requires` can be a list of names.
+func (a projectArgs) ptr(name string) *string {
+	switch name {
+	case "project":
+		return a.Project
+	case "goal":
+		return a.Goal
+	case "kind":
+		return a.Kind
+	case "title":
+		return a.Title
+	case "new_title":
+		return a.NewTitle
+	case "due":
+		return a.Due
+	case "lead_days":
+		return a.LeadDays
+	case "rrule":
+		return a.RRule
+	case "tz":
+		return a.TZ
+	case "done":
+		return a.Done
+	case "blocker":
+		return a.Blocker
+	case "body":
+		return a.Body
+	}
+	return nil
+}
+
+// field reports a field supplied with a NON-EMPTY value — what a requirement
+// check means.
+func (a projectArgs) field(name string) (string, bool) {
+	p := a.ptr(name)
+	if p == nil || *p == "" {
+		return "", false
+	}
+	return *p, true
+}
+
+// given reports a field the model SUPPLIED, empty or not — what a patch means,
+// so "blocker": "" clears the blocker instead of reading as absent.
+func (a projectArgs) given(name string) (string, bool) {
+	p := a.ptr(name)
+	if p == nil {
+		return "", false
+	}
+	return *p, true
+}
+
+// projectCommand declares one command of the project tool.
+type projectCommand struct {
+	name     string
+	requires []string // flat fields that must be present and non-empty
+	doc      string   // the description line advertised to the model
+	run      func(s *Store, botID BotID, a projectArgs) (string, error)
+}
+
+// projectCommands is the registry — the single place a command is declared.
+var projectCommands = []projectCommand{
+	{
+		name: "list",
+		doc: `"list": shows every project with its derived health (` +
+			`overdue, blocked, due_soon, ok, unknown), when it is next due and how many facts it holds.`,
+		run: runProjectList,
+	},
+	{
+		name:     "show",
+		requires: []string{"project"},
+		doc: `"show": lists one project's facts, most urgent first. Requires "project" ` +
+			`(its name, case-insensitive).`,
+		run: runProjectShow,
+	},
+	{
+		name:     "create",
+		requires: []string{"project"},
+		doc:      `"create": starts a project. Requires "project" (its name); optional "goal".`,
+		run:      runProjectCreate,
+	},
+	{
+		name:     "add_fact",
+		requires: []string{"project", "kind", "title"},
+		doc: `"add_fact": records something true about a project. Requires "project", "title" and ` +
+			`"kind", one of: "deadline" (one dated obligation — requires "due"), "recurring" (a dated ` +
+			`obligation that repeats — requires "due" for the FIRST occurrence plus "rrule" and "tz"), ` +
+			`"milestone" (a step, optionally "blocker" naming what human action it waits on), "note" ` +
+			`(undated context in "body"). Optional "lead_days" is how many days before the due date it ` +
+			`counts as due soon (default 30), and "body" holds details for any kind.`,
+		run: runProjectAddFact,
+	},
+	{
+		name:     "update_fact",
+		requires: []string{"project", "title"},
+		doc: `"update_fact": changes a fact. Requires "project" and "title" (the fact's current ` +
+			`title, case-insensitive) plus any of "new_title", "due", "lead_days", "done" ("true" or ` +
+			`"false"), "blocker" (empty clears it), "body" — omitted fields are left alone.`,
+		run: runProjectUpdateFact,
+	},
+	{
+		name:     "note",
+		requires: []string{"project", "body"},
+		doc: `"note": shorthand for adding a note fact. Requires "project" and "body"; the title is ` +
+			`taken from the start of the body.`,
+		run: runProjectNote,
+	},
+}
+
+// projectCommandNames lists the enum, in registry order.
+func projectCommandNames() []string {
+	names := make([]string, len(projectCommands))
+	for i, c := range projectCommands {
+		names[i] = c.name
+	}
+	return names
+}
+
+// projectToolDef renders the registry as the wire tool definition, the same way
+// memoryToolDef and calendarToolDef do: prose per command, one strict enum,
+// flat strings.
+func projectToolDef() wireTool {
+	lines := []string{
+		"Read and write the shared projects: what work is ABOUT, as against the calendar's " +
+			"appointments. A project is a goal plus typed, dated FACTS (a passport expiry, a company " +
+			"formation's milestones, a recurring annual filing), and its health is derived from those " +
+			"facts — you never set it. You, the user and the other bots all see the same projects. " +
+			"Dates are RFC3339 (e.g. 2027-03-14T00:00:00Z).",
+		projectLadder,
+		"Commands:",
+	}
+	for _, c := range projectCommands {
+		lines = append(lines, "- "+c.doc)
+	}
+	str := func(desc string) map[string]any {
+		return map[string]any{"type": "string", "description": desc}
+	}
+	return wireTool{Type: "function", Function: wireToolFunction{
+		Name:        projectToolName,
+		Description: strings.Join(lines, "\n"),
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{
+					"type":        "string",
+					"enum":        projectCommandNames(),
+					"description": "The operation to perform.",
+				},
+				"project":   str(`A project, by name (case-insensitive). Required by every command but "list".`),
+				"goal":      str(`What the project is for, one line. Optional, for "create".`),
+				"kind":      str(`The kind of fact: ` + strings.Join(factKinds(), ", ") + `. Required for "add_fact".`),
+				"title":     str(`The fact's title for "add_fact"; the fact to change for "update_fact".`),
+				"new_title": str(`A fact's new title, for "update_fact". Optional.`),
+				"due":       str(`When the fact is due, RFC3339. Required for a deadline; the FIRST occurrence for a recurring fact.`),
+				"lead_days": str(`How many days before the due date the fact counts as due soon, e.g. "180". Optional; defaults to 30.`),
+				"rrule":     str(`An RFC 5545 recurrence rule for a recurring fact, e.g. FREQ=YEARLY (supported: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH, BYSETPOS, WKST). Requires "tz".`),
+				"tz":        str(`The IANA zone the recurrence's wall clock lives in, e.g. Asia/Singapore. Required with "rrule".`),
+				"done":      str(`"true" or "false": whether a deadline or milestone is finished. Optional, for "update_fact".`),
+				"blocker":   str(`What human action a milestone is waiting on; an empty value clears it. Optional.`),
+				"body":      str(`The note's text, or details for any other kind.`),
+			},
+			"required": []string{"command"},
+		},
+	}}
+}
+
+// projectNamed resolves the "project" name arg. An unknown name answers with an
+// instructive error listing the projects that DO exist — deliberately not
+// auto-creating, because a typo must not spawn a project. The three returns are
+// the tool-handler split: a project, an instructive error text for the model, or
+// a real store failure.
+func projectNamed(s *Store, name string) (Project, string, error) {
+	p, err := s.ProjectByName(name)
+	if err == nil {
+		return p, "", nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return Project{}, "", err
+	}
+	all, err := s.ListProjects()
+	if err != nil {
+		return Project{}, "", err
+	}
+	if len(all) == 0 {
+		return Project{}, fmt.Sprintf("error: no project named %q — none exist yet; create makes one", name), nil
+	}
+	names := make([]string, len(all))
+	for i, p := range all {
+		names[i] = p.Name
+	}
+	return Project{}, fmt.Sprintf("error: no project named %q — existing projects: %s",
+		name, strings.Join(names, ", ")), nil
+}
+
+// factNamed resolves a fact by title within a project, case-insensitively.
+// Ambiguity is reported rather than guessed: picking one of two same-titled
+// facts would silently edit the wrong one.
+func factNamed(s *Store, p Project, title string) (Fact, string, error) {
+	facts, err := s.ListFacts(p.ID)
+	if err != nil {
+		return Fact{}, "", err
+	}
+	var matches []Fact
+	for _, f := range facts {
+		if strings.EqualFold(strings.TrimSpace(f.Title), strings.TrimSpace(title)) {
+			matches = append(matches, f)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], "", nil
+	case 0:
+		return Fact{}, fmt.Sprintf("error: no fact titled %q in %q — call show to see its facts", title, p.Name), nil
+	}
+	return Fact{}, fmt.Sprintf("error: %q matches %d facts in %q — rename one first so the fact you mean is unambiguous",
+		title, len(matches), p.Name), nil
+}
+
+// boolArg reads one "true"/"false" flat field: value, whether it was supplied,
+// and the instructive error for anything else — the executableArg shape, for
+// the same reason.
+func boolArg(a projectArgs, name string) (value, supplied bool, errText string) {
+	raw, ok := a.field(name)
+	if !ok {
+		return false, false, ""
+	}
+	switch strings.ToLower(raw) {
+	case "true":
+		return true, true, ""
+	case "false":
+		return false, true, ""
+	}
+	return false, false, fmt.Sprintf(`error: '%s' must be "true" or "false", not %q`, name, raw)
+}
+
+// leadArg reads the optional "lead_days" field as a whole number of days.
+func leadArg(a projectArgs) (value int, supplied bool, errText string) {
+	raw, ok := a.field("lead_days")
+	if !ok {
+		return 0, false, ""
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 0 {
+		return 0, false, fmt.Sprintf(`error: 'lead_days' must be a whole number of days, e.g. "30", not %q`, raw)
+	}
+	return n, true, ""
+}
+
+// ── Guards and derived state ──────────────────────────────────────────────────
+// The four known misuses, turned into instructive errors, plus the health line
+// every mutating result ends with. Two of the guards live in the store (a
+// duplicate title, a blocked-and-done milestone), so REST enforces them too;
+// the two below are TOOL-BOUNDARY only, because the thing they catch is a model
+// misfiling something, not a human meaning what they typed.
+
+// isoDate matches a bare YYYY-MM-DD anywhere in a string. It is a candidate
+// finder, not a validator: time.Parse decides whether the digits are a date, so
+// "invoice 2027-99-45" is just a number.
+var isoDate = regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
+
+// dateInText returns the first real calendar date in the text.
+func dateInText(text string) (string, bool) {
+	for _, candidate := range isoDate.FindAllString(text, -1) {
+		if _, err := time.Parse(time.DateOnly, candidate); err == nil {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// refuseDatedNote is the guard behind ladder rule 4. A note never moves health,
+// so a date filed as one is an obligation the project will never surface — and
+// the model gets back the exact call it should have made instead. Returns "" to
+// allow the write.
+func refuseDatedNote(title, body string) string {
+	for _, text := range []string{title, body} {
+		date, ok := dateInText(text)
+		if !ok {
+			continue
+		}
+		return fmt.Sprintf("error: that note carries the date %s — a date you must act by is a deadline, "+
+			`not a note; resend it as {"command": "add_fact", "kind": "deadline", "title": "...", "due": %q}`,
+			date, date+"T00:00:00Z")
+	}
+	return ""
+}
+
+// duplicateTitleError renders the store's uniqueness refusal with the command
+// that fixes it. The store deliberately does not name update_fact — it has no
+// business knowing a tool's command names, and the same rejection is a plain 409
+// on the REST path.
+func duplicateTitleError(title, project string) string {
+	return fmt.Sprintf("error: fact %q already exists in %s; use update_fact", title, project)
+}
+
+// wholeDays renders a span the way a person counts it: to the NEAREST day. A
+// deadline exactly 200 days out is 199.999 days by the time the write lands, and
+// "199 days before due" in the answer would look like an off-by-one bug.
+func wholeDays(d time.Duration) int { return int(d.Round(24*time.Hour) / (24 * time.Hour)) }
+
+// healthLine is the one-line state a mutating result ends with, e.g.
+// `Passports: due_soon, next due 2027-03-14 (in 193d)`.
+func healthLine(now time.Time, p Project) string {
+	if p.NextDue == nil {
+		return fmt.Sprintf("%s: %s", p.Name, p.Health)
+	}
+	due := p.NextDue.Local()
+	if due.Before(now) {
+		return fmt.Sprintf("%s: %s, next due %s (%dd overdue)",
+			p.Name, p.Health, due.Format(time.DateOnly), wholeDays(now.Sub(due)))
+	}
+	return fmt.Sprintf("%s: %s, next due %s (in %dd)",
+		p.Name, p.Health, due.Format(time.DateOnly), wholeDays(due.Sub(now)))
+}
+
+// withHealth appends the project's CURRENT health line to a result. Health is
+// derived, so the copy the handler was holding is already stale by the time it
+// answers — re-reading is how the model sees what its own write did.
+func withHealth(s *Store, id ProjectID, text string) (string, error) {
+	p, _, err := s.GetProject(id)
+	if err != nil {
+		return "", err
+	}
+	return text + "\n" + healthLine(time.Now(), p), nil
+}
+
+func runProjectList(s *Store, _ BotID, _ projectArgs) (string, error) {
+	projects, err := s.ListProjects()
+	if err != nil {
+		return "", err
+	}
+	if len(projects) == 0 {
+		return "(no projects yet — 'create' starts one)", nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "now: %s\n", localRFC3339(time.Now()))
+	fmt.Fprintf(&b, "%d project(s), most urgent first:\n", len(projects))
+	for i, p := range projects {
+		fmt.Fprintf(&b, "%d. %s — %s", i+1, p.Name, p.Health)
+		if p.NextDue != nil {
+			fmt.Fprintf(&b, ", next due %s", localRFC3339(*p.NextDue))
+		}
+		fmt.Fprintf(&b, "  (%d fact(s))", p.FactCount)
+		if p.Goal != "" {
+			fmt.Fprintf(&b, "  — %s", p.Goal)
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+func runProjectShow(s *Store, _ BotID, a projectArgs) (string, error) {
+	name, _ := a.field("project")
+	p, errText, err := projectNamed(s, name)
+	if err != nil || errText != "" {
+		return errText, err
+	}
+	_, facts, err := s.GetProject(p.ID)
+	if err != nil {
+		return projectStoreError(err)
+	}
+	return renderProject(time.Now(), p, facts), nil
+}
+
+// healthBearing reports whether any fact can move the project's health at all.
+// A project of nothing but notes derives nothing, and "ok" would read as a
+// verdict rather than as the absence of one.
+func healthBearing(facts []Fact) bool {
+	for _, f := range facts {
+		if f.Kind == FactDeadline || f.Kind == FactRecurring || f.Kind == FactMilestone {
+			return true
+		}
+	}
+	return false
+}
+
+// renderProject formats one project for the model: the current time first (the
+// anchor "due in three weeks" needs), then the header, then a line per fact in
+// the store's urgency-first order.
+func renderProject(now time.Time, p Project, facts []Fact) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "now: %s\n%s — %s", localRFC3339(now), p.Name, p.Health)
+	if p.Goal != "" {
+		fmt.Fprintf(&b, "\ngoal: %s", p.Goal)
+	}
+	if len(facts) == 0 {
+		b.WriteString("\n(no facts yet — add_fact records one)")
+		b.WriteString("\n" + noHealthPrompt)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "\n%d fact(s), most urgent first:\n", len(facts))
+	for i, f := range facts {
+		fmt.Fprintf(&b, "%d. [%s] %s", i+1, f.Kind, f.Title)
+		if !f.Due.IsZero() {
+			fmt.Fprintf(&b, "  due %s (lead %dd)", localRFC3339(f.Due), f.LeadDays)
+		}
+		if f.RRule != "" {
+			fmt.Fprintf(&b, "  (repeats: %s, %s)", f.RRule, f.TZ)
+		}
+		if f.Blocker != "" {
+			fmt.Fprintf(&b, "  BLOCKED: %s", f.Blocker)
+		}
+		if f.Done {
+			b.WriteString("  (done)")
+		}
+		b.WriteString("\n")
+		if f.Body != "" {
+			fmt.Fprintf(&b, "   %s\n", f.Body)
+		}
+	}
+	out := strings.TrimRight(b.String(), "\n")
+	if !healthBearing(facts) {
+		out += "\n" + noHealthPrompt
+	}
+	return out
+}
+
+// noHealthPrompt is what a project with nothing health-bearing ends with: the
+// model is told WHY there is no verdict and which kinds would produce one.
+const noHealthPrompt = "health unknown: add a deadline, recurring or milestone fact"
+
+func runProjectCreate(s *Store, botID BotID, a projectArgs) (string, error) {
+	name, _ := a.field("project")
+	goal, _ := a.field("goal")
+	// createdBy is the CALLING bot, stamped by the store — the model cannot
+	// name an author, so a project always says who really started it.
+	p, err := s.CreateProject(name, goal, string(botID))
+	if err != nil {
+		return projectStoreError(err)
+	}
+	return withHealth(s, p.ID, fmt.Sprintf("created project %q", p.Name))
+}
+
+func runProjectAddFact(s *Store, botID BotID, a projectArgs) (string, error) {
+	name, _ := a.field("project")
+	p, errText, err := projectNamed(s, name)
+	if err != nil || errText != "" {
+		return errText, err
+	}
+	kind, _ := a.field("kind")
+	title, _ := a.field("title")
+	f := Fact{Kind: FactKind(kind), Title: title}
+	if raw, ok := a.field("due"); ok {
+		due, err := calendarTime("due", raw)
+		if err != nil {
+			return err.Error(), nil
+		}
+		f.Due = due
+	}
+	lead, supplied, errText := leadArg(a)
+	if errText != "" {
+		return errText, nil
+	}
+	if supplied {
+		f.LeadDays = lead
+	}
+	f.RRule, _ = a.field("rrule")
+	f.TZ, _ = a.field("tz")
+	f.Blocker, _ = a.field("blocker")
+	f.Body, _ = a.field("body")
+	if f.Kind == FactNote {
+		if errText := refuseDatedNote(f.Title, f.Body); errText != "" {
+			return errText, nil
+		}
+	}
+	stored, err := s.CreateFact(p.ID, f, string(botID))
+	if errors.Is(err, ErrDuplicateName) {
+		return duplicateTitleError(f.Title, p.Name), nil
+	}
+	if err != nil {
+		return projectStoreError(err)
+	}
+	return withHealth(s, p.ID, fmt.Sprintf("added %s to %q: %s", stored.Kind, p.Name, stored.Title))
+}
+
+// runProjectNote is add_fact's shorthand: the body IS the note, and the title
+// is the handle a listing shows, taken from its start.
+func runProjectNote(s *Store, botID BotID, a projectArgs) (string, error) {
+	name, _ := a.field("project")
+	p, errText, err := projectNamed(s, name)
+	if err != nil || errText != "" {
+		return errText, err
+	}
+	body, _ := a.field("body")
+	title := noteTitle(body)
+	if errText := refuseDatedNote(title, body); errText != "" {
+		return errText, nil
+	}
+	stored, err := s.CreateFact(p.ID, Fact{Kind: FactNote, Title: title, Body: body}, string(botID))
+	if errors.Is(err, ErrDuplicateName) {
+		return duplicateTitleError(title, p.Name), nil
+	}
+	if err != nil {
+		return projectStoreError(err)
+	}
+	return withHealth(s, p.ID, fmt.Sprintf("added note to %q: %s", p.Name, stored.Title))
+}
+
+// noteTitle takes the note's handle from the start of its body, counted in
+// runes so a multi-byte body cannot be cut mid-character.
+func noteTitle(body string) string {
+	r := []rune(strings.Join(strings.Fields(body), " "))
+	if len(r) > noteTitleLimit {
+		return strings.TrimSpace(string(r[:noteTitleLimit]))
+	}
+	return string(r)
+}
+
+func runProjectUpdateFact(s *Store, _ BotID, a projectArgs) (string, error) {
+	name, _ := a.field("project")
+	p, errText, err := projectNamed(s, name)
+	if err != nil || errText != "" {
+		return errText, err
+	}
+	title, _ := a.field("title")
+	f, errText, err := factNamed(s, p, title)
+	if err != nil || errText != "" {
+		return errText, err
+	}
+	var patch FactPatch
+	changed := false
+	// new_title is non-empty-only (a fact must have a title); blocker and body
+	// are clearable, so they read the SUPPLIED value, empty included.
+	if v, ok := a.field("new_title"); ok {
+		patch.Title = &v
+		changed = true
+	}
+	for _, field := range []struct {
+		name string
+		set  func(string)
+	}{
+		{"blocker", func(v string) { patch.Blocker = &v }},
+		{"body", func(v string) { patch.Body = &v }},
+	} {
+		if v, ok := a.given(field.name); ok {
+			field.set(v)
+			changed = true
+		}
+	}
+	if raw, ok := a.field("due"); ok {
+		due, err := calendarTime("due", raw)
+		if err != nil {
+			return err.Error(), nil
+		}
+		patch.Due = &due
+		changed = true
+	}
+	if lead, supplied, errText := leadArg(a); errText != "" {
+		return errText, nil
+	} else if supplied {
+		patch.LeadDays = &lead
+		changed = true
+	}
+	if done, supplied, errText := boolArg(a, "done"); errText != "" {
+		return errText, nil
+	} else if supplied {
+		patch.Done = &done
+		changed = true
+	}
+	if !changed {
+		return "error: 'update_fact' needs at least one of new_title, due, lead_days, done, blocker, body to change", nil
+	}
+	updated, err := s.UpdateFact(f.ID, patch)
+	if errors.Is(err, ErrDuplicateName) {
+		intended := f.Title
+		if patch.Title != nil {
+			intended = *patch.Title
+		}
+		return duplicateTitleError(intended, p.Name), nil
+	}
+	if err != nil {
+		return projectStoreError(err)
+	}
+	text := fmt.Sprintf("updated %q: %s", p.Name, updated.Title)
+	// Ladder rule 6, as a caution rather than a refusal: ticking a deadline
+	// months early is nearly always a renewal filed the wrong way, but the model
+	// may be right, so the write stands and the answer names the alternative.
+	now := time.Now()
+	if patch.Done != nil && *patch.Done && updated.Kind == FactDeadline && updated.Due.After(now) {
+		text += fmt.Sprintf("\nmarked done %d days before due; if this was a renewal, "+
+			"set due to the new date instead", wholeDays(updated.Due.Sub(now)))
+	}
+	return withHealth(s, p.ID, text)
+}
+
+// projectStoreError splits the store's answer in two, exactly as
+// calendarStoreError does: a missing row, a rejected value or a taken name is
+// the MODEL's mistake and comes back as an instructive result it can fix on the
+// next iteration; anything else is a real store failure and fails the turn.
+func projectStoreError(err error) (string, error) {
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return "error: no such project or fact — call list to see what exists", nil
+	case errors.Is(err, ErrInvalid), errors.Is(err, ErrDuplicateName):
+		return "error: " + storeErrorText(err), nil
+	default:
+		return "", err
+	}
+}
+
+// storeErrorText strips the sentinel's own prefix, so the model reads the
+// specific reason rather than the package's error taxonomy.
+func storeErrorText(err error) string {
+	text := err.Error()
+	for _, prefix := range []string{"botnet: invalid: ", "botnet: that name is already taken: "} {
+		text = strings.TrimPrefix(text, prefix)
+	}
+	return text
+}
+
 // webSearchToolName is OpenRouter's built-in web-search SERVER tool — the
 // no-regression FALLBACK offered only when no client search backend is
 // configured. It is resolved by OpenRouter server-side (the search never
@@ -806,7 +1482,7 @@ func webSearchFuncDef() wireTool {
 // never leaks a bogus empty "function" object into the request or into
 // /v1/tools.
 func toolWireDefs(search *Router) []any {
-	defs := []any{memoryToolDef(), calendarToolDef()}
+	defs := []any{memoryToolDef(), calendarToolDef(), projectToolDef()}
 	if search.Available() {
 		defs = append(defs, webSearchFuncDef())
 	} else {
@@ -857,6 +1533,7 @@ func (tb *BotToolbox) wireDefs() []any { return toolWireDefs(tb.search) }
 var toolHandlers = map[string]func(*BotToolbox, context.Context, json.RawMessage) (toolResult, error){
 	memoryToolName:    (*BotToolbox).runMemory,
 	calendarToolName:  (*BotToolbox).runCalendar,
+	projectToolName:   (*BotToolbox).runProject,
 	webSearchFuncName: (*BotToolbox).runWebSearch,
 }
 
@@ -876,7 +1553,7 @@ func (tb *BotToolbox) Run(ctx context.Context, name string, args json.RawMessage
 
 // toolNames lists the dispatchable tool names, for the unknown-tool error.
 func toolNames() []string {
-	return []string{memoryToolName, calendarToolName, webSearchFuncName}
+	return []string{memoryToolName, calendarToolName, projectToolName, webSearchFuncName}
 }
 
 // runMemory dispatches the memory tool through the memoryCommands registry. It
@@ -943,6 +1620,37 @@ func (tb *BotToolbox) runCalendar(_ context.Context, args json.RawMessage) (tool
 	}
 	return toolResult{text: fmt.Sprintf("error: unknown command '%s' — valid: %s",
 		in.Command, strings.Join(calendarCommandNames(), ", "))}, nil
+}
+
+// runProject dispatches the project tool through the projectCommands registry —
+// the same shape runCalendar has, with the requirement check driven by each
+// command's `requires` list rather than a per-command branch. It ignores ctx:
+// every command is a local store operation.
+func (tb *BotToolbox) runProject(_ context.Context, args json.RawMessage) (toolResult, error) {
+	var in projectArgs
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &in); err != nil {
+			return toolResult{text: `error: arguments must be a JSON object like {"command": "list"}`}, nil
+		}
+	}
+	if in.Command == "" {
+		return toolResult{text: fmt.Sprintf("error: missing 'command' — valid: %s",
+			strings.Join(projectCommandNames(), ", "))}, nil
+	}
+	for _, c := range projectCommands {
+		if c.name != in.Command {
+			continue
+		}
+		for _, need := range c.requires {
+			if _, ok := in.field(need); !ok {
+				return toolResult{text: fmt.Sprintf("error: '%s' requires a '%s' field", c.name, need)}, nil
+			}
+		}
+		text, err := c.run(tb.store, tb.botID, in)
+		return toolResult{text: text}, err
+	}
+	return toolResult{text: fmt.Sprintf("error: unknown command '%s' — valid: %s",
+		in.Command, strings.Join(projectCommandNames(), ", "))}, nil
 }
 
 // runWebSearch dispatches the web_search tool: it runs the model's query through
