@@ -78,7 +78,10 @@ struct ProjectScreen: View {
                         .foregroundStyle(Palette.primaryText)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                healthBadge(project)
+                HStack(spacing: Metric.phoneRowGap) {
+                    healthBadge(project)
+                    ownerBadge(project)
+                }
                 // Before the facts: a parent's rolled-up reading is often a
                 // child's, so the children are what explain the badge above.
                 childrenSection
@@ -107,6 +110,45 @@ struct ProjectScreen: View {
         .padding(.horizontal, Metric.phoneRowGap)
         .padding(.vertical, Metric.phoneTightGap)
         .background(Palette.fieldFill, in: Capsule())
+    }
+
+    /// Who is answerable, and whether that came from an ancestor. Read through
+    /// the shared ProjectInheritance so the phone's "via Document Expirations"
+    /// is the same string the Mac's header prints, rather than a second walk
+    /// that would drift the first time an owner moved up the tree.
+    private func inheritance(_ project: Project) -> ProjectInheritance {
+        ProjectInheritance(
+            project: project,
+            tree: ProjectTree(store.projects),
+            botNames: Dictionary(store.bots.map { ($0.id, $0.displayName) },
+                                 uniquingKeysWith: { first, _ in first }))
+    }
+
+    @ViewBuilder
+    private func ownerBadge(_ project: Project) -> some View {
+        let owned = inheritance(project)
+        if let name = owned.ownerName {
+            HStack(spacing: Metric.phoneTightGap) {
+                if let id = owned.ownerBotID {
+                    BotAvatar(botID: id, size: Metric.avatarSmall)
+                }
+                Text(name)
+                    .font(TypeScale.phoneRowMeta)
+                    .foregroundStyle(Palette.primaryText)
+                    .lineLimit(1)
+                // Muted, and only when the owner came from above: on a project
+                // that sets its own there is nothing to explain.
+                if let via = owned.ownerVia {
+                    Text(via)
+                        .font(TypeScale.phoneRowMeta)
+                        .foregroundStyle(Palette.secondaryText)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, Metric.phoneRowGap)
+            .padding(.vertical, Metric.phoneTightGap)
+            .background(Palette.fieldFill, in: Capsule())
+        }
     }
 
     /// The direct children, preferring the live list — a rename or a moved
@@ -396,7 +438,7 @@ struct AddFactSheet: View {
     @State private var kind: FactKind
     @State private var title = ""
     @State private var due = AddFactSheet.defaultDue()
-    @State private var leadDays = 30
+    @State private var leadDays: Int
     @State private var rrule = ""
     @State private var tz = TimeZone.current.identifier
     @State private var blocker = ""
@@ -407,6 +449,13 @@ struct AddFactSheet: View {
         self.project = project
         self.initialKind = initialKind
         _kind = State(initialValue: initialKind)
+        // The lead this project hands a dated fact, as the SERVER derived it —
+        // its own, or the nearest ancestor's. A hardcoded 30 here would have
+        // silently disagreed with the Mac on any project that sets a lead, and
+        // written the wrong due_soon window from the phone. The global fallback
+        // applies only to a botnetd that predates thresholds.
+        _leadDays = State(initialValue: project.hasEffectiveLead
+                          ? project.effectiveLeadDays : Project.globalDefaultLeadDays)
     }
 
     private var trimmedTitle: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }

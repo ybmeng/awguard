@@ -21,6 +21,10 @@ enum LaunchScreen: String {
     case chat
     /// The first project in the list, which the server sorts loudest-first.
     case project
+    /// The first project that has a parent. Its owner and default lead are
+    /// inherited rather than its own, which is the reading ("via <ancestor>")
+    /// a root's screen can never show.
+    case childProject = "project-child"
     /// That project, with its Add Fact sheet already up.
     case addFact = "add-fact"
     /// The same sheet opened on `recurring`, the kind whose extra inputs prove
