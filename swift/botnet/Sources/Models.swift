@@ -596,15 +596,36 @@ struct Project: Identifiable, Decodable, Hashable {
     var createdBy: String
     var createdAt: Date
     var updatedAt: Date
-    /// Derived at read time from the facts; never patched, never sent back.
+    /// The parent project's id, or nil at the top level. The wire spells "top
+    /// level" two ways — the key omitted (Go's omitempty) and "" — and both
+    /// arrive here as nil, because the tree has exactly one notion of a root
+    /// and two spellings of it would split it in half.
+    var parentId: String?
+    /// Derived at read time from the facts of this project AND its whole
+    /// subtree; never patched, never sent back.
     var health: String
+    /// The coarse three-step reading of `health` ("S0" | "S1" | "S2"), derived
+    /// from the same rolled-up health. A wire string like `health` is: an "S3"
+    /// from a newer server has to render, not throw. "" means a server that
+    /// predates severity, which is why `hasSeverity` exists.
+    var severity: String
     /// The nearest upcoming due instant across the undone deadline and
-    /// recurring facts. Nil when nothing is pending.
+    /// recurring facts, this project's and its subtree's. Nil when nothing is
+    /// pending.
     var nextDue: Date?
+    /// This project's OWN facts — a parent's count does not include its
+    /// children's, which is what makes "3 facts" on a parent readable.
     var factCount: Int
+    /// DIRECT children. The server's own count; the sidebar's disclosure keys
+    /// off the tree it actually built, so this is for prose (the delete
+    /// confirmation) rather than for layout.
+    var childCount: Int
 
     var isUserCreated: Bool { createdBy == Event.userAuthor }
     var hasGoal: Bool { !goal.isEmpty }
+    var isTopLevel: Bool { parentId == nil }
+    var hasChildren: Bool { childCount > 0 }
+    var hasSeverity: Bool { !severity.isEmpty }
 
     /// "due soon" — the wire value read as words. An unknown future value comes
     /// through verbatim rather than being hidden behind a guess.
@@ -613,8 +634,26 @@ struct Project: Identifiable, Decodable, Hashable {
     /// "in 12d" / "today" / "overdue 3d", or nil when nothing is due.
     var nextDueText: String? { DueText.relative(nextDue) }
 
+    /// "overdue 13d" / "due soon · in 18d" / "ok · in 193d" / "unknown". When
+    /// the relative reading already carries the health word it stands alone:
+    /// "overdue · overdue 13d" says the same thing twice.
+    var healthText: String {
+        guard let due = nextDueText else { return healthLabel }
+        guard !due.hasPrefix(healthLabel) else { return due }
+        return "\(healthLabel) · \(due)"
+    }
+
+    /// "S0 · overdue 13d" — the severity first, because it is the thing that
+    /// sorts the list, then the health reading it coarsens. A server that
+    /// derives no severity says only the health part rather than an empty
+    /// prefix and a stray separator.
+    var severityText: String {
+        hasSeverity ? "\(severity) · \(healthText)" : healthText
+    }
+
     private enum Keys: String, CodingKey {
-        case id, name, goal, createdBy, createdAt, updatedAt, health, nextDue, factCount
+        case id, name, goal, parentId, createdBy, createdAt, updatedAt
+        case health, severity, nextDue, factCount, childCount
     }
     // Every derived key is read leniently: Go's omitempty drops exactly the zero
     // value, so an absent factCount IS 0 and an absent goal IS "". nextDue goes
@@ -626,12 +665,18 @@ struct Project: Identifiable, Decodable, Hashable {
         id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
         goal = try c.decodeIfPresent(String.self, forKey: .goal) ?? ""
+        // "" is the wire's other way of saying top level; it collapses to nil
+        // here so nothing downstream has to test for both.
+        let parent = try c.decodeIfPresent(String.self, forKey: .parentId) ?? ""
+        parentId = parent.isEmpty ? nil : parent
         createdBy = try c.decodeIfPresent(String.self, forKey: .createdBy) ?? ""
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
         health = try c.decodeIfPresent(String.self, forKey: .health) ?? ""
+        severity = try c.decodeIfPresent(String.self, forKey: .severity) ?? ""
         nextDue = try c.decodeIfPresent(Date.self, forKey: .nextDue)?.nilIfServerZero
         factCount = try c.decodeIfPresent(Int.self, forKey: .factCount) ?? 0
+        childCount = try c.decodeIfPresent(Int.self, forKey: .childCount) ?? 0
     }
 }
 
@@ -711,12 +756,170 @@ struct ProjectDetail: Decodable, Hashable {
     /// A project with no facts sends `facts` as null (Go's nil slice), which is
     /// an empty list, not a missing one.
     var facts: [ProjectFact]
+    /// The DIRECT children, with their own derived fields, in the same sort the
+    /// list uses. Null (no children) and absent (a server that predates the
+    /// hierarchy) are both an empty list, exactly like `facts`.
+    var children: [Project]
 
-    private enum Keys: String, CodingKey { case project, facts }
+    private enum Keys: String, CodingKey { case project, facts, children }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         project = try c.decode(Project.self, forKey: .project)
         facts = try c.decodeIfPresent([ProjectFact].self, forKey: .facts) ?? []
+        children = try c.decodeIfPresent([Project].self, forKey: .children) ?? []
+    }
+}
+
+/// The project hierarchy, built ONCE from the flat list the server sends.
+///
+/// Every view reads its shape from here and no view walks `parentId` itself:
+/// the sidebar's rows, the pane's children strip and the Edit sheet's parent
+/// picker are three readings of one structure, and three separate walks would
+/// disagree the first time an edge case (an orphan, a rename, a cycle) showed
+/// up in exactly one of them.
+///
+/// Two rules the server guarantees but this cannot assume, because the client
+/// also renders a list mid-write and a list from an older server:
+/// a project whose parent is not in the list is an ORPHAN and renders as a
+/// root — dropping it would hide real work — and a parent chain that loops is
+/// walked at most once per project rather than forever.
+struct ProjectTree {
+    /// The flat list, in the server's own order (severity/health precedence,
+    /// then nextDue, then name). Sibling order within the tree is exactly this
+    /// order; nothing here re-sorts.
+    let all: [Project]
+    /// Top-level projects and orphans, in list order.
+    let roots: [Project]
+
+    private let byID: [String: Project]
+    private let byParent: [String: [Project]]
+
+    init(_ projects: [Project]) {
+        all = projects
+        var byID: [String: Project] = [:]
+        for p in projects { byID[p.id] = p }
+        var byParent: [String: [Project]] = [:]
+        var roots: [Project] = []
+        for p in projects {
+            // A parent that isn't in this list can't be rendered as a parent,
+            // so its child is a root here rather than an invisible node.
+            if let parent = p.parentId, parent != p.id, byID[parent] != nil {
+                byParent[parent, default: []].append(p)
+            } else {
+                roots.append(p)
+            }
+        }
+        self.byID = byID
+        self.byParent = byParent
+        self.roots = roots
+    }
+
+    func project(_ id: String) -> Project? { byID[id] }
+
+    /// Direct children, in list order.
+    func children(of id: String) -> [Project] { byParent[id] ?? [] }
+
+    func hasChildren(_ id: String) -> Bool { byParent[id] != nil }
+
+    /// How far in the row indents: 0 for a root. A looping parent chain stops
+    /// at the first repeat rather than hanging the UI.
+    func depth(of id: String) -> Int {
+        var depth = 0
+        var seen: Set<String> = [id]
+        var cursor = byID[id]?.parentId
+        while let parent = cursor, !seen.contains(parent), let node = byID[parent] {
+            seen.insert(parent)
+            depth += 1
+            cursor = node.parentId
+        }
+        return depth
+    }
+
+    /// The project AND all its descendants, preorder. Includes self, because
+    /// every caller wants it: the parent picker excludes this whole set (you
+    /// cannot be your own parent or your descendant's), and the delete
+    /// confirmation counts it.
+    func subtree(of id: String) -> [Project] {
+        guard let root = byID[id] else { return [] }
+        var out: [Project] = []
+        var stack = [root]
+        var seen = Set<String>()
+        while let node = stack.popLast() {
+            guard seen.insert(node.id).inserted else { continue }
+            out.append(node)
+            stack.append(contentsOf: children(of: node.id).reversed())
+        }
+        return out
+    }
+
+    /// One rendered sidebar line: which project, how far in, whether it can
+    /// disclose and whether it currently is.
+    struct Row: Identifiable, Hashable {
+        let project: Project
+        let depth: Int
+        let hasChildren: Bool
+        let expanded: Bool
+
+        var id: String { project.id }
+    }
+
+    /// The rows the sidebar draws, in order.
+    ///
+    /// With no query: preorder from the roots, descending only into ids in
+    /// `expanded`. With a query: the matching projects PLUS the ancestors
+    /// needed to reach them, every such ancestor force-revealed — a match two
+    /// levels down is useless if its parent is collapsed, and the persisted
+    /// expansion is left untouched so it comes back when the search clears.
+    func rows(expanded: Set<String>, query: String = "") -> [Row] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return rows(from: roots, expanded: expanded, visible: nil) }
+        var visible = Set<String>()
+        for p in all where p.name.range(of: needle, options: .caseInsensitive) != nil {
+            for ancestor in ancestry(of: p.id) { visible.insert(ancestor) }
+        }
+        guard !visible.isEmpty else { return [] }
+        return rows(from: roots.filter { visible.contains($0.id) },
+                    expanded: visible, visible: visible)
+    }
+
+    /// Every project the given one could be moved under: the whole tree minus
+    /// its own subtree, in render order with depth. Excluding the subtree is
+    /// what makes a cycle unofferable rather than a 400 the user has to read —
+    /// the server still refuses one, but the picker never proposes it.
+    ///
+    /// Here rather than in the sheet so it is provable without a view, and so
+    /// the one place that knows the shape is the one place that answers this.
+    func parentCandidates(for id: String) -> [Row] {
+        let excluded = Set(subtree(of: id).map(\.id))
+        return rows(expanded: Set(all.map(\.id))).filter { !excluded.contains($0.project.id) }
+    }
+
+    /// A project and every ancestor above it, self first. Cycle-guarded like
+    /// `depth(of:)`.
+    private func ancestry(of id: String) -> [String] {
+        var out: [String] = []
+        var seen = Set<String>()
+        var cursor: String? = id
+        while let current = cursor, seen.insert(current).inserted, let node = byID[current] {
+            out.append(current)
+            cursor = node.parentId
+        }
+        return out
+    }
+
+    private func rows(from level: [Project], expanded: Set<String>,
+                      visible: Set<String>?, depth: Int = 0) -> [Row] {
+        var out: [Row] = []
+        for project in level {
+            let kids = children(of: project.id).filter { visible?.contains($0.id) ?? true }
+            let open = expanded.contains(project.id)
+            out.append(Row(project: project, depth: depth,
+                           hasChildren: !kids.isEmpty, expanded: open && !kids.isEmpty))
+            if open, !kids.isEmpty {
+                out += rows(from: kids, expanded: expanded, visible: visible, depth: depth + 1)
+            }
+        }
+        return out
     }
 }
 

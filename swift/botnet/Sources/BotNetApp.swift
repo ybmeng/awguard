@@ -73,7 +73,10 @@ struct ContentView: View {
                 // its health badge and a deleted project falls back rather
                 // than rendering a ghost.
                 if let project = store.projects.first(where: { $0.id == id }) {
-                    ProjectView(project: project)
+                    // The pane's children strip navigates, so it hands the id
+                    // back here: the sidebar's selection stays the one place
+                    // that knows what is open.
+                    ProjectView(project: project) { selection = .project($0) }
                 } else {
                     nothingSelected
                 }

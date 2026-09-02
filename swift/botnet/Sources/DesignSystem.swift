@@ -89,6 +89,29 @@ enum Palette {
         }
     }
 
+    /// A project's severity to its dot color: S0 act now, S1 should be doing,
+    /// S2 tracked but not pressing. Severity is a COARSENING of health, so it
+    /// reuses health's tokens rather than opening a second palette that could
+    /// drift out of step with the first — and S2 is deliberately the quiet gray
+    /// even for a healthy project, because the scale answers "does this need me
+    /// now", not "is this fine". An unknown value falls back the same way the
+    /// health and freshness maps do.
+    static func severity(_ wire: String) -> Color {
+        switch wire {
+        case "S0": return healthOverdue
+        case "S1": return healthDueSoon
+        default: return secondaryText // S2, future values
+        }
+    }
+
+    /// The dot beside a project's name. Severity is the scale the tree reads
+    /// by, but a botnetd that predates it sends none, and graying every project
+    /// on an older server would be a silent lie — so health is the fallback,
+    /// in one place rather than at each call site.
+    static func projectDot(severity: String, health: String) -> Color {
+        severity.isEmpty ? self.health(health) : self.severity(severity)
+    }
+
     /// A run's status to its label color — the same temperature scale as the
     /// freshness dot: green for a clean envelope, orange for degraded and
     /// needs_human (the run spoke, but wants eyes), red for failed and for
@@ -159,6 +182,17 @@ enum Metric {
     /// A project's health dot in the sidebar and in the pane's badge. Same size
     /// family as freshnessDot, separate so the two can retune apart.
     static let healthDot: CGFloat = 7
+    /// How far one level of the project tree indents its rows. Smaller than
+    /// sidebarIndent (which sets a whole section in from its header): these
+    /// steps stack, and a section three projects deep must not run out of row.
+    static let projectTreeIndent: CGFloat = 11
+    /// The disclosure caret's fixed column on a project row. A leaf reserves
+    /// the same width and draws nothing, so sibling names line up whether or
+    /// not they have children.
+    static let projectDisclosureWidth: CGFloat = 12
+    /// A child row in the pane's sub-projects strip. Its own token because the
+    /// strip is a list of links, not the facts list, and the two retune apart.
+    static let childStripRowGap: CGFloat = 1
     /// A fact row's leading kind glyph, fixed so every title starts at one x
     /// whichever glyph the kind uses.
     static let factGlyphWidth: CGFloat = 16
