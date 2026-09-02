@@ -176,6 +176,17 @@ func TestDiscover(t *testing.T) {
   retry_for: 6h
 `)
 
+	// A git worktree under .claude/ carries a full copy of the repo; its
+	// manifests must never shadow the real ones.
+	wt := filepath.Join(repo, ".claude", "worktrees", "lane", "alpha")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inWorktree := "---\nname: alpha\ngoal: worktree-copy\nforms:\n  \"3\": echo no\n---\n"
+	if err := os.WriteFile(filepath.Join(wt, "README.md"), []byte(inWorktree), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	svc := newProbe(t, repo)
 	autos := svc.discover()
 	byName := map[string]Automation{}
@@ -185,7 +196,7 @@ func TestDiscover(t *testing.T) {
 	if len(autos) != 3 {
 		t.Fatalf("discover = %d automations (%v), want 3 (alpha, beta, delta)", len(autos), byName)
 	}
-	if a := byName["alpha"]; a.Goal == "impostor" || a.Dir != "alpha" {
+	if a := byName["alpha"]; a.Goal == "impostor" || a.Goal == "worktree-copy" || a.Dir != "alpha" {
 		t.Errorf("duplicate name did not keep the first found: %+v", a)
 	}
 	if a := byName["beta"]; a.Schedule == nil || a.Schedule.RetryFor != 6*time.Hour {

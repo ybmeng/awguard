@@ -9,10 +9,11 @@ import (
 )
 
 // skipDirs are directory names never descended into during discovery: VCS and
-// build litter, plus the per-automation output dirs (data/, raw/) whose
-// contents churn every run.
+// build litter, .claude (agent skills, and git worktrees whose full repo copies
+// would otherwise shadow the real manifests), plus the per-automation output
+// dirs (data/, raw/) whose contents churn every run.
 var skipDirs = map[string]bool{
-	".git": true, "node_modules": true, "__pycache__": true,
+	".git": true, ".claude": true, "node_modules": true, "__pycache__": true,
 	"build": true, "data": true, "raw": true,
 }
 
