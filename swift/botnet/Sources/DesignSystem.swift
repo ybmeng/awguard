@@ -3,6 +3,11 @@
 // spacing number; every value lives here so the look can be retuned in one file.
 
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+#else
+import UIKit
+#endif
 
 // MARK: - Palette
 
@@ -109,6 +114,11 @@ enum Palette {
         solid(0x9B7BE8), solid(0x4A8FE8), solid(0xEFC03C), solid(0x5BB85B),
     ]
 
+    // The tokens above are platform-neutral; only the bridge from a hex pair to
+    // an appearance-aware Color needs the host toolkit, so that bridge is the
+    // one thing that forks. Both sides resolve the SAME hexes — the iOS app
+    // shares this file, and a second palette would drift from the Mac's.
+    #if canImport(AppKit)
     private static func dynamic(light: UInt32, dark: UInt32) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
             let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -126,6 +136,24 @@ enum Palette {
             alpha: 1
         )
     }
+    #else
+    private static func dynamic(light: UInt32, dark: UInt32) -> Color {
+        Color(uiColor: UIColor { traits in
+            uiColor(traits.userInterfaceStyle == .dark ? dark : light)
+        })
+    }
+
+    private static func solid(_ hex: UInt32) -> Color { Color(uiColor: uiColor(hex)) }
+
+    private static func uiColor(_ hex: UInt32) -> UIColor {
+        UIColor(
+            red: Double((hex >> 16) & 0xFF) / 255,
+            green: Double((hex >> 8) & 0xFF) / 255,
+            blue: Double(hex & 0xFF) / 255,
+            alpha: 1
+        )
+    }
+    #endif
 }
 
 // MARK: - Metrics
