@@ -1,0 +1,40 @@
+name: BotNetMobile
+options:
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  BotNetMobile:
+    type: application
+    platform: iOS
+    sources:
+      # The phone's own screens. Everything below this is SHARED with the Mac
+      # app by path — not copied — so the two apps can never disagree about the
+      # wire contract, the transcript grouping, or the palette.
+      - path: Sources
+      - path: ../botnet/Sources/Models.swift
+      - path: ../botnet/Sources/APIClient.swift
+      - path: ../botnet/Sources/Store.swift
+      - path: ../botnet/Sources/Transcript.swift
+      - path: ../botnet/Sources/DesignSystem.swift
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: BotNet
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # botnetd speaks plain HTTP on loopback and on the LAN. Without this the
+        # simulator's ATS refuses every request and the app reads as unreachable
+        # with no error worth showing.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anywatch.botnet.ios
+        MARKETING_VERSION: "0.1"
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: UF6JUCLS78
+        TARGETED_DEVICE_FAMILY: "1,2"
