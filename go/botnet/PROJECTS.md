@@ -107,6 +107,79 @@ Deleting a project deletes its WHOLE subtree, every fact under it and every proj
 per-row deletes — so the change feed carries a real tombstone for each, and a sub-project is
 never orphaned into a top-level row the user never made.
 
+## The lead threshold
+
+How early a date starts mattering is a property of the FOLDER of work, not of each fact: a
+passport is worth six months of warning, an invoice a fortnight. So a project carries
+`defaultLeadDays`, and every dated fact created under it with no lead of its own takes it.
+
+`effectiveLeadDays` is the derived answer — own `defaultLeadDays` when set, else the nearest
+ancestor that set one, else the global 30 — computed in the same forest pass that rolls health
+up. The two directions travel together in one walk: health folds UP out of a subtree, the
+threshold flows DOWN into it.
+
+| Where | Value |
+|---|---|
+| `Document Expirations`, `defaultLeadDays: 180` | 180 |
+| `Passport` under it, unset | 180, inherited |
+| `China Q2 Visa` under it, `defaultLeadDays: 90` | 90, its own overrides |
+| `Singapore Co`, top level, unset | 30, the global default |
+
+It applies at CREATE time only. A fact's lead is stored on the fact, so raising a project's
+default never silently rewrites what the facts already under it mean — and a caller who wants no
+window at all patches that fact's `leadDays` to 0, which is still the one way to say "exactly on
+the day". `0` in `defaultLeadDays` means UNSET, so patching it to 0 clears the project's own
+threshold and the ancestor's applies again.
+
+## Owner and nudges
+
+A project nobody is answerable for is a list, not a responsibility. `ownerBot` names the bot
+answerable for one, and `effectiveOwner` inherits it exactly as the lead threshold does — own
+owner, else the nearest ancestor's, else none. Naming an owner once on "Document Expirations"
+makes every document under it somebody's.
+
+An owner whose bot has been deleted READS as unset, in both fields, so no client renders a thread
+that is gone. `DeleteBot` clears the stored pointer to match, one project row at a time, so the
+change feed carries a real update for each.
+
+`POST /v1/projects/tick` is the whole nudge, and the std `ping` service POSTs it hourly. It
+derives the forest once, then per project compares the rolled-up health against `lastHealth` —
+the health the last tick observed, stored on the project and deliberately NOT on the wire, since
+health is derived and refetched and a second, older copy would only invite a client to trust the
+wrong one.
+
+| Case | What happens |
+|---|---|
+| worse than `lastHealth`, owner free | the owner is told, `lastHealth` moves — in ONE transaction |
+| worse, no effective owner | skipped with a reason, `lastHealth` untouched |
+| worse, the owner has a turn in flight | skipped with a reason, `lastHealth` untouched |
+| the same or better | `lastHealth` moves silently; improvements are not news |
+
+An empty `lastHealth` counts as `ok`, so a project that is already overdue the first time the
+tick meets it nudges immediately rather than being adopted as the new normal. The skipped cases
+write nothing at all, which is what makes them a deferral rather than a lost message: the next
+tick re-decides from the same comparison. Two projects owned by one bot therefore take two ticks,
+because a bot answers one turn at a time.
+
+The response is `{"checked": N, "nudged": [...], "skipped": [...]}`, both lists always arrays.
+The tick is idempotent by construction — running it twice over the same state nudges nothing the
+second time — so `ping` needs no backoff and a caller may run it as often as it likes.
+
+The message is an ordinary user-role append to the owner's thread, through the same store path
+`POST /v1/bots/{id}/messages` uses, so the model turn starts, the reply lands in the transcript
+and no client needs a new rendering. It is recognisable by its opening and by nothing structural:
+
+```
+Project nudge — Document Expirations is now S1 due_soon (was S2 ok). Facts driving it:
+- US passport expires: due 2027-03-14 (in 190d, lead 180d)
+- Photos taken: blocked — Studio has not sent the digital copies
+Act on it or update the facts with the project tool; reply with what you did.
+```
+
+The facts listed are the undone ones anywhere in the project's SUBTREE that are as loud as the
+project now is — subtree, because health rolled up, so a parent's nudge has to name the child's
+fact that caused it. At most five, most urgent first.
+
 ## Calendar projection
 
 Every undone `deadline` or `recurring` fact has exactly one event on the calendar named
@@ -126,7 +199,7 @@ here verbatim, and if the two ever disagree, the tool description is right:
 
 ```
 How to record something — take the FIRST rule that fits:
-1. A date in the future you must act by → kind=deadline with "due" and "lead_days" (passport renewals 180, visa renewals 90, company filings 60; anything else 30).
+1. A date in the future you must act by → kind=deadline with "due". The lead window defaults from the PROJECT, so set it once with "default_lead_days" on the project that holds this kind of date (passport renewals 180, visa renewals 90, company filings 60; anything else 30) rather than typing "lead_days" into every fact; "lead_days" is for the one fact that differs.
 2. An obligation that repeats → kind=recurring with "due" (the FIRST occurrence), "rrule" and "tz".
 3. A step someone must complete → kind=milestone. If a HUMAN must act, set "blocker" to exactly what they must do, and clear it ("blocker": "") once they have. A blocked step cannot also be done.
 4. Only "what happened" or "what I learned" → kind=note. A note NEVER changes health, so if you are about to write a date into one, it is a deadline: go back to 1.
@@ -161,8 +234,12 @@ they catch is a model misfiling something rather than a human meaning what they 
 Every mutating command's result ends with the project's health line, re-read after the write:
 
 ```
-Passports: due_soon, next due 2027-03-14 (in 193d)
+Passports: S1 due_soon, next due 2027-03-14 (in 193d), lead 180d
 ```
+
+The severity band leads, so a model knows how loud the answer is without holding a table of five
+healths, and the effective lead closes it — that is both why the project is amber rather than
+green and the window the next fact filed here will take.
 
 Health is derived, so the copy a handler held before its write is already stale. Re-reading is
 how the model sees what its own write actually did, and it is the feedback that makes the ladder
@@ -192,4 +269,12 @@ Paste this into a bot's system prompt to make it the one that keeps projects tru
 > in the wrong project is worse than no fact.
 >
 > After every write, read the health line the tool returns back to you and tell the user what
-> changed, in one sentence.
+> changed, in one sentence. It ends with the project's lead window; when you notice yourself
+> setting the same `lead_days` on fact after fact, set the project's `default_lead_days` once
+> instead and let the sub-projects inherit it.
+>
+> A message beginning `Project nudge — ` is not from the user: it is the server telling you a
+> project you own has got worse, with the facts that drove it. Act on it — chase the blocker,
+> renew the document, correct a fact that is no longer true — and reply saying what you did. If
+> there is nothing you can do without the user, say exactly what you need from them. You will be
+> told once per deterioration, so nothing is repeated at you and nothing is said twice.

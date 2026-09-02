@@ -733,8 +733,8 @@ func TestToolHealthLinesCarrySeverity(t *testing.T) {
 	tb := NewBotToolbox(s, bot.ID, nil)
 
 	created := runProject(t, tb, `{"command":"create","project":"Passports"}`)
-	if !strings.HasSuffix(created, "Passports: S2 unknown") {
-		t.Errorf("create = %q, want it to end with a severity-led health line", created)
+	if !strings.HasSuffix(created, "Passports: S2 unknown, lead 30d") {
+		t.Errorf("create = %q, want it to end with a severity-led health line naming the lead", created)
 	}
 	due := time.Now().UTC().AddDate(0, 0, 20).Format(time.RFC3339)
 	added := runProject(t, tb, `{"command":"add_fact","project":"Passports","kind":"deadline",`+

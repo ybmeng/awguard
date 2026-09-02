@@ -308,7 +308,7 @@ func TestMutatingResultsEndWithHealth(t *testing.T) {
 	tb := NewBotToolbox(s, bot.ID, nil)
 
 	created := runProject(t, tb, `{"command":"create","project":"Passports","goal":"keep them valid"}`)
-	if !strings.HasSuffix(created, "Passports: S2 unknown") {
+	if !strings.HasSuffix(created, "Passports: S2 unknown, lead 30d") {
 		t.Errorf("create = %q, want it to end with the new project's health line", created)
 	}
 

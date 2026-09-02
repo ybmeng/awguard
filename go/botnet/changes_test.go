@@ -299,6 +299,22 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 	expectRows(t, logAfter(t, s, mark),
 		[]changeRow{{"fact", string(milestone.ID), "destroyed"}}, "DeleteFact")
 
+	// TickProjects is the one write path that runs on a SCHEDULE. A tick that
+	// only observes emits the project's own updated row — no owner, so nothing
+	// is told — and a tick that finds nothing new emits nothing at all, which is
+	// what keeps an hourly clock from moving the sync token every hour.
+	mark = topSeq(t, s)
+	if _, err := s.TickProjects(time.Now().UTC()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark),
+		[]changeRow{{"project", string(project.ID), "updated"}}, "TickProjects (observed)")
+	mark = topSeq(t, s)
+	if _, err := s.TickProjects(time.Now().UTC()); err != nil {
+		t.Fatalf("second tick: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark), nil, "TickProjects (nothing new)")
+
 	// DeleteProject CASCADES to its whole SUBTREE and to every fact under it, as
 	// explicit per-row DELETEs, so a sync client is never left holding a fact —
 	// or a sub-project — of a project it saw die.

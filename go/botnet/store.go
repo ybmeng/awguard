@@ -201,7 +201,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_calendars_name ON calendars(name COLLATE N
 -- see the Project DECISIONs in schema.go. Name uniqueness is case-insensitive
 -- and the index enforces it, exactly as calendars do — globally, NOT per
 -- parent, so the name a user says out loud addresses one project whatever the
--- hierarchy looks like. parent_id rides the guarded column list below.
+-- hierarchy looks like. parent_id, default_lead_days, owner_bot_id and
+-- last_health ride the guarded column list below.
 CREATE TABLE IF NOT EXISTS projects (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
@@ -356,6 +357,16 @@ END;
 		// every project written before hierarchy existed IS a top-level project,
 		// which is exactly what '' means.
 		{"projects", "parent_id", `TEXT NOT NULL DEFAULT ''`},
+		// The project's inherited lead threshold. 0 is the real default and
+		// means "unset — take it from above", so a project written before the
+		// column existed reads the global default with no backfill to run.
+		{"projects", "default_lead_days", `INTEGER NOT NULL DEFAULT 0`},
+		// The owner bot and the tick's bookkeeping. '' is the real default for
+		// both — "nobody owns this" and "never ticked" — so a pre-nudge row
+		// needs no backfill and, having no recorded health, nudges on the first
+		// tick that finds it already unwell.
+		{"projects", "owner_bot_id", `TEXT NOT NULL DEFAULT ''`},
+		{"projects", "last_health", `TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, c := range added {
 		if err := s.addColumn(c.table, c.column, c.decl); err != nil {
@@ -1145,6 +1156,14 @@ func (s *Store) Seal(seg Segment, summary string) error {
 
 // DeleteBot removes a bot, its entire conversation and its segment chain.
 func (s *Store) DeleteBot(id BotID) error {
+	// The projects this bot owned lose their owner explicitly rather than being
+	// left with a pointer at a thread that no longer exists. One statement, and
+	// SQLite's row triggers fire per row, so the change feed carries a real
+	// project-updated row for each — the DeleteProject cascade's shape exactly.
+	if _, err := s.db.Exec(`UPDATE projects SET owner_bot_id = '', updated_at = ? WHERE owner_bot_id = ?`,
+		fmtEventTime(time.Now().UTC().Truncate(time.Second)), id); err != nil {
+		return fmt.Errorf("clear the projects this bot owned: %w", err)
+	}
 	if _, err := s.db.Exec(`DELETE FROM messages WHERE bot_id = ?`, id); err != nil {
 		return fmt.Errorf("delete bot messages: %w", err)
 	}
@@ -1201,6 +1220,27 @@ func (s *Store) ListBots(netID string) ([]Bot, error) {
 		 ORDER BY COALESCE(NULLIF(last_message_at, ''), created_at) DESC, rowid DESC`, netID)
 	if err != nil {
 		return nil, fmt.Errorf("list bots: %w", err)
+	}
+	defer rows.Close()
+	var out []Bot
+	for rows.Next() {
+		b, err := scanBot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan bot: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// AllBots returns every bot in the database, in display-name order. It is the
+// roster the project tool resolves an owner NAME against and lists back when
+// the name matches none or several — a net-less read, because the tool has a
+// calling bot rather than a net, and the MVP has exactly one net anyway.
+func (s *Store) AllBots() ([]Bot, error) {
+	rows, err := s.db.Query(`SELECT ` + botColumns + ` FROM bots ORDER BY display_name COLLATE NOCASE, rowid`)
+	if err != nil {
+		return nil, fmt.Errorf("list every bot: %w", err)
 	}
 	defer rows.Close()
 	var out []Bot

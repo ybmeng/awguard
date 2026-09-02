@@ -292,7 +292,7 @@ func validateFact(f Fact) error {
 	return nil
 }
 
-// validateProject holds a project's own two rules, for the same reason.
+// validateProject holds a project's own rules, for the same reason.
 func validateProject(p Project) error {
 	if p.Name == "" {
 		return fmt.Errorf("%w: name must not be empty", ErrInvalid)
@@ -300,17 +300,22 @@ func validateProject(p Project) error {
 	if len([]rune(p.Name)) > 64 {
 		return fmt.Errorf("%w: name must be at most 64 characters", ErrInvalid)
 	}
+	if p.DefaultLeadDays < 0 {
+		return fmt.Errorf("%w: defaultLeadDays must be 0 or more, not %d", ErrInvalid, p.DefaultLeadDays)
+	}
 	return nil
 }
 
 // ── Projects ──────────────────────────────────────────────────────────────────
 
-const projectColumns = `id, name, goal, parent_id, created_by, created_at, updated_at`
+const projectColumns = `id, name, goal, parent_id, default_lead_days, owner_bot_id, last_health,
+	created_by, created_at, updated_at`
 
 func scanProject(sc interface{ Scan(...any) error }) (Project, error) {
 	var p Project
 	var createdAt, updatedAt string
-	if err := sc.Scan(&p.ID, &p.Name, &p.Goal, &p.ParentID, &p.CreatedBy, &createdAt, &updatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.Name, &p.Goal, &p.ParentID, &p.DefaultLeadDays,
+		&p.OwnerBot, &p.LastHealth, &p.CreatedBy, &createdAt, &updatedAt); err != nil {
 		return Project{}, err
 	}
 	var err error
@@ -322,7 +327,23 @@ func scanProject(sc interface{ Scan(...any) error }) (Project, error) {
 	}
 	p.Health = HealthUnknown
 	p.Severity = severityFor(HealthUnknown)
+	// The un-inherited answers, so a project read on its own — getProject inside
+	// a write transaction — still names a usable window and its own owner.
+	// loadForest overwrites both with the ancestor's the moment the tree is in
+	// hand, and it is loadForest that decides whether the owner still exists.
+	p.EffectiveLeadDays = leadOrGlobal(p.DefaultLeadDays)
+	p.EffectiveOwner = p.OwnerBot
 	return p, nil
+}
+
+// leadOrGlobal is the bottom of the inheritance chain: a project's own default
+// when it set one, else the global 30. One function, so "0 means unset" is
+// decided once rather than at every reader.
+func leadOrGlobal(own int) int {
+	if own > 0 {
+		return own
+	}
+	return defaultLeadDays
 }
 
 // hydrate fills the derived fields from the project's OWN facts. It is the only
@@ -347,7 +368,30 @@ func hydrate(p *Project, facts []Fact, now time.Time) {
 type projectForest struct {
 	byID     map[ProjectID]*Project
 	children map[ProjectID][]*Project // direct children, in list order
+	facts    map[ProjectID][]Fact     // own facts, in insertion order
 	sorted   []Project                // every project, most urgent first
+	now      time.Time                // the clock every project here was judged against
+}
+
+// liveBots is the set of bot ids that still exist. It is read once per
+// derivation so a dangling owner — a hand-edited row, or a bot deleted by a
+// process that predates the clearing cascade — reads as unset rather than as an
+// owner whose thread nobody can open.
+func liveBots(q dbtx) (map[BotID]bool, error) {
+	rows, err := q.Query(`SELECT id FROM bots`)
+	if err != nil {
+		return nil, fmt.Errorf("read the bot roster: %w", err)
+	}
+	defer rows.Close()
+	live := map[BotID]bool{}
+	for rows.Next() {
+		var id BotID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan a bot id: %w", err)
+		}
+		live[id] = true
+	}
+	return live, rows.Err()
 }
 
 // loadForest reads the projects and the facts once each and derives everything
@@ -379,10 +423,25 @@ func loadForest(q dbtx, now time.Time) (*projectForest, error) {
 	for _, f := range facts {
 		byProject[f.ProjectID] = append(byProject[f.ProjectID], f)
 	}
+	live, err := liveBots(q)
+	if err != nil {
+		return nil, err
+	}
 
-	f := &projectForest{byID: map[ProjectID]*Project{}, children: map[ProjectID][]*Project{}}
+	f := &projectForest{
+		byID:     map[ProjectID]*Project{},
+		children: map[ProjectID][]*Project{},
+		facts:    byProject,
+		now:      now,
+	}
 	for _, p := range nodes {
 		hydrate(p, byProject[p.ID], now)
+		// An owner whose bot is gone reads as no owner at all, in BOTH fields:
+		// a client must never render, or a tick address, a thread that is not
+		// there. DeleteBot clears the stored value to agree.
+		if p.OwnerBot != "" && !live[p.OwnerBot] {
+			p.OwnerBot, p.EffectiveOwner = "", ""
+		}
 		f.byID[p.ID] = p
 	}
 	// A pointer at a project that is gone makes an ORPHAN, and an orphan is a
@@ -413,21 +472,34 @@ func loadForest(q dbtx, now time.Time) (*projectForest, error) {
 	return f, nil
 }
 
-// rollUp folds each subtree's worst health and nearest date into its root, in
-// ONE post-order walk of the forest — every project is visited once whatever
-// the depth. A project not reachable from any root can only be part of a stored
-// cycle, which the write boundary refuses; it keeps its own derived values
-// rather than hanging the read.
+// rollUp is the forest's ONE tree walk, and it carries both directions at once:
+// the inherited answers (the lead threshold, the owner) flow DOWN into each
+// child before the recursion, and the worst health and nearest date fold UP into
+// the parent after it. Every project is visited once whatever the depth.
+//
+// A project not reachable from any root can only be part of a stored cycle,
+// which the write boundary refuses; it keeps the un-inherited values scanProject
+// and hydrate already gave it rather than hanging the read.
 func (f *projectForest) rollUp(roots []*Project) {
 	done := map[ProjectID]bool{}
-	var walk func(p *Project)
-	walk = func(p *Project) {
+	var walk func(p *Project, inheritedLead int, inheritedOwner BotID)
+	walk = func(p *Project, inheritedLead int, inheritedOwner BotID) {
 		if done[p.ID] {
 			return
 		}
 		done[p.ID] = true
+		// Own value wins; otherwise the nearest ancestor's answer, which is
+		// exactly what the parent resolved a level up.
+		p.EffectiveLeadDays = inheritedLead
+		if p.DefaultLeadDays > 0 {
+			p.EffectiveLeadDays = p.DefaultLeadDays
+		}
+		p.EffectiveOwner = inheritedOwner
+		if p.OwnerBot != "" {
+			p.EffectiveOwner = p.OwnerBot
+		}
 		for _, c := range f.children[p.ID] {
-			walk(c)
+			walk(c, p.EffectiveLeadDays, p.EffectiveOwner)
 			if healthRank[c.Health] > healthRank[p.Health] {
 				p.Health = c.Health
 			}
@@ -439,7 +511,8 @@ func (f *projectForest) rollUp(roots []*Project) {
 		p.Severity = severityFor(p.Health)
 	}
 	for _, r := range roots {
-		walk(r)
+		// A root inherits from nothing: the global lead default, and no owner.
+		walk(r, defaultLeadDays, "")
 	}
 }
 
@@ -601,7 +674,11 @@ func (s *Store) CreateProject(in Project, createdBy string) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
-	return p, nil
+	// Re-derived after the write for the same reason UpdateProject is: the
+	// inherited threshold and the rolled-up health are answers about the TREE,
+	// and the row the insert produced knows nothing about where it landed.
+	p, _, err = s.GetProject(p.ID)
+	return p, err
 }
 
 // createProject is the one insert path. The dup-name check, the parent check
@@ -611,15 +688,17 @@ func (s *Store) CreateProject(in Project, createdBy string) (Project, error) {
 func createProject(q dbtx, in Project, createdBy string) (Project, error) {
 	now := time.Now().UTC().Truncate(time.Second)
 	p := Project{
-		ID:        ProjectID(newID("prj_")),
-		Name:      strings.TrimSpace(in.Name),
-		Goal:      in.Goal,
-		ParentID:  in.ParentID,
-		CreatedBy: createdBy,
-		CreatedAt: now,
-		UpdatedAt: now,
-		Health:    HealthUnknown,
-		Severity:  severityFor(HealthUnknown),
+		ID:              ProjectID(newID("prj_")),
+		Name:            strings.TrimSpace(in.Name),
+		Goal:            in.Goal,
+		ParentID:        in.ParentID,
+		DefaultLeadDays: in.DefaultLeadDays,
+		OwnerBot:        in.OwnerBot,
+		CreatedBy:       createdBy,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		Health:          HealthUnknown,
+		Severity:        severityFor(HealthUnknown),
 	}
 	if err := validateProject(p); err != nil {
 		return Project{}, err
@@ -635,12 +714,31 @@ func createProject(q dbtx, in Project, createdBy string) (Project, error) {
 	if err := requireParentable(q, p, p.ParentID); err != nil {
 		return Project{}, err
 	}
-	if _, err := q.Exec(`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, p.Name, p.Goal, p.ParentID, p.CreatedBy,
+	if err := requireOwner(q, p.OwnerBot); err != nil {
+		return Project{}, err
+	}
+	if _, err := q.Exec(`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Name, p.Goal, p.ParentID, p.DefaultLeadDays, p.OwnerBot, p.LastHealth, p.CreatedBy,
 		fmtEventTime(p.CreatedAt), fmtEventTime(p.UpdatedAt)); err != nil {
 		return Project{}, fmt.Errorf("create project: %w", err)
 	}
 	return p, nil
+}
+
+// requireOwner is the owner pointer's whole validation, run at the write
+// boundary by BOTH create and update for the same reason requireParentable is:
+// naming an owner that does not exist would give a project a thread to be
+// nudged in that nobody can read. "" is legal and means nobody owns it.
+func requireOwner(q dbtx, owner BotID) error {
+	if owner == "" {
+		return nil
+	}
+	if _, err := getBot(q, owner); errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("%w: no bot %s to own this project", ErrNotFound, owner)
+	} else if err != nil {
+		return err
+	}
+	return nil
 }
 
 // GetProject loads one project with its facts, both hydrated: the project's
@@ -737,6 +835,12 @@ type ProjectPatch struct {
 	Name     *string    `json:"name"`
 	Goal     *string    `json:"goal"`
 	ParentID *ProjectID `json:"parentId"`
+
+	// DefaultLeadDays and OwnerBot are pointers for the same reason ParentID is:
+	// a patch to 0 / "" CLEARS the project's own value and lets the ancestor's
+	// apply again, which must not read the same as leaving it alone.
+	DefaultLeadDays *int   `json:"defaultLeadDays"`
+	OwnerBot        *BotID `json:"ownerBot"`
 }
 
 // UpdateProject applies a partial patch and returns the project as stored,
@@ -762,6 +866,12 @@ func (s *Store) UpdateProject(id ProjectID, p ProjectPatch) (Project, error) {
 		if p.ParentID != nil {
 			out.ParentID = *p.ParentID
 		}
+		if p.DefaultLeadDays != nil {
+			out.DefaultLeadDays = *p.DefaultLeadDays
+		}
+		if p.OwnerBot != nil {
+			out.OwnerBot = *p.OwnerBot
+		}
 		if err := validateProject(out); err != nil {
 			return err
 		}
@@ -775,9 +885,15 @@ func (s *Store) UpdateProject(id ProjectID, p ProjectPatch) (Project, error) {
 		if err := requireParentable(q, out, out.ParentID); err != nil {
 			return err
 		}
+		if err := requireOwner(q, out.OwnerBot); err != nil {
+			return err
+		}
 		out.UpdatedAt = time.Now().UTC().Truncate(time.Second)
-		if _, err := q.Exec(`UPDATE projects SET name = ?, goal = ?, parent_id = ?, updated_at = ? WHERE id = ?`,
-			out.Name, out.Goal, out.ParentID, fmtEventTime(out.UpdatedAt), id); err != nil {
+		if _, err := q.Exec(
+			`UPDATE projects SET name = ?, goal = ?, parent_id = ?, default_lead_days = ?,
+			        owner_bot_id = ?, updated_at = ? WHERE id = ?`,
+			out.Name, out.Goal, out.ParentID, out.DefaultLeadDays, out.OwnerBot,
+			fmtEventTime(out.UpdatedAt), id); err != nil {
 			return fmt.Errorf("update project: %w", err)
 		}
 		if renamed {
@@ -858,10 +974,15 @@ func scanFact(sc interface{ Scan(...any) error }) (Fact, error) {
 
 // CreateFact stores one fact on a project and returns it as stored. The id, the
 // author and both timestamps are stamped here; a dated kind created with no
-// lead takes the 30-day default (a caller wanting no lead window patches it to
+// lead takes the project's EFFECTIVE lead — its own threshold, the nearest
+// ancestor's, or the global 30 (a caller wanting no lead window patches it to
 // zero afterwards, which is the one way to say "exactly on the day"). The
 // project lookup, the projection and the insert share a transaction, so the
 // project cannot be deleted out from under the fact between them.
+//
+// The lead is read from the forest INSIDE that transaction rather than from a
+// bare row: the threshold is an answer about the tree, and deriving it here is
+// what keeps one derivation rather than a second copy of the inheritance rule.
 func (s *Store) CreateFact(projectID ProjectID, f Fact, createdBy string) (Fact, error) {
 	now := time.Now().UTC().Truncate(time.Second)
 	f.ID = FactID(newID("fct_"))
@@ -870,21 +991,27 @@ func (s *Store) CreateFact(projectID ProjectID, f Fact, createdBy string) (Fact,
 	f.CreatedAt, f.UpdatedAt = now, now
 	f.Title = strings.TrimSpace(f.Title)
 	f.Due = f.Due.UTC().Truncate(time.Second)
-	if f.LeadDays == 0 && !f.Due.IsZero() {
-		f.LeadDays = defaultLeadDays
-	}
-	if err := validateFact(f); err != nil {
-		return Fact{}, err
-	}
 	err := s.tx(func(q dbtx) error {
-		p, err := getProject(q, projectID)
+		forest, err := loadForest(q, now)
 		if err != nil {
+			return err
+		}
+		p, ok := forest.byID[projectID]
+		if !ok {
+			return ErrNotFound
+		}
+		if f.LeadDays == 0 && !f.Due.IsZero() {
+			f.LeadDays = p.EffectiveLeadDays
+		}
+		// Validated against the fact as it will be STORED, lead included, so
+		// the write boundary judges the same value every reader will see.
+		if err := validateFact(f); err != nil {
 			return err
 		}
 		if err := requireUniqueTitle(q, projectID, "", f.Title); err != nil {
 			return err
 		}
-		if f, err = projectFact(q, p, f); err != nil {
+		if f, err = projectFact(q, *p, f); err != nil {
 			return err
 		}
 		return insertFact(q, f)
@@ -1137,6 +1264,275 @@ func queryFacts(q dbtx, where string, args ...any) ([]Fact, error) {
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+// ── The tick ──────────────────────────────────────────────────────────────────
+// The nudge: one pass over the forest that tells each project's owner, once,
+// that its project has got worse. It is the only thing in the service with
+// stored state (last_health) and the only thing that writes on a schedule.
+//
+// DECISION (compare against what the LAST TICK saw, not against a timer): the
+// question a nudge answers is "has this changed for the worse since I last
+// looked", so the memory it needs is one health per project, not a delivery log
+// and not a cooldown. Two consequences fall out for free: a project that stays
+// overdue is not re-announced every hour, and a project that goes overdue,
+// gets fixed and goes overdue again IS announced twice, because that is two
+// pieces of news.
+//
+// DECISION (an empty last_health counts as ok): so a project that is ALREADY
+// overdue when the tick first meets it — the migration case, and a project
+// created between two ticks — nudges immediately rather than being silently
+// adopted as the new normal. A project that is healthy on its first tick just
+// records, because ok-to-ok is not a worsening.
+
+// projectNudgePrefix opens every nudge message. It is the one recognisable
+// thing about it: a nudge is an ordinary user-role message so no client needs a
+// new rendering, and this is what lets a reader (or a test) tell one apart.
+const projectNudgePrefix = "Project nudge — "
+
+// nudgeFactLimit caps the facts a nudge lists. A project of thirty blocked
+// milestones is a wall of text the model will skim; five is what the message
+// can say and still be read.
+const nudgeFactLimit = 5
+
+// ProjectNudge is one delivered nudge, as the tick's response reports it.
+type ProjectNudge struct {
+	Project string        `json:"project"`
+	Bot     BotID         `json:"bot"`
+	From    ProjectHealth `json:"from"`
+	To      ProjectHealth `json:"to"`
+
+	// The append this nudge made, so the server can start the model turn for it
+	// the way sendMessage does. Unexported: it is a handoff inside the package,
+	// not part of what the tick serves.
+	bot     Bot
+	message Message
+}
+
+// ProjectSkip is a project that WORSENED and could not be told, with the reason
+// — the tick's most useful diagnostic, because those are the ones whose news is
+// still pending on the next run.
+type ProjectSkip struct {
+	Project string `json:"project"`
+	Reason  string `json:"reason"`
+}
+
+// ProjectTick is what POST /v1/projects/tick answers. Both lists are always
+// arrays: a client has no nil case for either.
+type ProjectTick struct {
+	Checked int            `json:"checked"`
+	Nudged  []ProjectNudge `json:"nudged"`
+	Skipped []ProjectSkip  `json:"skipped"`
+}
+
+// TickProjects is the whole nudge, as ONE function over ONE derivation of the
+// forest at `at`. Each project's verdict is decided from that derivation and
+// applied in its own transaction, so a failure part-way leaves the projects
+// already handled correctly recorded and the rest simply untouched — the next
+// tick picks them up, because nothing about the decision depends on this run
+// having happened.
+//
+// The append and the last_health write share that transaction, which is the
+// whole of the idempotence argument: there is no instant at which a bot has
+// been told and the project does not know, or the project is marked and the bot
+// never heard.
+func (s *Store) TickProjects(at time.Time) (ProjectTick, error) {
+	at = at.UTC()
+	forest, err := loadForest(s.db, at)
+	if err != nil {
+		return ProjectTick{}, err
+	}
+	out := ProjectTick{Nudged: []ProjectNudge{}, Skipped: []ProjectSkip{}}
+	// forest.sorted is urgency-first, so the worst news is delivered first and
+	// the response reads in the order a person would want it.
+	for _, snapshot := range forest.sorted {
+		p := forest.byID[snapshot.ID]
+		out.Checked++
+		prev := p.LastHealth
+		if prev == "" {
+			prev = HealthOK
+		}
+		if healthRank[p.Health] <= healthRank[prev] {
+			// Not worse: record it silently, so the NEXT deterioration is
+			// measured from where the project actually is. Writing only on a
+			// change keeps a steady-state tick from emitting change rows.
+			if p.Health != p.LastHealth {
+				if err := s.recordHealth(p.ID, p.Health); err != nil {
+					return out, err
+				}
+			}
+			continue
+		}
+		owner := p.EffectiveOwner
+		if owner == "" {
+			out.Skipped = append(out.Skipped, ProjectSkip{p.Name,
+				"got worse but no bot owns it — set an owner on it or on a project above it"})
+			continue
+		}
+		nudge, skipped, err := s.nudge(at, *p, prev, forest.drivingFacts(p.ID))
+		if err != nil {
+			return out, err
+		}
+		if skipped != "" {
+			out.Skipped = append(out.Skipped, ProjectSkip{p.Name, skipped})
+			continue
+		}
+		out.Nudged = append(out.Nudged, nudge)
+	}
+	return out, nil
+}
+
+// recordHealth stamps what the tick observed. It is a field-only UPDATE, so the
+// projects row trigger captures it like any other and a second client refetches
+// a project whose condition the tick just noticed.
+func (s *Store) recordHealth(id ProjectID, h ProjectHealth) error {
+	if _, err := s.db.Exec(`UPDATE projects SET last_health = ? WHERE id = ?`, h, id); err != nil {
+		return fmt.Errorf("record project health: %w", err)
+	}
+	return nil
+}
+
+// nudge appends one nudge to the owner's thread and stamps last_health in the
+// SAME transaction. It returns a non-empty reason instead when the bot cannot
+// take the message right now — a turn already in flight — and then writes
+// nothing at all, so the news survives to the next tick.
+//
+// The append is claimBot + appendMessage: exactly what POST /v1/bots/{id}/
+// messages does, which is what makes the turn start, the reply land in the
+// transcript, and the UI need no new rendering.
+func (s *Store) nudge(at time.Time, p Project, prev ProjectHealth, facts []Fact) (ProjectNudge, string, error) {
+	out := ProjectNudge{Project: p.Name, Bot: p.EffectiveOwner, From: prev, To: p.Health}
+	busy := ""
+	err := s.tx(func(q dbtx) error {
+		bot, err := getBot(q, p.EffectiveOwner)
+		if errors.Is(err, ErrNotFound) {
+			// The bot went between the derivation and this transaction. Treat
+			// it as the ownerless case: nothing written, next tick re-decides.
+			busy = "got worse but its owner bot no longer exists"
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := claimBot(q, p.EffectiveOwner); errors.Is(err, ErrBusy) {
+			busy = "got worse but " + bot.DisplayName + " is busy with a turn already in flight"
+			return nil
+		} else if err != nil {
+			return err
+		}
+		msg, err := appendMessage(q, "", p.EffectiveOwner, "user",
+			nudgeMessage(at, p, prev, facts), StatusAwaiting, nil, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := q.Exec(`UPDATE projects SET last_health = ? WHERE id = ?`, p.Health, p.ID); err != nil {
+			return fmt.Errorf("record project health: %w", err)
+		}
+		out.bot, out.message = bot, msg
+		return nil
+	})
+	if err != nil {
+		return ProjectNudge{}, "", err
+	}
+	return out, busy, nil
+}
+
+// drivingFacts is what the nudge lists: the undone facts anywhere in the
+// project's SUBTREE that are as loud as the project now is.
+//
+// DECISION (the band, not the exact health): a project reading blocked is
+// driven by its blocked milestones AND by anything else in the same severity
+// band, because those are the things a person would act on together — and
+// matching on the exact health would leave a due_soon deadline unmentioned
+// beside a blocked step that outranks it by one. Subtree, not own facts,
+// because health rolled up: a parent's nudge has to name the child's fact that
+// caused it, or the message points at nothing.
+func (f *projectForest) drivingFacts(root ProjectID) []Fact {
+	want := severityFor(f.byID[root].Health)
+	var out []Fact
+	seen := map[ProjectID]bool{}
+	var walk func(id ProjectID)
+	walk = func(id ProjectID) {
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		for _, fact := range f.facts[id] {
+			if fact.Done {
+				continue
+			}
+			signal, ok := factSignals[fact.Kind]
+			if !ok {
+				continue
+			}
+			health, _ := signal(fact, f.now)
+			if severityFor(health) == want && health != HealthOK {
+				out = append(out, fact)
+			}
+		}
+		for _, c := range f.children[id] {
+			walk(c.ID)
+		}
+	}
+	walk(root)
+	// Most urgent first, so a truncated list keeps the facts that matter: the
+	// dated ones by date, then everything undated in the order it was written.
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := factBand(out[i]), factBand(out[j])
+		if a != b {
+			return a < b
+		}
+		if a == bandDated {
+			return out[i].Due.Before(out[j].Due)
+		}
+		return false
+	})
+	if len(out) > nudgeFactLimit {
+		out = out[:nudgeFactLimit]
+	}
+	return out
+}
+
+// nudgeMessage renders the message the owner reads. It says what changed, which
+// facts drove it, and what to do — in that order, because a model that stops
+// reading after the first line has still learned the thing that matters.
+func nudgeMessage(at time.Time, p Project, prev ProjectHealth, facts []Fact) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s%s is now %s %s (was %s %s). Facts driving it:",
+		projectNudgePrefix, p.Name, p.Severity, p.Health, severityFor(prev), prev)
+	if len(facts) == 0 {
+		// Only reachable if the facts moved between the derivation and here.
+		// Saying so beats an empty list the model reads as "nothing to do".
+		b.WriteString("\n- (the facts have changed since; call the project tool to see them)")
+	}
+	for _, f := range facts {
+		fmt.Fprintf(&b, "\n- %s", nudgeFactLine(at, f))
+	}
+	b.WriteString("\nAct on it or update the facts with the project tool; reply with what you did.")
+	return b.String()
+}
+
+// nudgeFactLine is one fact as the nudge names it: enough to act on without
+// calling the tool, and short enough that five of them still read as a list.
+func nudgeFactLine(now time.Time, f Fact) string {
+	if f.Blocker != "" {
+		return fmt.Sprintf("%s: blocked — %s", f.Title, f.Blocker)
+	}
+	signal, ok := factSignals[f.Kind]
+	if !ok {
+		return f.Title
+	}
+	_, due := signal(f, now)
+	if due.IsZero() {
+		return f.Title
+	}
+	local := due.Local()
+	if local.Before(now) {
+		return fmt.Sprintf("%s: due %s (%dd overdue, lead %dd)",
+			f.Title, local.Format(time.DateOnly), wholeDays(now.Sub(local)), f.LeadDays)
+	}
+	return fmt.Sprintf("%s: due %s (in %dd, lead %dd)",
+		f.Title, local.Format(time.DateOnly), wholeDays(local.Sub(now)), f.LeadDays)
 }
 
 // ── Calendar projection ───────────────────────────────────────────────────────

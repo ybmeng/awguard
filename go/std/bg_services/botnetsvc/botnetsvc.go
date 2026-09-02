@@ -38,6 +38,17 @@ func DefaultAddr() string {
 	return "127.0.0.1:8730"
 }
 
+// ResolveAddr applies the "empty means the default" rule New applies, for the
+// callers that need to KNOW the address rather than just listen on it — the
+// execcal bridge and ping's projects clock both build a URL from it, and an
+// unresolved empty string would send them somewhere nothing answers.
+func ResolveAddr(addr string) string {
+	if addr == "" {
+		return DefaultAddr()
+	}
+	return addr
+}
+
 // DefaultDBPath is the SQLite path: $BOTNET_DB, else ~/.botnet/net.db.
 func DefaultDBPath() string {
 	if v := os.Getenv("BOTNET_DB"); v != "" {

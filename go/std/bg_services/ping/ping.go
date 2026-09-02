@@ -126,6 +126,13 @@ func (s *Service) Name() string { return "ping" }
 // Root returns the absolute root directory the service operates in.
 func (s *Service) Root() string { return s.root }
 
+// Targets returns the BUILT-IN targets, a copy. It exists so stdd's wiring test
+// can assert the roster of clocks: ping is the only clock in the system, so a
+// target dropped from services() is a pipeline that silently never runs, and
+// that is worth a test rather than a reading. The file targets are deliberately
+// absent — they are operator input, read fresh at Run.
+func (s *Service) Targets() []Target { return append([]Target(nil), s.targets...) }
+
 // Run pings every target — built-in plus any from targets.json — on its own
 // interval until ctx is canceled. The first ping fires immediately, so the
 // system converges right at startup instead of one interval later.

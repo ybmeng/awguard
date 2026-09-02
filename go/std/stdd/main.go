@@ -78,12 +78,19 @@ Automations flags (run, install):
 // services builds the full roster of std background services. The firing
 // pipeline is wired here: ping (the only clock) ticks execcal every minute
 // and the automations service every five; execcal bridges the botnet
-// calendar's fireable instances to automations /fire.
+// calendar's fireable instances to automations /fire. ping also drives the
+// projects nudge hourly, straight into botnet — the second thing in the system
+// that happens without anyone asking, and the only one that talks to a person.
 func services(root string, interval time.Duration, syncer artifacts.Syncer, bot botnetsvc.Config, automationsRepo string) ([]bgservices.Service, error) {
 	art, err := artifacts.New(artifacts.Config{Root: root, Interval: interval, Syncer: syncer})
 	if err != nil {
 		return nil, err
 	}
+	// Resolved ONCE, here, because three things now derive from it — the
+	// listener, execcal's bridge and ping's projects clock — and botnetsvc.New
+	// would otherwise resolve an empty Addr privately, leaving the two callers
+	// pointed at an address nothing is listening on.
+	bot.Addr = botnetsvc.ResolveAddr(bot.Addr)
 	// The automations service is constructed FIRST so its handler can be
 	// mounted into botnet: the app talks to exactly one backend (botnet's
 	// TCP port), which bridges the client-facing automations routes
@@ -107,6 +114,12 @@ func services(root string, interval time.Duration, syncer artifacts.Syncer, bot 
 	pinger, err := ping.New(ping.Config{Root: root, Targets: []ping.Target{
 		{Name: "execcal-tick", URL: "unix://" + execcal.SocketPath(root) + "/tick", Interval: time.Minute},
 		{Name: "automations-tick", URL: "unix://" + automations.SocketPath(root) + "/tick", Interval: 5 * time.Minute},
+		// The projects nudge. It is a TCP call to botnet's own address rather
+		// than a unix socket, because the projects service has no socket of its
+		// own — it lives inside botnet. Hourly: the thing it watches is a
+		// deadline crossing a lead window measured in days, so a finer clock
+		// would only wake a model sooner to say the same thing.
+		{Name: "projects-tick", URL: "http://" + bot.Addr + "/v1/projects/tick", Interval: time.Hour},
 	}})
 	if err != nil {
 		return nil, err
