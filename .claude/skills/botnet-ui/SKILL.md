@@ -267,6 +267,16 @@ rediscover the hard way.
 - `PIPESTATUS` is empty in this shell. `cmd | grep …; echo $PIPESTATUS[0]`
   prints nothing and proves nothing. Redirect to a log and read `$?` on the
   next line.
+- A verdict label must be computed from the result, never printed beside
+  it. `git diff --stat; echo "[empty above = no churn]"` asserts a conclusion
+  the output can contradict, and an agent reported a stale pass that way.
+  Same family as the PIPESTATUS trap: branch on the value, then print.
+- After any commit that touches files your work lives in, re-run your gate
+  before calling your result current; a green from before the commit is not
+  evidence about HEAD.
+- The orchestrator commits by explicit file list, never `git add -A`, while
+  any agent may be writing: a sweep once captured half of an agent's
+  in-flight edit and left decode-check red on HEAD with both app builds green.
 - A scratch swiftc harness must not be named `main.swift`: it turns the file
   into top-level code and any `@main` in the shared sources stops compiling.
 - When the Go tree itself will not build (another agent mid-edit),
