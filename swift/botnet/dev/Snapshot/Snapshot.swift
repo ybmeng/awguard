@@ -16,7 +16,11 @@
 //   snapshot --project --add-fact [--fact-kind deadline|recurring|milestone|note]
 //                                           # its Add Fact sheet, rendered flat
 //   snapshot --project --edit               # its Edit Project sheet (Parent
-//                                           # picker), rendered flat
+//                                           # picker, Default lead, Owner),
+//                                           # rendered flat
+//   snapshot --project --new-sub-project    # the New Sub-project sheet under
+//                                           # it, whose thresholds read the
+//                                           # PARENT's inherited values
 //   snapshot --expand-projects <names>      # sidebar tree disclosed at those
 //                                           # projects (comma-joined names)
 //   snapshot --sidebar-search <text>        # with that typed in the sidebar's
@@ -57,6 +61,11 @@ private enum ProjectPaneSheet {
     /// Edit Project, whose Parent picker is the one place the subtree-exclusion
     /// rule is visible — worth a render, not just a code read.
     case edit
+    /// New Sub-project under the named project. The threshold rows read their
+    /// "inherited (N d)" off the PARENT here rather than off a project that
+    /// exists, which is a different code path from Edit's and so a different
+    /// render.
+    case newSubProject
 }
 
 @main
@@ -187,6 +196,9 @@ struct Snapshot {
                 project = first
             }
             if flags.contains("--edit") { return .project(project, sheet: .edit) }
+            if flags.contains("--new-sub-project") {
+                return .project(project, sheet: .newSubProject)
+            }
             guard flags.contains("--add-fact") else { return .project(project, sheet: nil) }
             // Loudly again: a typo'd kind would otherwise render the deadline
             // form and pass review as whatever kind was asked for.
@@ -282,7 +294,12 @@ struct Snapshot {
                         .background(Palette.chrome)
                 case .edit:
                     EditProjectSheet(project: project)
-                        .frame(width: 460, height: 320)
+                        .frame(width: 460, height: 340)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Palette.chrome)
+                case .newSubProject:
+                    NewProjectSheet(parent: project)
+                        .frame(width: 460, height: 340)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Palette.chrome)
                 case nil:

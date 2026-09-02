@@ -607,7 +607,7 @@ mutation.
 | `UpdateBot` | bot | updated (memory field included — a memory-only PATCH still emits) |
 | `SetMemory` | bot | updated (the model's memory tools, mid-turn) |
 | `MarkRead` | bot | updated |
-| `DeleteBot` | bot + its messages + its segments | destroyed (tombstones) |
+| `DeleteBot` | bot + its messages + its segments | destroyed (tombstones). ALSO project updated, one row per project the bot owned: the owner pointer is cleared first, by a single `UPDATE ... WHERE owner_bot_id = ?` whose row trigger fires per row |
 | `AppendMessage` | message | created (+ bot updated — list metadata changes) |
 | `SetMessageStatus` / `setStatus` | message | updated |
 | `CompleteTurn` | message | created (reply) + updated (user turn settles) |
@@ -628,6 +628,7 @@ mutation.
 | `CreateFact` | fact | created. A dated, undone fact ALSO emits event created first (its calendar projection), and the first such fact ever ALSO emits calendar created for the ensured "Projects" calendar |
 | `UpdateFact` | fact | updated (a field-only patch still emits — row trigger). The projection rides the same transaction: event updated, or created when the fact became dated/undone, or destroyed when it was marked done |
 | `DeleteFact` | fact + its projected event | destroyed (event first, then the fact) |
+| `TickProjects` | project | updated, at most one per project, only when its observed health MOVED. A project it NUDGES also emits message created + bot updated (the append is the ordinary `appendMessage` path), and those three rows share one transaction with the `last_health` write |
 
 Note `AppendMessage` also updates `bots.last_message_at`/`last_message_text`, so it emits
 **two** change rows (message created, bot updated). Easy to miss; the sidebar depends on it.
@@ -650,6 +651,17 @@ map order). **Project health, `nextDue` and `factCount` are derived reads** comp
 a client wanting current health refetches the project the feed named. The calendar events a
 fact projects are ordinary `events` rows and reach clients through the existing `event`
 bucket — no new entity, no new trigger.
+
+**Thresholds, owners and the nudge (2026-09-02) added ONE call site and NO entities.**
+`projects.default_lead_days`, `owner_bot_id` and `last_health` are fields on an already-triggered
+row, so every edit of them is the existing `CreateProject`/`UpdateProject` row. `effectiveLeadDays`
+and `effectiveOwner` are **derived reads** computed in the same forest pass as health: outside the
+feed, refetched with the project the feed named. The one genuinely new write path is
+`TickProjects`, and it is the only thing in the service that writes on a SCHEDULE rather than in
+response to a user — which is exactly why its rows are worth naming. Its nudge is a plain
+`appendMessage`, so it emits the same two rows a send does and needs no new bucket; the third row
+is the project's own, carrying `last_health`. A tick that changes nothing emits nothing, which is
+what keeps an hourly clock from moving the sync token every hour.
 
 The startup sweep **should** emit change rows — a client reconnecting after a restart needs
 to see those failures, and the state token will have moved regardless.

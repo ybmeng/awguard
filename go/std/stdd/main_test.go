@@ -13,6 +13,7 @@ import (
 	"stdtools/go/std/bg_services/artifacts"
 	"stdtools/go/std/bg_services/automations"
 	"stdtools/go/std/bg_services/botnetsvc"
+	"stdtools/go/std/bg_services/ping"
 )
 
 // writeFixtureAutomation writes one automation dir (README manifest + emit.sh)
@@ -184,5 +185,81 @@ func TestServicesBridgeAutomationsThroughBotnet(t *testing.T) {
 	}
 	if status, _ := do("POST", "/tick", nil); status != http.StatusNotFound {
 		t.Errorf("POST /tick through botnet = %d, want 404", status)
+	}
+}
+
+// TestServicesPingRoster pins the clocks stdd wires. ping is the only clock in
+// the system, so a target missing here is a pipeline that silently never runs —
+// and the projects nudge, unlike the other two, is an ordinary TCP call to the
+// botnet address rather than a unix socket.
+func TestServicesPingRoster(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "")
+	root, err := os.MkdirTemp("/tmp", "stddping")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+
+	const addr = "127.0.0.1:8799"
+	svcs, err := services(root, artifacts.DefaultInterval, artifacts.NopSyncer{}, botnetsvc.Config{
+		Addr:   addr,
+		DBPath: filepath.Join(root, "net.db"),
+	}, "")
+	if err != nil {
+		t.Fatalf("services: %v", err)
+	}
+	var pinger *ping.Service
+	for _, svc := range svcs {
+		if p, ok := svc.(*ping.Service); ok {
+			pinger = p
+		}
+	}
+	if pinger == nil {
+		t.Fatal("services() roster has no ping service")
+	}
+	got := map[string]ping.Target{}
+	for _, tgt := range pinger.Targets() {
+		got[tgt.Name] = tgt
+	}
+	for _, want := range []ping.Target{
+		{Name: "execcal-tick", Interval: time.Minute},
+		{Name: "automations-tick", Interval: 5 * time.Minute},
+		{Name: "projects-tick", URL: "http://" + addr + "/v1/projects/tick", Interval: time.Hour},
+	} {
+		tgt, ok := got[want.Name]
+		if !ok {
+			t.Errorf("ping roster has no %q target: %+v", want.Name, pinger.Targets())
+			continue
+		}
+		if tgt.Interval != want.Interval {
+			t.Errorf("%s interval = %s, want %s", want.Name, tgt.Interval, want.Interval)
+		}
+		if want.URL != "" && tgt.URL != want.URL {
+			t.Errorf("%s url = %q, want %q", want.Name, tgt.URL, want.URL)
+		}
+	}
+	if len(pinger.Targets()) != 3 {
+		t.Errorf("ping roster = %+v, want exactly the three built-in clocks", pinger.Targets())
+	}
+
+	// An unset Addr must resolve to the SAME default botnetsvc listens on, or
+	// the clock and the listener disagree and the nudge silently never fires.
+	t.Setenv("BOTNET_ADDR", "")
+	defaults, err := services(root, artifacts.DefaultInterval, artifacts.NopSyncer{}, botnetsvc.Config{
+		DBPath: filepath.Join(root, "net.db"),
+	}, "")
+	if err != nil {
+		t.Fatalf("services with no addr: %v", err)
+	}
+	for _, svc := range defaults {
+		p, ok := svc.(*ping.Service)
+		if !ok {
+			continue
+		}
+		for _, tgt := range p.Targets() {
+			if tgt.Name == "projects-tick" && tgt.URL != "http://"+botnetsvc.DefaultAddr()+"/v1/projects/tick" {
+				t.Errorf("projects-tick with no addr = %q, want the botnetsvc default", tgt.URL)
+			}
+		}
 	}
 }

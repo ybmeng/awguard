@@ -506,6 +506,47 @@ type Fireable struct {
 // and ChildCount counts DIRECT children so a client can draw a disclosure
 // chevron without walking the array twice. Every one of them is derived in the
 // single pass that hydrates a listing — never stored, never in the feed.
+//
+// DECISION (the lead window is a project THRESHOLD, inherited): DefaultLeadDays
+// is authored on the project and EffectiveLeadDays is the nearest-ancestor
+// answer to "how early does a date here start mattering" — own default, else
+// the closest ancestor that set one, else the global 30. A passport is worth
+// six months of warning and an invoice a fortnight; that is a property of the
+// FOLDER of work, so a bot sets it once on "Document Expirations" rather than
+// remembering to type 180 into every fact. Inheritance is derived in the same
+// forest pass health is, so it costs no query and cannot go stale, and it
+// applies at CREATE time only: a fact's lead is stored on the fact, so moving a
+// project's default never silently rewrites what its existing facts mean.
+//
+// DECISION (health rolls UP, the lead threshold and the owner flow DOWN): they
+// are the two directions of the same tree and ONE pass computes all of it — the
+// rollup folds a subtree's worst answer into its root on the way back out, and
+// the inherited values hand the parent's answer to each child on the way in.
+//
+// DECISION (a project has an OWNER BOT, and the owner is who gets told): a
+// project nobody is answerable for is a list, not a responsibility. OwnerBot
+// names the bot, and EffectiveOwner inherits it the way the threshold does, so
+// naming an owner once on "Document Expirations" makes every document under it
+// somebody's. A dangling pointer READS as unset — both fields blank — so a
+// client can never render an owner whose thread is gone; DeleteBot clears the
+// stored value to match, per row, so the change feed carries every one.
+//
+// DECISION (a tick tells the owner when a project gets WORSE, once): the whole
+// nudge is `POST /v1/projects/tick`, pinged hourly, comparing each project's
+// rolled-up health against the LastHealth the last tick saw. Only a
+// deterioration is news — an improvement is recorded silently, and a
+// re-deterioration to the same level is not a second event. The message is an
+// ordinary user-role append to the owner's thread through the same path the app
+// posts one, so the model turn starts, the reply lands in the transcript and no
+// client needs a new rendering; it is recognisable by its "Project nudge — "
+// opening and by nothing structural.
+//
+// DECISION (the message and the LastHealth write are ONE transaction): that is
+// what makes the tick idempotent under a crash. There is no window in which a
+// bot has been told and the project does not know it, and none in which the
+// project has been marked and the bot never heard. A project whose owner is
+// busy or absent is SKIPPED with LastHealth untouched, so the news survives to
+// the next tick rather than being marked as delivered.
 type Project struct {
 	ID   ProjectID `json:"id"`
 	Name string    `json:"name"` // trimmed, non-empty, <= 64 chars, unique case-insensitively
@@ -515,6 +556,22 @@ type Project struct {
 	// It is the only authored part of the hierarchy; everything else about the
 	// shape (children, counts, the rollup) is derived from these pointers.
 	ParentID ProjectID `json:"parentId,omitempty"`
+
+	// DefaultLeadDays is the lead window this project gives its dated facts,
+	// 0 meaning "unset — take it from above". Authored, stored, and >= 0.
+	DefaultLeadDays int `json:"defaultLeadDays"`
+
+	// OwnerBot is the bot answerable for this project, "" for none. It must
+	// name a bot that exists, checked at the write boundary; DeleteBot clears
+	// every project it owned, so a stored pointer never outlives its thread.
+	OwnerBot BotID `json:"ownerBot,omitempty"`
+
+	// LastHealth is the rolled-up health the last tick OBSERVED, and the only
+	// state the nudge keeps. It is stored and deliberately NOT on the wire (see
+	// the tick DECISION below): health is derived and refetched, so a second,
+	// older copy of it on the wire would only invite a client to trust the
+	// wrong one. "" means never ticked.
+	LastHealth ProjectHealth `json:"-"`
 
 	// CreatedBy follows Event.CreatedBy exactly: a BotID for a tool write, the
 	// "user" sentinel for a REST one, stamped by the write path.
@@ -532,6 +589,17 @@ type Project struct {
 	NextDue    *time.Time    `json:"nextDue,omitempty"`
 	FactCount  int           `json:"factCount"`
 	ChildCount int           `json:"childCount"`
+
+	// EffectiveLeadDays is the inherited answer above: own DefaultLeadDays when
+	// it is set, else the nearest ancestor's, else the global 30. It is what a
+	// new dated fact takes and what every health line prints, so a client never
+	// has to walk the tree to know which window applies here.
+	EffectiveLeadDays int `json:"effectiveLeadDays"`
+
+	// EffectiveOwner is the same inheritance over OwnerBot: own owner, else the
+	// nearest ancestor's, else "". It is who a nudge goes to, so a
+	// sub-project nobody named an owner for is still somebody's problem.
+	EffectiveOwner BotID `json:"effectiveOwner,omitempty"`
 }
 
 // Severity is the derived urgency BAND a project falls in: three values,

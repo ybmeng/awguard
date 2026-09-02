@@ -332,14 +332,14 @@ func calendarToolDef() wireTool {
 					"enum":        calendarCommandNames(),
 					"description": "The operation to perform.",
 				},
-				"event_id": str(`The event to change, for "update" and "delete". Take it from "list".`),
-				"title":    str(`The event's title, for "create" and "update".`),
-				"start":    str(`When the event starts, RFC3339, for "create" and "update".`),
-				"end":      str(`When the event ends, RFC3339. Optional; "create" defaults to one hour after the start.`),
-				"location": str(`Where it happens. Optional.`),
-				"notes":    str(`Anything else worth keeping on the event. Optional.`),
-				"from":     str(`Start of the window to list, RFC3339. Optional; defaults to now.`),
-				"to":       str(`End of the window to list, RFC3339. Optional; defaults to 14 days out.`),
+				"event_id":   str(`The event to change, for "update" and "delete". Take it from "list".`),
+				"title":      str(`The event's title, for "create" and "update".`),
+				"start":      str(`When the event starts, RFC3339, for "create" and "update".`),
+				"end":        str(`When the event ends, RFC3339. Optional; "create" defaults to one hour after the start.`),
+				"location":   str(`Where it happens. Optional.`),
+				"notes":      str(`Anything else worth keeping on the event. Optional.`),
+				"from":       str(`Start of the window to list, RFC3339. Optional; defaults to now.`),
+				"to":         str(`End of the window to list, RFC3339. Optional; defaults to 14 days out.`),
 				"calendar":   str(`A calendar, by name (case-insensitive). Optional filter/target for "create", "update" and "list"; the current name for "rename_calendar" and "delete_calendar".`),
 				"name":       str(`A calendar's name: the new calendar for "create_calendar", the new name for "rename_calendar".`),
 				"color":      str(`A calendar color, one of ` + strings.Join(calendarColors, ", ") + `, for "create_calendar" and "rename_calendar". Optional.`),
@@ -783,7 +783,7 @@ const projectToolName = "project"
 // instructive errors rather than silent drift, so the ladder is enforced and
 // not merely advertised.
 const projectLadder = `How to record something — take the FIRST rule that fits:
-1. A date in the future you must act by → kind=deadline with "due" and "lead_days" (passport renewals 180, visa renewals 90, company filings 60; anything else 30).
+1. A date in the future you must act by → kind=deadline with "due". The lead window defaults from the PROJECT, so set it once with "default_lead_days" on the project that holds this kind of date (passport renewals 180, visa renewals 90, company filings 60; anything else 30) rather than typing "lead_days" into every fact; "lead_days" is for the one fact that differs.
 2. An obligation that repeats → kind=recurring with "due" (the FIRST occurrence), "rrule" and "tz".
 3. A step someone must complete → kind=milestone. If a HUMAN must act, set "blocker" to exactly what they must do, and clear it ("blocker": "") once they have. A blocked step cannot also be done.
 4. Only "what happened" or "what I learned" → kind=note. A note NEVER changes health, so if you are about to write a date into one, it is a deadline: go back to 1.
@@ -803,21 +803,23 @@ const noteTitleLimit = 60
 // answers: clearing a blocker is "blocker": "", which must not read the same as
 // leaving it alone.
 type projectArgs struct {
-	Command  string  `json:"command"`
-	Project  *string `json:"project"`
-	Parent   *string `json:"parent"`
-	NewName  *string `json:"new_name"`
-	Goal     *string `json:"goal"`
-	Kind     *string `json:"kind"`
-	Title    *string `json:"title"`
-	NewTitle *string `json:"new_title"`
-	Due      *string `json:"due"`
-	LeadDays *string `json:"lead_days"`
-	RRule    *string `json:"rrule"`
-	TZ       *string `json:"tz"`
-	Done     *string `json:"done"`
-	Blocker  *string `json:"blocker"`
-	Body     *string `json:"body"`
+	Command         string  `json:"command"`
+	Project         *string `json:"project"`
+	Parent          *string `json:"parent"`
+	NewName         *string `json:"new_name"`
+	Goal            *string `json:"goal"`
+	DefaultLeadDays *string `json:"default_lead_days"`
+	Owner           *string `json:"owner"`
+	Kind            *string `json:"kind"`
+	Title           *string `json:"title"`
+	NewTitle        *string `json:"new_title"`
+	Due             *string `json:"due"`
+	LeadDays        *string `json:"lead_days"`
+	RRule           *string `json:"rrule"`
+	TZ              *string `json:"tz"`
+	Done            *string `json:"done"`
+	Blocker         *string `json:"blocker"`
+	Body            *string `json:"body"`
 }
 
 // ptr resolves one flat field by its wire name — the single switch the two
@@ -832,6 +834,10 @@ func (a projectArgs) ptr(name string) *string {
 		return a.NewName
 	case "goal":
 		return a.Goal
+	case "default_lead_days":
+		return a.DefaultLeadDays
+	case "owner":
+		return a.Owner
 	case "kind":
 		return a.Kind
 	case "title":
@@ -902,8 +908,10 @@ var projectCommands = []projectCommand{
 	{
 		name:     "create",
 		requires: []string{"project"},
-		doc: `"create": starts a project. Requires "project" (its name); optional "goal" and ` +
-			`"parent" (an existing project's name, making this one a sub-project of it).`,
+		doc: `"create": starts a project. Requires "project" (its name); optional "goal", ` +
+			`"parent" (an existing project's name, making this one a sub-project of it), ` +
+			`"default_lead_days" (the lead window every dated fact here takes unless it names its own) ` +
+			`and "owner" (the bot answerable for it, by display name).`,
 		run: runProjectCreate,
 	},
 	{
@@ -911,7 +919,8 @@ var projectCommands = []projectCommand{
 		requires: []string{"project"},
 		doc: `"update": changes a project itself, not its facts. Requires "project" plus any of ` +
 			`"new_name", "goal", "parent" (an existing project's name to move it under, or "none" to ` +
-			`make it top-level) — omitted fields are left alone.`,
+			`make it top-level), "default_lead_days" ("0" clears it and the parent's applies again), ` +
+			`"owner" (a bot's display name, or "none" to clear it) — omitted fields are left alone.`,
 		run: runProjectUpdate,
 	},
 	{
@@ -922,15 +931,17 @@ var projectCommands = []projectCommand{
 			`obligation that repeats — requires "due" for the FIRST occurrence plus "rrule" and "tz"), ` +
 			`"milestone" (a step, optionally "blocker" naming what human action it waits on), "note" ` +
 			`(undated context in "body"). Optional "lead_days" is how many days before the due date it ` +
-			`counts as due soon (default 30), and "body" holds details for any kind.`,
+			`counts as due soon — omit it and the fact takes the project's own window — and "body" ` +
+			`holds details for any kind.`,
 		run: runProjectAddFact,
 	},
 	{
 		name:     "update_fact",
 		requires: []string{"project", "title"},
 		doc: `"update_fact": changes a fact. Requires "project" and "title" (the fact's current ` +
-			`title, case-insensitive) plus any of "new_title", "due", "lead_days", "done" ("true" or ` +
-			`"false"), "blocker" (empty clears it), "body" — omitted fields are left alone.`,
+			`title, case-insensitive) plus any of "new_title", "due", "lead_days", "rrule" and "tz" ` +
+			`(a recurring fact's rule — changing either moves every future occurrence), "done" ("true" ` +
+			`or "false"), "blocker" (empty clears it), "body" — omitted fields are left alone.`,
 		run: runProjectUpdateFact,
 	},
 	{
@@ -981,16 +992,22 @@ func projectToolDef() wireTool {
 					"enum":        projectCommandNames(),
 					"description": "The operation to perform.",
 				},
-				"project":   str(`A project, by name (case-insensitive). Required by every command but "list".`),
-				"parent":    str(`The project this one sits under, by name. Optional, for "create" and "update"; "none" makes it top-level again.`),
-				"new_name":  str(`A project's new name, for "update". Optional.`),
-				"goal":      str(`What the project is for, one line. Optional, for "create" and "update".`),
+				"project":  str(`A project, by name (case-insensitive). Required by every command but "list".`),
+				"parent":   str(`The project this one sits under, by name. Optional, for "create" and "update"; "none" makes it top-level again.`),
+				"new_name": str(`A project's new name, for "update". Optional.`),
+				"goal":     str(`What the project is for, one line. Optional, for "create" and "update".`),
+				"default_lead_days": str(`How many days before a due date the facts of THIS project count as ` +
+					`due soon, e.g. "180". Optional, for "create" and "update"; sub-projects inherit it, and "0" ` +
+					`clears it so the parent's applies again.`),
+				"owner": str(`The bot answerable for this project, by DISPLAY NAME (case-insensitive) — it is ` +
+					`the one nudged when the project gets worse. Optional, for "create" and "update"; ` +
+					`sub-projects inherit it, and "none" clears it so the parent's applies again.`),
 				"kind":      str(`The kind of fact: ` + strings.Join(factKinds(), ", ") + `. Required for "add_fact".`),
 				"title":     str(`The fact's title for "add_fact"; the fact to change for "update_fact".`),
 				"new_title": str(`A fact's new title, for "update_fact". Optional.`),
 				"due":       str(`When the fact is due, RFC3339. Required for a deadline; the FIRST occurrence for a recurring fact.`),
-				"lead_days": str(`How many days before the due date the fact counts as due soon, e.g. "180". Optional; defaults to 30.`),
-				"rrule":     str(`An RFC 5545 recurrence rule for a recurring fact, e.g. FREQ=YEARLY (supported: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH, BYSETPOS, WKST). Requires "tz".`),
+				"lead_days": str(`How many days before the due date THIS ONE fact counts as due soon, e.g. "180". Optional; omitted, it takes the project's window.`),
+				"rrule":     str(`An RFC 5545 recurrence rule for a recurring fact, e.g. FREQ=YEARLY (supported: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH, BYSETPOS, WKST). Requires "tz". Settable on "update_fact" too, which moves every future occurrence.`),
 				"tz":        str(`The IANA zone the recurrence's wall clock lives in, e.g. Asia/Singapore. Required with "rrule".`),
 				"done":      str(`"true" or "false": whether a deadline or milestone is finished. Optional, for "update_fact".`),
 				"blocker":   str(`What human action a milestone is waiting on; an empty value clears it. Optional.`),
@@ -1070,15 +1087,19 @@ func boolArg(a projectArgs, name string) (value, supplied bool, errText string) 
 	return false, false, fmt.Sprintf(`error: '%s' must be "true" or "false", not %q`, name, raw)
 }
 
-// leadArg reads the optional "lead_days" field as a whole number of days.
-func leadArg(a projectArgs) (value int, supplied bool, errText string) {
-	raw, ok := a.field("lead_days")
+// daysArg reads one optional day-count field ("lead_days" on a fact,
+// "default_lead_days" on a project) as a whole number of days. One function
+// rather than two, so the two windows cannot end up parsing or refusing
+// differently — and "0" is a real supplied value, which is how a model clears a
+// project's own threshold.
+func daysArg(a projectArgs, name string) (value int, supplied bool, errText string) {
+	raw, ok := a.field(name)
 	if !ok {
 		return 0, false, ""
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || n < 0 {
-		return 0, false, fmt.Sprintf(`error: 'lead_days' must be a whole number of days, e.g. "30", not %q`, raw)
+		return 0, false, fmt.Sprintf(`error: '%s' must be a whole number of days, e.g. "30", not %q`, name, raw)
 	}
 	return n, true, ""
 }
@@ -1136,20 +1157,24 @@ func duplicateTitleError(title, project string) string {
 func wholeDays(d time.Duration) int { return int(d.Round(24*time.Hour) / (24 * time.Hour)) }
 
 // healthLine is the one-line state a mutating result ends with, e.g.
-// `Passports: S1 due_soon, next due 2027-03-14 (in 193d)`. The severity band
-// leads, so a model reading one result knows how loud it is without holding a
-// table of five healths — and the value is the same string the app colours from.
+// `Passports: S1 due_soon, next due 2027-03-14 (in 193d), lead 180d`. The
+// severity band leads, so a model reading one result knows how loud it is
+// without holding a table of five healths — and the value is the same string
+// the app colours from. The lead closes the line because it is the answer to
+// "why is this amber and not green", and because it is the window the NEXT fact
+// filed here will take, inherited or not.
 func healthLine(now time.Time, p Project) string {
+	lead := fmt.Sprintf(", lead %dd", p.EffectiveLeadDays)
 	if p.NextDue == nil {
-		return fmt.Sprintf("%s: %s %s", p.Name, p.Severity, p.Health)
+		return fmt.Sprintf("%s: %s %s%s", p.Name, p.Severity, p.Health, lead)
 	}
 	due := p.NextDue.Local()
 	if due.Before(now) {
-		return fmt.Sprintf("%s: %s %s, next due %s (%dd overdue)",
-			p.Name, p.Severity, p.Health, due.Format(time.DateOnly), wholeDays(now.Sub(due)))
+		return fmt.Sprintf("%s: %s %s, next due %s (%dd overdue)%s",
+			p.Name, p.Severity, p.Health, due.Format(time.DateOnly), wholeDays(now.Sub(due)), lead)
 	}
-	return fmt.Sprintf("%s: %s %s, next due %s (in %dd)",
-		p.Name, p.Severity, p.Health, due.Format(time.DateOnly), wholeDays(due.Sub(now)))
+	return fmt.Sprintf("%s: %s %s, next due %s (in %dd)%s",
+		p.Name, p.Severity, p.Health, due.Format(time.DateOnly), wholeDays(due.Sub(now)), lead)
 }
 
 // withHealth appends the project's CURRENT health line to a result. Health is
@@ -1266,7 +1291,11 @@ func healthBearing(facts []Fact) bool {
 // and the model gets there by showing that one.
 func renderProject(now time.Time, p Project, children []Project, facts []Fact) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "now: %s\n%s — %s %s", localRFC3339(now), p.Name, p.Severity, p.Health)
+	// The header names the effective lead for the same reason the health line
+	// does: it is the window a fact added here will take, and a model that
+	// cannot see it types one in by hand.
+	fmt.Fprintf(&b, "now: %s\n%s — %s %s, lead %dd",
+		localRFC3339(now), p.Name, p.Severity, p.Health, p.EffectiveLeadDays)
 	if p.Goal != "" {
 		fmt.Fprintf(&b, "\ngoal: %s", p.Goal)
 	}
@@ -1341,6 +1370,51 @@ func parentArg(s *Store, a projectArgs) (id ProjectID, supplied bool, errText st
 	return parent.ID, true, "", nil
 }
 
+// ownerArg resolves the "owner" a model supplied into a BotID. Bots are named
+// the way projects are — by the DISPLAY NAME a person says out loud, never by a
+// bot_ id a model would have to carry between turns — and the sentinel that
+// clears it is the same "none" the parent uses.
+//
+// Neither of the two non-answers is guessed: an unknown name lists the bots that
+// exist, and two bots sharing one name is an ambiguity error, because picking
+// one would silently make the wrong thread answerable for the project.
+func ownerArg(s *Store, a projectArgs) (id BotID, supplied bool, errText string, err error) {
+	raw, ok := a.given("owner")
+	if !ok {
+		return "", false, "", nil
+	}
+	name := strings.TrimSpace(raw)
+	if name == "" || strings.EqualFold(name, noParentWord) {
+		return "", true, "", nil
+	}
+	bots, err := s.AllBots()
+	if err != nil {
+		return "", true, "", err
+	}
+	var matches []Bot
+	for _, b := range bots {
+		if strings.EqualFold(strings.TrimSpace(b.DisplayName), name) {
+			matches = append(matches, b)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0].ID, true, "", nil
+	case 0:
+		if len(bots) == 0 {
+			return "", true, fmt.Sprintf("error: no bot named %q — there are no bots to own a project", name), nil
+		}
+		names := make([]string, len(bots))
+		for i, b := range bots {
+			names[i] = b.DisplayName
+		}
+		return "", true, fmt.Sprintf("error: no bot named %q — the bots are: %s",
+			name, strings.Join(names, ", ")), nil
+	}
+	return "", true, fmt.Sprintf("error: %q matches %d bots — rename one so the owner you mean is unambiguous",
+		name, len(matches)), nil
+}
+
 func runProjectCreate(s *Store, botID BotID, a projectArgs) (string, error) {
 	name, _ := a.field("project")
 	goal, _ := a.field("goal")
@@ -1348,9 +1422,19 @@ func runProjectCreate(s *Store, botID BotID, a projectArgs) (string, error) {
 	if err != nil || errText != "" {
 		return errText, err
 	}
+	lead, _, errText := daysArg(a, "default_lead_days")
+	if errText != "" {
+		return errText, nil
+	}
+	owner, _, errText, err := ownerArg(s, a)
+	if err != nil || errText != "" {
+		return errText, err
+	}
 	// createdBy is the CALLING bot, stamped by the store — the model cannot
 	// name an author, so a project always says who really started it.
-	p, err := s.CreateProject(Project{Name: name, Goal: goal, ParentID: parent}, string(botID))
+	p, err := s.CreateProject(
+		Project{Name: name, Goal: goal, ParentID: parent, DefaultLeadDays: lead, OwnerBot: owner},
+		string(botID))
 	if err != nil {
 		return projectStoreError(err)
 	}
@@ -1389,8 +1473,23 @@ func runProjectUpdate(s *Store, _ BotID, a projectArgs) (string, error) {
 	if supplied {
 		patch.ParentID = &parent
 	}
-	if patch.Name == nil && patch.Goal == nil && patch.ParentID == nil {
-		return "error: 'update' needs at least one of new_name, goal, parent to change", nil
+	// "0" is a real value here: it clears this project's own threshold and lets
+	// the nearest ancestor's apply again.
+	if lead, given, errText := daysArg(a, "default_lead_days"); errText != "" {
+		return errText, nil
+	} else if given {
+		patch.DefaultLeadDays = &lead
+	}
+	owner, given, errText, err := ownerArg(s, a)
+	if err != nil || errText != "" {
+		return errText, err
+	}
+	if given {
+		patch.OwnerBot = &owner
+	}
+	if patch.Name == nil && patch.Goal == nil && patch.ParentID == nil &&
+		patch.DefaultLeadDays == nil && patch.OwnerBot == nil {
+		return "error: 'update' needs at least one of new_name, goal, parent, default_lead_days, owner to change", nil
 	}
 	updated, err := s.UpdateProject(p.ID, patch)
 	if err != nil {
@@ -1415,7 +1514,7 @@ func runProjectAddFact(s *Store, botID BotID, a projectArgs) (string, error) {
 		}
 		f.Due = due
 	}
-	lead, supplied, errText := leadArg(a)
+	lead, supplied, errText := daysArg(a, "lead_days")
 	if errText != "" {
 		return errText, nil
 	}
@@ -1499,6 +1598,12 @@ func runProjectUpdateFact(s *Store, _ BotID, a projectArgs) (string, error) {
 	}{
 		{"blocker", func(v string) { patch.Blocker = &v }},
 		{"body", func(v string) { patch.Body = &v }},
+		// rrule and tz belong to a recurring fact and go through the same
+		// validation create does; changing either re-projects the fact's
+		// calendar event inside UpdateFact's transaction, so the month grid
+		// never keeps showing the rule the fact no longer has.
+		{"rrule", func(v string) { patch.RRule = &v }},
+		{"tz", func(v string) { patch.TZ = &v }},
 	} {
 		if v, ok := a.given(field.name); ok {
 			field.set(v)
@@ -1513,7 +1618,7 @@ func runProjectUpdateFact(s *Store, _ BotID, a projectArgs) (string, error) {
 		patch.Due = &due
 		changed = true
 	}
-	if lead, supplied, errText := leadArg(a); errText != "" {
+	if lead, supplied, errText := daysArg(a, "lead_days"); errText != "" {
 		return errText, nil
 	} else if supplied {
 		patch.LeadDays = &lead
@@ -1526,7 +1631,7 @@ func runProjectUpdateFact(s *Store, _ BotID, a projectArgs) (string, error) {
 		changed = true
 	}
 	if !changed {
-		return "error: 'update_fact' needs at least one of new_title, due, lead_days, done, blocker, body to change", nil
+		return "error: 'update_fact' needs at least one of new_title, due, lead_days, rrule, tz, done, blocker, body to change", nil
 	}
 	updated, err := s.UpdateFact(f.ID, patch)
 	if errors.Is(err, ErrDuplicateName) {

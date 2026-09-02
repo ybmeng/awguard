@@ -101,6 +101,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/events/{id}", s.deleteEvent)
 	mux.HandleFunc("GET /v1/projects", s.listProjects)
 	mux.HandleFunc("POST /v1/projects", s.createProject)
+	// Registered before the {id} routes only for readability; the method-pattern
+	// mux prefers the literal segment over the wildcard whatever the order.
+	mux.HandleFunc("POST /v1/projects/tick", s.tickProjects)
 	mux.HandleFunc("GET /v1/projects/{id}", s.getProject)
 	mux.HandleFunc("PATCH /v1/projects/{id}", s.patchProject)
 	mux.HandleFunc("DELETE /v1/projects/{id}", s.deleteProject)
@@ -847,9 +850,21 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request) {
 // PATCH partial: absent leaves a field alone, and "" is a real value — clearing
 // a goal, or promoting a project to the top level.
 type projectInput struct {
-	Name     *string `json:"name"`
-	Goal     *string `json:"goal"`
-	ParentID *string `json:"parentId"`
+	Name            *string `json:"name"`
+	Goal            *string `json:"goal"`
+	ParentID        *string `json:"parentId"`
+	DefaultLeadDays *int    `json:"defaultLeadDays"` // 0 on a PATCH clears the project's own threshold
+	OwnerBot        *string `json:"ownerBot"`        // "" on a PATCH clears it; an unknown bot is a 404
+}
+
+// owner renders the body's ownerBot as the patch's optional field, for the same
+// reason parent is its own two lines.
+func (in projectInput) owner() *BotID {
+	if in.OwnerBot == nil {
+		return nil
+	}
+	id := BotID(*in.OwnerBot)
+	return &id
 }
 
 // parent renders the body's parentId as the patch's optional field. It is its
@@ -916,7 +931,17 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	if in.ParentID != nil {
 		parent = ProjectID(*in.ParentID)
 	}
-	p, err := s.store.CreateProject(Project{Name: *in.Name, Goal: goal, ParentID: parent}, userAuthor)
+	lead := 0
+	if in.DefaultLeadDays != nil {
+		lead = *in.DefaultLeadDays
+	}
+	owner := BotID("")
+	if in.OwnerBot != nil {
+		owner = BotID(*in.OwnerBot)
+	}
+	p, err := s.store.CreateProject(
+		Project{Name: *in.Name, Goal: goal, ParentID: parent, DefaultLeadDays: lead, OwnerBot: owner},
+		userAuthor)
 	if err != nil {
 		writeErr(w, writeStatus(err), err)
 		return
@@ -950,7 +975,8 @@ func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p, err := s.store.UpdateProject(ProjectID(r.PathValue("id")),
-		ProjectPatch{Name: in.Name, Goal: in.Goal, ParentID: in.parent()})
+		ProjectPatch{Name: in.Name, Goal: in.Goal, ParentID: in.parent(),
+			DefaultLeadDays: in.DefaultLeadDays, OwnerBot: in.owner()})
 	if err != nil {
 		writeErr(w, writeStatus(err), err)
 		return
@@ -967,6 +993,40 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// tickProjects is the nudge's whole entry point: derive the forest, tell each
+// worsened project's owner once, and report what was told and what was not. The
+// std ping service POSTs it hourly and nothing else does — it is idempotent by
+// construction, so the next interval IS the retry and a caller may run it as
+// often as it likes.
+//
+// The optional ?at drives the clock, so a test can put a deadline in the past
+// without waiting for one; a malformed value is a 400 rather than a silent
+// fallback to now, which would make a mistyped tick look like it worked.
+func (s *Server) tickProjects(w http.ResponseWriter, r *http.Request) {
+	at := time.Now().UTC()
+	if raw := r.URL.Query().Get("at"); raw != "" {
+		parsed, err := eventTime("at", raw)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		at = parsed
+	}
+	tick, err := s.store.TickProjects(at)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	// The turns start AFTER the store work, on the same goroutine-per-turn path
+	// a send uses: each nudge is already persisted and awaiting, so a crash here
+	// leaves exactly what a crashed send leaves, and the startup sweep settles
+	// it.
+	for _, n := range tick.Nudged {
+		s.startTurn(n.bot, n.message)
+	}
+	writeJSON(w, http.StatusOK, tick)
 }
 
 // createFact records one fact on a project. The kind's own rules (which fields

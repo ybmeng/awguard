@@ -620,12 +620,40 @@ struct Project: Identifiable, Decodable, Hashable {
     /// off the tree it actually built, so this is for prose (the delete
     /// confirmation) rather than for layout.
     var childCount: Int
+    /// The due_soon window this project hands to a dated fact created without
+    /// one of its own. 0 means this project sets none — NOT a zero-day lead —
+    /// and is also what a server that predates the field sends.
+    var defaultLeadDays: Int
+    /// DERIVED: own `defaultLeadDays` if set, else the nearest ancestor's, else
+    /// the global default. 0 only from a server that predates it, which is why
+    /// `hasEffectiveLead` exists rather than a bare `> 0` at every call site.
+    var effectiveLeadDays: Int
+    /// The bot answerable for this project, when it sets one itself. Nil for
+    /// both spellings of unset (the key omitted, and ""), like `parentId`, and
+    /// nil for a dangling owner the server has already cleared.
+    var ownerBot: String?
+    /// DERIVED: own owner, else the nearest ancestor's, else nil. This is the
+    /// bot the tick nudges, and the one the pane's header names.
+    var effectiveOwner: String?
+
+    /// The lead a dated fact gets when nobody in the chain sets one — mirrors
+    /// `defaultLeadDays` in go/botnet/projects.go. Only used to answer "what
+    /// would this project inherit if it cleared its own", which the server has
+    /// no field for; every value actually in force comes off the wire.
+    static let globalDefaultLeadDays = 30
 
     var isUserCreated: Bool { createdBy == Event.userAuthor }
     var hasGoal: Bool { !goal.isEmpty }
     var isTopLevel: Bool { parentId == nil }
     var hasChildren: Bool { childCount > 0 }
     var hasSeverity: Bool { !severity.isEmpty }
+    /// This project sets a lead of its own rather than taking one from above.
+    var setsOwnLead: Bool { defaultLeadDays > 0 }
+    /// The server derived a lead at all — false only on a botnetd that predates
+    /// thresholds, where the sheets must not print "inherited (0 d)".
+    var hasEffectiveLead: Bool { effectiveLeadDays > 0 }
+    var setsOwnOwner: Bool { ownerBot != nil }
+    var hasOwner: Bool { effectiveOwner != nil }
 
     /// "due soon" — the wire value read as words. An unknown future value comes
     /// through verbatim rather than being hidden behind a guess.
@@ -654,6 +682,7 @@ struct Project: Identifiable, Decodable, Hashable {
     private enum Keys: String, CodingKey {
         case id, name, goal, parentId, createdBy, createdAt, updatedAt
         case health, severity, nextDue, factCount, childCount
+        case defaultLeadDays, effectiveLeadDays, ownerBot, effectiveOwner
     }
     // Every derived key is read leniently: Go's omitempty drops exactly the zero
     // value, so an absent factCount IS 0 and an absent goal IS "". nextDue goes
@@ -677,6 +706,14 @@ struct Project: Identifiable, Decodable, Hashable {
         nextDue = try c.decodeIfPresent(Date.self, forKey: .nextDue)?.nilIfServerZero
         factCount = try c.decodeIfPresent(Int.self, forKey: .factCount) ?? 0
         childCount = try c.decodeIfPresent(Int.self, forKey: .childCount) ?? 0
+        defaultLeadDays = try c.decodeIfPresent(Int.self, forKey: .defaultLeadDays) ?? 0
+        effectiveLeadDays = try c.decodeIfPresent(Int.self, forKey: .effectiveLeadDays) ?? 0
+        // Same collapse as parentId: an omitted key and "" are one state, and
+        // an empty string reaching a BotAvatar would draw a blob for nobody.
+        let owner = try c.decodeIfPresent(String.self, forKey: .ownerBot) ?? ""
+        ownerBot = owner.isEmpty ? nil : owner
+        let effective = try c.decodeIfPresent(String.self, forKey: .effectiveOwner) ?? ""
+        effectiveOwner = effective.isEmpty ? nil : effective
     }
 }
 
@@ -894,6 +931,65 @@ struct ProjectTree {
         return rows(expanded: Set(all.map(\.id))).filter { !excluded.contains($0.project.id) }
     }
 
+    // MARK: inheritance
+    //
+    // The server sends the ANSWER (effectiveLeadDays, effectiveOwner) but not
+    // where it came from, and the pane's "via <parent>" and the sheets'
+    // "inherited (N d)" both need the source. That walk lives here, once, for
+    // the same reason the rest of the shape does — and because the sheets need
+    // a second question the wire cannot answer at all: what this project would
+    // fall back to if it cleared its own value, which is what the stepper has
+    // to read while it sits at 0.
+
+    /// Whether this botnetd derives leads and owners at all. It is read off the
+    /// data rather than a version, like everything else here: a server that
+    /// predates thresholds sends no `effectiveLeadDays`, and the sheets must
+    /// not offer settings it would silently drop. An empty list cannot tell —
+    /// and the current server is the safer guess than a retired one.
+    var supportsThresholds: Bool {
+        all.isEmpty || all.contains { $0.hasEffectiveLead }
+    }
+
+    /// The project whose `defaultLeadDays` is in force here: this one when it
+    /// sets a lead, else the nearest ancestor that does. Nil means nobody in
+    /// the chain sets one and the global default applies.
+    func leadSource(for id: String) -> Project? {
+        nearest(from: id, where: \.setsOwnLead)
+    }
+
+    /// Same walk for the owner: who the server's `effectiveOwner` came from.
+    func ownerSource(for id: String) -> Project? {
+        nearest(from: id, where: \.setsOwnOwner)
+    }
+
+    /// The nearest STRICT ancestor that sets a lead — what this project would
+    /// take if it set none of its own, regardless of what it sets now.
+    func inheritedLeadSource(for id: String) -> Project? {
+        nearest(from: byID[id]?.parentId, where: \.setsOwnLead)
+    }
+
+    /// That ancestor's lead, or the global default when there is no such
+    /// ancestor. Never 0: "inherit nothing" is not a state the server has.
+    func inheritedLeadDays(for id: String) -> Int {
+        inheritedLeadSource(for: id)?.defaultLeadDays ?? Project.globalDefaultLeadDays
+    }
+
+    /// The nearest strict ancestor that sets an owner — who would own this
+    /// project if its own owner were cleared.
+    func inheritedOwnerSource(for id: String) -> Project? {
+        nearest(from: byID[id]?.parentId, where: \.setsOwnOwner)
+    }
+
+    /// First project at or above `id` satisfying `predicate`. Cycle-guarded by
+    /// `ancestry`, so a looping chain terminates rather than hanging the sheet.
+    private func nearest(from id: String?, where predicate: (Project) -> Bool) -> Project? {
+        guard let id else { return nil }
+        for step in ancestry(of: id) {
+            if let node = byID[step], predicate(node) { return node }
+        }
+        return nil
+    }
+
     /// A project and every ancestor above it, self first. Cycle-guarded like
     /// `depth(of:)`.
     private func ancestry(of id: String) -> [String] {
@@ -920,6 +1016,104 @@ struct ProjectTree {
             }
         }
         return out
+    }
+}
+
+/// What a project's default lead and owner READ AS: set here, or taken from a
+/// named ancestor, or the global fallback.
+///
+/// A value rather than four helpers scattered across two sheets and a pane
+/// header, because the readings have to agree: the header's "via Document
+/// Expirations" and the Edit sheet's "None (inherited: Ada)" are the same fact
+/// said twice, and the stepper's "inherited (180 d)" has to be the number the
+/// server would actually apply. Being a value also means the exact strings are
+/// asserted in decode-check rather than eyeballed in a screenshot.
+struct ProjectInheritance {
+    /// The lead in force here, exactly as the server derived it — never
+    /// recomputed. 0 only from a botnetd that predates thresholds.
+    let effectiveLeadDays: Int
+    /// The bot in force here, as the server derived it.
+    let effectiveOwner: String?
+    /// The project `effectiveOwner` came from, when that is not this one.
+    let ownerFrom: String?
+    /// What this project would take if it set NO lead of its own — the answer
+    /// the stepper needs while it sits at 0, which is not `effectiveLeadDays`
+    /// (that already folds in the project's own value).
+    let inheritedLeadDays: Int
+    /// The bot that would own it if its own owner were cleared.
+    let inheritedOwner: String?
+
+    private let botNames: [String: String]
+
+    init(project: Project, tree: ProjectTree, botNames: [String: String]) {
+        self.botNames = botNames
+        effectiveLeadDays = project.effectiveLeadDays
+        effectiveOwner = project.effectiveOwner
+        let source = tree.ownerSource(for: project.id)
+        ownerFrom = (source?.id == project.id) ? nil : source?.name
+        inheritedLeadDays = tree.inheritedLeadDays(for: project.id)
+        inheritedOwner = tree.inheritedOwnerSource(for: project.id)?.ownerBot
+    }
+
+    /// The same readings for a project that does not exist yet: the New sheet's
+    /// case. Nothing is set on it, so everything it would have is whatever its
+    /// parent already has in force — which the server has rolled up for us.
+    init(newChildOf parent: Project?, tree: ProjectTree, botNames: [String: String]) {
+        self.botNames = botNames
+        effectiveLeadDays = parent?.effectiveLeadDays ?? 0
+        effectiveOwner = parent?.effectiveOwner
+        ownerFrom = parent?.name
+        inheritedLeadDays = parent.map { tree.leadSource(for: $0.id)?.defaultLeadDays
+                                         ?? Project.globalDefaultLeadDays }
+            ?? Project.globalDefaultLeadDays
+        inheritedOwner = parent?.effectiveOwner
+    }
+
+    /// The bot id the header draws an avatar for, or nil when nothing owns it.
+    var ownerBotID: String? { effectiveOwner }
+
+    /// The owner's display name. A bot this client has not fetched still gets
+    /// named — by its id — rather than vanishing from a header that is meant to
+    /// say who is answerable.
+    var ownerName: String? {
+        guard let id = effectiveOwner else { return nil }
+        return botNames[id] ?? id
+    }
+
+    /// "via Document Expirations" when the owner came from above, nil when the
+    /// project sets its own. The header prints it muted after the name.
+    var ownerVia: String? {
+        guard effectiveOwner != nil, let from = ownerFrom else { return nil }
+        return "via \(from)"
+    }
+
+    /// The Default lead stepper's label for a DRAFT value, so the sheet reads
+    /// the number the user is currently choosing. A draft of 0 does not mean a
+    /// zero-day lead — it means "take whatever is above me" — so the row says
+    /// which number that is instead of printing "0 days".
+    func leadStepperText(draft: Int) -> String {
+        guard draft > 0 else { return "Default lead: inherited (\(inheritedLeadDays) d)" }
+        return "Default lead: \(draft) \(draft == 1 ? "day" : "days")"
+    }
+
+    /// The Owner picker's None row. Picking None on a project under an owning
+    /// ancestor does not leave it unowned, so the row says who it falls back to.
+    var noneOwnerLabel: String {
+        guard let id = inheritedOwner else { return "None" }
+        return "None (inherited: \(botNames[id] ?? id))"
+    }
+
+    /// The facts empty state. It names the lead a dated fact added here would
+    /// get, which is the one project-level setting invisible from an empty
+    /// list. A server that derives no lead says the plain sentence instead of
+    /// "a 0-day lead".
+    var emptyFactsText: String {
+        // The call to action comes before the lead: the lead qualifies the
+        // thing being asked for, and a reader who already knows what to add
+        // should not have to step over a threshold to reach the verb.
+        let call = "No facts yet. Add a deadline, a recurring obligation, a milestone or a note."
+        guard effectiveLeadDays > 0 else { return call }
+        return "\(call) A dated one starts with a \(effectiveLeadDays)-day lead."
     }
 }
 

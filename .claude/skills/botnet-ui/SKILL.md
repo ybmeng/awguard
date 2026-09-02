@@ -241,3 +241,44 @@ From `swift/botnet/`:
 
 Update this skill when you learn something the next agent would otherwise
 rediscover the hard way.
+
+## Shared files and the iOS app (added 2026-09-02)
+
+- `swift/botnet-ios/` is a second xcodegen target (BotNetMobile) that compiles
+  Models, APIClient, Store, Transcript and DesignSystem from `../botnet/Sources`
+  BY PATH. Any AppKit call added to one of those five files breaks the phone
+  build silently until someone builds it. Run `swift/botnet-ios/dev/shared-check.sh`
+  (compiles the five against the iphonesimulator SDK alone) as a third gate next
+  to the two Release builds whenever you touch a shared file; wrap AppKit in
+  `#if canImport(AppKit)` with a UIKit twin, as DesignSystem's Palette bridge does.
+  Keep shared-file edits additive and source-compatible: no renames, no signature
+  changes, so the other target keeps building.
+- The Form label-slot trap has an exact inverse on iOS: a TextField carrying a
+  `prompt:` DROPS its label there, so the field renders as a bare value with
+  nothing naming it. Mac wants the label slot; iOS wants the name carried in the
+  row. The same line cannot serve both; branch it. Also `prompt:` must precede
+  `axis:` or it does not compile.
+- Screenshots on iOS come from a real booted simulator (`dev/sim.sh`:
+  simctl boot/install/launch + `simctl io booted screenshot`), never from
+  reasoning about layout. Six real defects were caught only that way.
+
+## More house lessons (2026-09-02)
+
+- `PIPESTATUS` is empty in this shell. `cmd | grep …; echo $PIPESTATUS[0]`
+  prints nothing and proves nothing. Redirect to a log and read `$?` on the
+  next line.
+- A scratch swiftc harness must not be named `main.swift`: it turns the file
+  into top-level code and any `@main` in the shared sources stops compiling.
+- When the Go tree itself will not build (another agent mid-edit),
+  `git archive HEAD | tar -x -C <scratch>` gives a buildable backend to verify
+  against without touching the checkout; the stub-proxy trick assumes a
+  buildable tree.
+- Counterfactual derivations belong client-side in the tree value, pinned by a
+  live check. The sheets need "what would this project inherit if it cleared
+  its own value", which is NOT the wire's `effectiveLeadDays`; `ProjectTree`
+  derives it and a decode-check asserts the walk equals the server's derivation
+  on every project that sets nothing.
+- A done fact shows its absolute date in the muted colour with no relative and
+  no lead; a struck-through row that still reads "overdue 49d" is a defect.
+- `seed-demo.sh` deletes and rebuilds the demo DB, so re-running it wipes
+  anything you seeded through the routes; seed after the last restart.
