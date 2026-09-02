@@ -454,8 +454,7 @@ struct AddFactSheet: View {
         // silently disagreed with the Mac on any project that sets a lead, and
         // written the wrong due_soon window from the phone. The global fallback
         // applies only to a botnetd that predates thresholds.
-        _leadDays = State(initialValue: project.hasEffectiveLead
-                          ? project.effectiveLeadDays : Project.globalDefaultLeadDays)
+        _leadDays = State(initialValue: FactLead.initialDraft(for: project))
     }
 
     private var trimmedTitle: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -486,7 +485,8 @@ struct AddFactSheet: View {
                     if kind.fields.contains(.leadDays) {
                         // The window that makes this fact "due soon". The
                         // server's own default is 30 days.
-                        Stepper("Lead \(leadDays) days", value: $leadDays, in: 0...365)
+                        Stepper(FactLead.label(draft: leadDays, project: project),
+                                value: $leadDays, in: 0...365)
                     }
                     if kind.fields.contains(.rrule) {
                         // Typed verbatim: the rule IS the spec, and the server
