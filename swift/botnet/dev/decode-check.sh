@@ -15,6 +15,7 @@ mkdir -p "$here/build"
 swiftc -o "$bin" \
     "$here/Sources/Models.swift" \
     "$here/Sources/APIClient.swift" \
+    "$here/Sources/FactLead.swift" \
     "$here/dev/decode-check.swift"
 
 exec "$bin"

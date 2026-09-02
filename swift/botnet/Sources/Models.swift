@@ -653,18 +653,11 @@ struct Project: Identifiable, Decodable, Hashable {
     /// thresholds, where the sheets must not print "inherited (0 d)".
     var hasEffectiveLead: Bool { effectiveLeadDays > 0 }
 
-    /// The lead a dated fact added to THIS project will actually be stored
-    /// with. `createFact` in go/botnet/projects.go replaces a dated fact's
-    /// leadDays of 0 with the project's `effectiveLeadDays`, so zero is an
-    /// inherit sentinel on a fact exactly as it is on a project — and the
-    /// number it inherits is this one, not `ProjectTree.inheritedLeadDays`
-    /// (that answers the different question a project's own stepper asks).
-    /// A botnetd that derives no lead falls back to the global default it
-    /// applies server-side. The Add Fact sheet seeds its stepper from this and
-    /// labels it from this, so the seed and the label cannot drift apart.
-    var factLeadDays: Int {
-        hasEffectiveLead ? effectiveLeadDays : Project.globalDefaultLeadDays
-    }
+    // The lead a dated fact added here will actually be stored with lives in
+    // FactLead.inherited(of:), not on Project: it is shared verbatim with the
+    // iOS app, and a second copy here would be the drift this whole seam exists
+    // to prevent.
+
     var setsOwnOwner: Bool { ownerBot != nil }
     var hasOwner: Bool { effectiveOwner != nil }
 
@@ -742,8 +735,16 @@ struct ProjectFact: Identifiable, Decodable, Hashable {
     /// The deadline's instant, or a recurring fact's FIRST occurrence. Absent
     /// (and year-1) on a milestone or a note.
     var due: Date?
-    /// Days before `due` that count as due_soon. Meaningless without a due.
+    /// This fact's OWN lead window, where 0 means UNSET — take the project's.
+    /// Authored, not derived, so it is what an editor round-trips; it is NOT
+    /// what a reader should render.
     var leadDays: Int
+    /// DERIVED: `leadDays` when set, else the owning project's
+    /// `effectiveLeadDays`. This is the window that actually applies, and the
+    /// one every reader uses — the server computes due_soon from this and never
+    /// from `leadDays`, so a row reading the authored value would disagree with
+    /// the health the same response reports.
+    var effectiveLeadDays: Int
     var rrule: String?
     var tz: String?
     /// Only a deadline or a milestone can be done; a done fact affects neither
@@ -774,7 +775,7 @@ struct ProjectFact: Identifiable, Decodable, Hashable {
     var dueText: String? { DueText.relative(due) }
 
     private enum Keys: String, CodingKey {
-        case id, projectId, kind, title, due, leadDays, rrule, tz, done
+        case id, projectId, kind, title, due, leadDays, effectiveLeadDays, rrule, tz, done
         case blocker, body, eventId, createdBy, createdAt, updatedAt
     }
     init(from decoder: Decoder) throws {
@@ -785,6 +786,11 @@ struct ProjectFact: Identifiable, Decodable, Hashable {
         title = try c.decode(String.self, forKey: .title)
         due = try c.decodeIfPresent(Date.self, forKey: .due)?.nilIfServerZero
         leadDays = try c.decodeIfPresent(Int.self, forKey: .leadDays) ?? 0
+        // A botnetd that predates the split rewrote leadDays to the resolved
+        // window on create and sends no derived key, so its stored value IS the
+        // effective one. Falling back to 0 instead would drop the lead from
+        // every row on that server rather than rendering exactly as before.
+        effectiveLeadDays = try c.decodeIfPresent(Int.self, forKey: .effectiveLeadDays) ?? leadDays
         rrule = try c.decodeIfPresent(String.self, forKey: .rrule)
         tz = try c.decodeIfPresent(String.self, forKey: .tz)
         done = try c.decodeIfPresent(Bool.self, forKey: .done) ?? false
@@ -1101,12 +1107,30 @@ struct ProjectInheritance {
     }
 
     /// The Default lead stepper's label for a DRAFT value, so the sheet reads
-    /// the number the user is currently choosing. A draft of 0 does not mean a
-    /// zero-day lead — it means "take whatever is above me" — so the row says
-    /// which number that is instead of printing "0 days".
+    /// the number the user is currently choosing.
     func leadStepperText(draft: Int) -> String {
-        guard draft > 0 else { return "Default lead: inherited (\(inheritedLeadDays) d)" }
-        return "Default lead: \(draft) \(draft == 1 ? "day" : "days")"
+        Self.leadStepperText("Default lead", draft: draft, whenInherited: inheritedLeadDays)
+    }
+
+    /// The phrasing BOTH lead steppers share — this project row and the Add
+    /// Fact sheet's per-fact row through `FactLead.label`.
+    ///
+    /// Zero is the server's inherit sentinel at both levels: a project with no
+    /// `defaultLeadDays` takes its ancestor's, and a dated fact created with no
+    /// `leadDays` takes its project's. So a stepper at 0 must name the number
+    /// that will really apply rather than print "0 days", which is a window no
+    /// create can actually produce. The two levels inherit DIFFERENT numbers,
+    /// so the caller supplies it; only the wording is shared, because a user
+    /// meets both rows two clicks apart and one of them phrasing it differently
+    /// would read as a different kind of setting.
+    ///
+    /// The colon is not decoration: it appears only when the value is a phrase
+    /// rather than a number ("Lead: inherited (180 d)" against "Lead 180
+    /// days"), which is what keeps the numeric reading from looking like a
+    /// label with a stray separator.
+    static func leadStepperText(_ label: String, draft: Int, whenInherited: Int) -> String {
+        guard draft > 0 else { return "\(label): inherited (\(whenInherited) d)" }
+        return "\(label) \(draft) \(draft == 1 ? "day" : "days")"
     }
 
     /// The Owner picker's None row. Picking None on a project under an owning

@@ -827,6 +827,43 @@ struct DecodeCheck {
             }
         }
 
+        // A fact's lead split the same way a project's did: `leadDays` is what
+        // this fact AUTHORED (0 = unset), and `effectiveLeadDays` is the answer
+        // every reader uses — its own when set, else the project's. The pane
+        // must render the derived one, or a fact created without a lead of its
+        // own shows no lead at all and, worse, colors its due text on the wrong
+        // boundary: the server calls it due_soon while the row stays grey.
+        let factOwnLead = Data("""
+        {"id":"fct_lead_own","projectId":"prj_1","kind":"deadline","title":"Own lead","due":"2027-03-14T09:00:00Z","leadDays":45,"effectiveLeadDays":45,"done":false,"createdBy":"user","createdAt":"2026-09-02T08:00:00Z","updatedAt":"2026-09-02T08:00:00Z"}
+        """.utf8)
+        let factInheritedLead = Data("""
+        {"id":"fct_lead_inherit","projectId":"prj_1","kind":"deadline","title":"Inherited lead","due":"2027-03-14T09:00:00Z","leadDays":0,"effectiveLeadDays":180,"done":false,"createdBy":"user","createdAt":"2026-09-02T08:00:00Z","updatedAt":"2026-09-02T08:00:00Z"}
+        """.utf8)
+        // The server that PREDATES the split rewrote leadDays on create and
+        // sent no derived key, so its stored value IS the effective one.
+        let factOldServer = Data("""
+        {"id":"fct_lead_old","projectId":"prj_1","kind":"deadline","title":"Old server","due":"2027-03-14T09:00:00Z","leadDays":180,"done":false,"createdBy":"user","createdAt":"2026-09-02T08:00:00Z","updatedAt":"2026-09-02T08:00:00Z"}
+        """.utf8)
+        await check("ProjectFact.effectiveLeadDays: own, inherited, and an older server's") {
+            let own = try decoder.decode(ProjectFact.self, from: factOwnLead)
+            let inherited = try decoder.decode(ProjectFact.self, from: factInheritedLead)
+            let old = try decoder.decode(ProjectFact.self, from: factOldServer)
+            guard own.leadDays == 45, own.effectiveLeadDays == 45,
+                  // The whole point: authored 0, applied 180. A row reading
+                  // `leadDays` here would print nothing and grey out a fact the
+                  // server has already called due_soon.
+                  inherited.leadDays == 0, inherited.effectiveLeadDays == 180,
+                  // No derived key at all: fall back to the stored one rather
+                  // than to 0, which would silently drop the lead on an older
+                  // botnetd instead of rendering exactly as it used to.
+                  old.leadDays == 180, old.effectiveLeadDays == 180
+            else {
+                throw NSError(domain: "decode-check", code: 58, userInfo: [
+                    NSLocalizedDescriptionKey: "fact lead decoded wrong: \(own) / \(inherited) / \(old)",
+                ])
+            }
+        }
+
         // Thresholds (rock 2). `defaultLeadDays` is what THIS project sets, 0
         // meaning it sets none; `effectiveLeadDays` is the server's rolled-up
         // answer — own if set, else the nearest ancestor's, else the global 30.
@@ -949,11 +986,20 @@ struct DecodeCheck {
                   child.ownerName == "Ada", child.ownerVia == "via Document Expirations",
                   loose.ownerName == nil, loose.ownerVia == nil,
                   // Stepper: a draft of 0 is not "no lead", it is the inherited
-                  // one, so the row says which number that actually is.
-                  parent.leadStepperText(draft: 180) == "Default lead: 180 days",
+                  // one, so the row says which number that actually is. The
+                  // colon rides only on the inherited reading — the shared
+                  // builder's rule, which dev/lead-check.sh pins from the Add
+                  // Fact side, so a reword here fails there too.
+                  parent.leadStepperText(draft: 180) == "Default lead 180 days",
                   parent.leadStepperText(draft: 0) == "Default lead: inherited (30 d)",
                   child.leadStepperText(draft: 0) == "Default lead: inherited (180 d)",
-                  child.leadStepperText(draft: 1) == "Default lead: 1 day",
+                  child.leadStepperText(draft: 1) == "Default lead 1 day",
+                  // Both steppers are ONE builder: the project row and the Add
+                  // Fact row differ only in their label and in the number a 0
+                  // resolves to.
+                  FactLead.label(draft: 0, project: tree.project("p2")!)
+                      == "Lead: inherited (180 d)",
+                  FactLead.label(draft: 14, project: tree.project("p2")!) == "Lead 14 days",
                   // Owner picker's None row.
                   child.noneOwnerLabel == "None (inherited: Ada)",
                   parent.noneOwnerLabel == "None",
@@ -991,31 +1037,30 @@ struct DecodeCheck {
             """.utf8))
             let owner = projects[0], child = projects[1], oldServer = projects[2]
             guard // The number a dated fact added here actually gets. The sheet
-                  // seeds the stepper from this AND labels it from this, so the
-                  // two can never disagree.
-                  owner.factLeadDays == 180, child.factLeadDays == 180,
+                  // LABELS the stepper from this; it SEEDS at 0 so an untouched
+                  // fact keeps inheriting instead of authoring the number.
+                  FactLead.inherited(of: owner) == 180,
+                  FactLead.inherited(of: child) == 180,
+                  FactLead.initialDraft(for: child) == 0,
                   // A botnetd that derives no lead: the client names the global
                   // default it will apply rather than claiming a zero-day one.
                   !oldServer.hasEffectiveLead,
-                  oldServer.factLeadDays == Project.globalDefaultLeadDays,
+                  FactLead.inherited(of: oldServer) == Project.globalDefaultLeadDays,
                   // The reading itself, at 0 and either side of 1.
-                  ProjectInheritance.leadStepperText(
-                    "Lead", draft: 0, whenInherited: child.factLeadDays)
-                    == "Lead: inherited (180 d)",
-                  ProjectInheritance.leadStepperText(
-                    "Lead", draft: 45, whenInherited: child.factLeadDays)
-                    == "Lead: 45 days",
-                  ProjectInheritance.leadStepperText(
-                    "Lead", draft: 1, whenInherited: child.factLeadDays)
-                    == "Lead: 1 day",
-                  // The project level keeps its own wording off the same helper,
-                  // so the two rows a user meets two clicks apart agree.
-                  ProjectInheritance.leadStepperText(
-                    "Default lead", draft: 0, whenInherited: 30)
-                    == "Default lead: inherited (30 d)"
+                  FactLead.label(draft: 0, project: child) == "Lead: inherited (180 d)",
+                  FactLead.label(draft: 45, project: child) == "Lead 45 days",
+                  FactLead.label(draft: 1, project: child) == "Lead 1 day",
+                  // The inherited number is the PROJECT's effective lead, never
+                  // the ancestor lookup the project's own stepper uses: on the
+                  // child those differ (180 vs the root's 30), and borrowing the
+                  // wrong one would promise 30 where the fact will get 180.
+                  ProjectInheritance(project: child,
+                                     tree: ProjectTree(projects),
+                                     botNames: [:]).inheritedLeadDays == 180,
+                  FactLead.label(draft: 0, project: owner) == "Lead: inherited (180 d)"
             else {
                 throw NSError(domain: "decode-check", code: 57, userInfo: [
-                    NSLocalizedDescriptionKey: "fact lead reading wrong: \(ProjectInheritance.leadStepperText("Lead", draft: 0, whenInherited: child.factLeadDays)) / factLeadDays \(child.factLeadDays), \(oldServer.factLeadDays)",
+                    NSLocalizedDescriptionKey: "fact lead reading wrong: \(FactLead.label(draft: 0, project: child)) / \(FactLead.label(draft: 45, project: child)) / inherited \(FactLead.inherited(of: child)), \(FactLead.inherited(of: oldServer))",
                 ])
             }
         }
