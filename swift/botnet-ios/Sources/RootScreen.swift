@@ -106,6 +106,10 @@ struct RootScreen: View {
         case .calendar: path = [.calendar]
         case .chat:
             if let bot = store.bots.first { path = [.bot(bot.id)] }
+        case .childProject:
+            if let child = store.projects.first(where: { $0.parentId != nil }) {
+                path = [.project(child.id)]
+            }
         case .project, .addFact, .addFactRecurring:
             // The first ROOT, which is the first row the list draws — the flat
             // list's own first entry can be a child, whose parent is what the
