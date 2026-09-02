@@ -337,3 +337,85 @@ func TestFactMarshalKeepsBothLeads(t *testing.T) {
 		}
 	}
 }
+
+// TestLeadZeroRoundTripsOnEveryWritePath is the regression rock1-ui asked for,
+// stated as the property rather than as three separate walks: for EVERY route
+// that can write a lead, creating with 0 and patching to 0 must leave the same
+// stored value and the same derived one. The routes are the REST handlers, the
+// project tool, and the store beneath both.
+func TestLeadZeroRoundTripsOnEveryWritePath(t *testing.T) {
+	h := newHarness(t, &fakeLLM{})
+	bot := newBot(t, h.store)
+	tb := NewBotToolbox(h.store, bot.ID, nil)
+
+	var p Project
+	postExpect(t, http.StatusCreated, h.ts.URL+"/v1/projects",
+		`{"name":"Document Expirations","defaultLeadDays":180}`, &p)
+	factsURL := h.ts.URL + "/v1/projects/" + string(p.ID) + "/facts"
+	due := time.Now().UTC().AddDate(1, 0, 0).Format(time.RFC3339)
+
+	// Each route writes a lead of 0 twice: once on the way in, once as a patch
+	// over an explicit non-zero. Both must land in the same place.
+	restCreate := func(title, body string) Fact {
+		var f Fact
+		postExpect(t, http.StatusCreated, factsURL, body, &f)
+		return f
+	}
+	var got []struct {
+		route string
+		fact  Fact
+	}
+	add := func(route string, f Fact) {
+		got = append(got, struct {
+			route string
+			fact  Fact
+		}{route, f})
+	}
+
+	add("REST create with an explicit 0", restCreate("a",
+		`{"kind":"deadline","title":"rest zero","due":"`+due+`","leadDays":0}`))
+	add("REST create omitting the field", restCreate("b",
+		`{"kind":"deadline","title":"rest omitted","due":"`+due+`"}`))
+
+	seeded := restCreate("c", `{"kind":"deadline","title":"rest patched","due":"`+due+`","leadDays":45}`)
+	var patched Fact
+	patch(t, factsURL+"/"+string(seeded.ID), `{"leadDays":0}`, &patched)
+	add("REST patch back to 0", patched)
+
+	runProject(t, tb, `{"command":"add_fact","project":"Document Expirations","kind":"deadline",`+
+		`"title":"tool zero","due":"`+due+`","lead_days":"0"}`)
+	add("tool add_fact with lead_days 0", factNamedInTest(t, h.store, p, "tool zero"))
+
+	runProject(t, tb, `{"command":"add_fact","project":"Document Expirations","kind":"deadline",`+
+		`"title":"tool patched","due":"`+due+`","lead_days":"45"}`)
+	runProject(t, tb, `{"command":"update_fact","project":"Document Expirations",`+
+		`"title":"tool patched","lead_days":"0"}`)
+	add("tool update_fact to 0", factNamedInTest(t, h.store, p, "tool patched"))
+
+	storeMade, err := h.store.CreateFact(p.ID,
+		Fact{Kind: FactDeadline, Title: "store zero", Due: time.Now().UTC().AddDate(1, 0, 0)}, userAuthor)
+	if err != nil {
+		t.Fatalf("store create: %v", err)
+	}
+	add("store CreateFact with 0", storeMade)
+
+	for _, c := range got {
+		if c.fact.LeadDays != 0 {
+			t.Errorf("%s: stored leadDays = %d, want 0 — no route may bake a resolved lead into the row",
+				c.route, c.fact.LeadDays)
+		}
+		if c.fact.EffectiveLeadDays != 180 {
+			t.Errorf("%s: effectiveLeadDays = %d, want the project's 180",
+				c.route, c.fact.EffectiveLeadDays)
+		}
+	}
+	// And the facts are indistinguishable afterwards, which is the actual
+	// property: how a lead of 0 got there must not survive in the data.
+	for _, c := range got[1:] {
+		if c.fact.LeadDays != got[0].fact.LeadDays || c.fact.EffectiveLeadDays != got[0].fact.EffectiveLeadDays {
+			t.Errorf("%s left %d/%d but %s left %d/%d; the route must not be readable from the result",
+				c.route, c.fact.LeadDays, c.fact.EffectiveLeadDays,
+				got[0].route, got[0].fact.LeadDays, got[0].fact.EffectiveLeadDays)
+		}
+	}
+}

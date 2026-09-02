@@ -1090,8 +1090,14 @@ func boolArg(a projectArgs, name string) (value, supplied bool, errText string) 
 // daysArg reads one optional day-count field ("lead_days" on a fact,
 // "default_lead_days" on a project) as a whole number of days. One function
 // rather than two, so the two windows cannot end up parsing or refusing
-// differently — and "0" is a real supplied value, which is how a model clears a
-// project's own threshold.
+// differently.
+//
+// "0" is a real supplied value at both levels, and at both it means INHERIT:
+// on a fact it hands the window back to the project, on a project it clears
+// that project's own threshold so the nearest ancestor's applies again. The
+// supplied flag therefore has to survive all the way to the store — a caller
+// that collapses it back into "unset" is what made create and patch disagree
+// (see the LeadDays DECISION in schema.go).
 func daysArg(a projectArgs, name string) (value int, supplied bool, errText string) {
 	raw, ok := a.field(name)
 	if !ok {
