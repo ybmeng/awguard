@@ -246,9 +246,9 @@ rediscover the hard way.
 
 - `swift/botnet-ios/` is a second xcodegen target (BotNetMobile) that compiles
   Models, APIClient, Store, Transcript and DesignSystem from `../botnet/Sources`
-  BY PATH. Any AppKit call added to one of those five files breaks the phone
+  BY PATH (plus FactLead). Any AppKit call added to a shared file breaks the phone
   build silently until someone builds it. Run `swift/botnet-ios/dev/shared-check.sh`
-  (compiles the five against the iphonesimulator SDK alone) as a third gate next
+  (compiles the shared files against the iphonesimulator SDK alone) as a third gate next
   to the two Release builds whenever you touch a shared file; wrap AppKit in
   `#if canImport(AppKit)` with a UIKit twin, as DesignSystem's Palette bridge does.
   Keep shared-file edits additive and source-compatible: no renames, no signature

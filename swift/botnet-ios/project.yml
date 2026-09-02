@@ -16,6 +16,7 @@ targets:
       - path: ../botnet/Sources/Store.swift
       - path: ../botnet/Sources/Transcript.swift
       - path: ../botnet/Sources/DesignSystem.swift
+      - path: ../botnet/Sources/FactLead.swift
     info:
       path: Info.plist
       properties:

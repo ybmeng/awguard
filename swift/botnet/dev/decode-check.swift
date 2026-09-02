@@ -970,6 +970,56 @@ struct DecodeCheck {
             }
         }
 
+        // The FACT stepper's reading. Zero is the server's inherit sentinel at
+        // both levels — createFact in go/botnet/projects.go substitutes the
+        // project's EffectiveLeadDays for a dated fact whose leadDays is 0 —
+        // so a stepper sitting at 0 has to name the number that will really
+        // apply. It cannot be screenshotted (reaching 0 means clicking a
+        // stepper thirty times and the offscreen render has no click), which
+        // is exactly why the string is asserted here.
+        //
+        // The two levels inherit DIFFERENT numbers, which is the trap: a
+        // project at 0 takes its ancestor's `inheritedLeadDays`, while a fact
+        // at 0 takes its project's `effectiveLeadDays` — that already folds in
+        // the project's own value. Sharing one number here would print 30
+        // where the fact is actually going to get 180.
+        await check("fact lead stepper: 0 reads as the project's effective lead") {
+            let projects = try decoder.decode([Project].self, from: Data("""
+            [{"id":"p1","name":"Document Expirations","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2","defaultLeadDays":180,"effectiveLeadDays":180,"childCount":1},
+             {"id":"p2","name":"Passport","parentId":"p1","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2","effectiveLeadDays":180},
+             {"id":"p3","name":"Old server","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2"}]
+            """.utf8))
+            let owner = projects[0], child = projects[1], oldServer = projects[2]
+            guard // The number a dated fact added here actually gets. The sheet
+                  // seeds the stepper from this AND labels it from this, so the
+                  // two can never disagree.
+                  owner.factLeadDays == 180, child.factLeadDays == 180,
+                  // A botnetd that derives no lead: the client names the global
+                  // default it will apply rather than claiming a zero-day one.
+                  !oldServer.hasEffectiveLead,
+                  oldServer.factLeadDays == Project.globalDefaultLeadDays,
+                  // The reading itself, at 0 and either side of 1.
+                  ProjectInheritance.leadStepperText(
+                    "Lead", draft: 0, whenInherited: child.factLeadDays)
+                    == "Lead: inherited (180 d)",
+                  ProjectInheritance.leadStepperText(
+                    "Lead", draft: 45, whenInherited: child.factLeadDays)
+                    == "Lead: 45 days",
+                  ProjectInheritance.leadStepperText(
+                    "Lead", draft: 1, whenInherited: child.factLeadDays)
+                    == "Lead: 1 day",
+                  // The project level keeps its own wording off the same helper,
+                  // so the two rows a user meets two clicks apart agree.
+                  ProjectInheritance.leadStepperText(
+                    "Default lead", draft: 0, whenInherited: 30)
+                    == "Default lead: inherited (30 d)"
+            else {
+                throw NSError(domain: "decode-check", code: 57, userInfo: [
+                    NSLocalizedDescriptionKey: "fact lead reading wrong: \(ProjectInheritance.leadStepperText("Lead", draft: 0, whenInherited: child.factLeadDays)) / factLeadDays \(child.factLeadDays), \(oldServer.factLeadDays)",
+                ])
+            }
+        }
+
         // The four kinds the sheet offers are a Swift enum with a field table;
         // the table is what decides which inputs show, so it is checked here
         // rather than only by eye in a screenshot.

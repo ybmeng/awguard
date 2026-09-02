@@ -18,7 +18,7 @@ trap 'rm -rf "$out"' EXIT
 xcrun swiftc -o "$out/lead-check" \
   "$shared/Models.swift" \
   "$shared/APIClient.swift" \
-  "$here/Sources/FactLead.swift" \
+  "$shared/FactLead.swift" \
   "$here/dev/lead-check.swift"
 
 "$out/lead-check"

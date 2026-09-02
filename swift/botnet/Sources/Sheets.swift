@@ -731,12 +731,7 @@ struct AddFactSheet: View {
         self.project = project
         self.initialKind = initialKind
         _kind = State(initialValue: initialKind)
-        // The project's lead, not a flat 30: a fact created with no lead of its
-        // own gets exactly this server-side, so the sheet opening on anything
-        // else would show a number the fact is not going to have. A botnetd
-        // that derives none falls back to the global default it applies.
-        _leadDays = State(initialValue: project.hasEffectiveLead
-                          ? project.effectiveLeadDays : Project.globalDefaultLeadDays)
+        _leadDays = State(initialValue: FactLead.initialDraft(for: project))
     }
 
     private var trimmedTitle: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -765,9 +760,8 @@ struct AddFactSheet: View {
                                    displayedComponents: [.date, .hourAndMinute])
                     }
                     if kind.fields.contains(.leadDays) {
-                        // The window that makes this fact "due soon". The
-                        // server's own default is 30 days.
-                        Stepper("Lead \(leadDays) days", value: $leadDays, in: 0...365)
+                        Stepper(FactLead.label(draft: leadDays, project: project),
+                                value: $leadDays, in: 0...365)
                     }
                     if kind.fields.contains(.rrule) {
                         // Typed verbatim: the rule IS the spec, and the server

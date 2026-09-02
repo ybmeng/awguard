@@ -652,6 +652,19 @@ struct Project: Identifiable, Decodable, Hashable {
     /// The server derived a lead at all — false only on a botnetd that predates
     /// thresholds, where the sheets must not print "inherited (0 d)".
     var hasEffectiveLead: Bool { effectiveLeadDays > 0 }
+
+    /// The lead a dated fact added to THIS project will actually be stored
+    /// with. `createFact` in go/botnet/projects.go replaces a dated fact's
+    /// leadDays of 0 with the project's `effectiveLeadDays`, so zero is an
+    /// inherit sentinel on a fact exactly as it is on a project — and the
+    /// number it inherits is this one, not `ProjectTree.inheritedLeadDays`
+    /// (that answers the different question a project's own stepper asks).
+    /// A botnetd that derives no lead falls back to the global default it
+    /// applies server-side. The Add Fact sheet seeds its stepper from this and
+    /// labels it from this, so the seed and the label cannot drift apart.
+    var factLeadDays: Int {
+        hasEffectiveLead ? effectiveLeadDays : Project.globalDefaultLeadDays
+    }
     var setsOwnOwner: Bool { ownerBot != nil }
     var hasOwner: Bool { effectiveOwner != nil }
 

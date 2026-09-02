@@ -19,7 +19,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 shared="$here/../botnet/Sources"
 
 # The files the iOS app compiles from the Mac's tree.
-files=(Models.swift APIClient.swift Store.swift Transcript.swift DesignSystem.swift)
+files=(Models.swift APIClient.swift Store.swift Transcript.swift DesignSystem.swift FactLead.swift)
 
 paths=()
 missing=()

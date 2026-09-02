@@ -1,4 +1,4 @@
-// FactLead.swift — what the Add Fact sheet's lead row SAYS, kept out of the
+// FactLead.swift — what the Add Fact sheet's lead row SAYS on BOTH apps, kept out of the
 // view so it can be proven without one (dev/lead-check.sh).
 //
 // The rule it encodes is a server rule, not a display choice. Creating a dated
