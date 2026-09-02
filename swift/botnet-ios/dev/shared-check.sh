@@ -43,12 +43,25 @@ sdk="$(xcrun --sdk iphonesimulator --show-sdk-path)"
 # The simulator triple follows the host arch: arm64 on Apple silicon.
 arch="$(uname -m)"
 
-xcrun swiftc \
+if ! xcrun swiftc \
   -sdk "$sdk" \
   -target "${arch}-apple-ios17.0-simulator" \
   -parse-as-library \
   -emit-library -o /dev/null \
   -Xclang-linker -isysroot -Xclang-linker "$sdk" \
   "${paths[@]}"
+then
+    # A tree that predates the iOS platform fork fails here for a reason that
+    # has nothing to do with the change under test, and an adopter who cannot
+    # tell that apart from a real AppKit leak will rationally start ignoring
+    # this gate. Say which one it is.
+    if ! grep -q "canImport(AppKit)" "$shared/DesignSystem.swift"; then
+        echo >&2
+        echo "shared-check: this tree has no iOS platform fork in DesignSystem.swift," >&2
+        echo "shared-check: so the failure above is EXPECTED and is not caused by your change." >&2
+        echo "shared-check: the gate is only meaningful once that fork has landed here." >&2
+    fi
+    exit 1
+fi
 
 echo "shared layer compiles for iOS (${#paths[@]} files)"
