@@ -827,6 +827,149 @@ struct DecodeCheck {
             }
         }
 
+        // Thresholds (rock 2). `defaultLeadDays` is what THIS project sets, 0
+        // meaning it sets none; `effectiveLeadDays` is the server's rolled-up
+        // answer — own if set, else the nearest ancestor's, else the global 30.
+        // Both are omitempty ints, so a server that predates them sends neither
+        // key and both read as 0, which the app must treat as "no answer yet"
+        // rather than as a zero-day lead.
+        let ownLeadProject = Data("""
+        {"id":"prj_lead_own","name":"Document Expirations","goal":"","createdBy":"user","createdAt":"2026-09-01T08:09:00Z","updatedAt":"2026-09-01T08:09:00Z","health":"ok","severity":"S2","defaultLeadDays":180,"effectiveLeadDays":180,"factCount":0,"childCount":1}
+        """.utf8)
+        let inheritedLeadProject = Data("""
+        {"id":"prj_lead_child","name":"Passport","goal":"","parentId":"prj_lead_own","createdBy":"user","createdAt":"2026-09-01T08:10:00Z","updatedAt":"2026-09-01T08:10:00Z","health":"ok","severity":"S2","effectiveLeadDays":180,"factCount":2}
+        """.utf8)
+        await check("Project.defaultLeadDays/effectiveLeadDays: own, inherited, and absent") {
+            let own = try decoder.decode(Project.self, from: ownLeadProject)
+            let inherited = try decoder.decode(Project.self, from: inheritedLeadProject)
+            // The pre-thresholds server: neither key, and the app must know it
+            // has no answer rather than reading a zero-day lead off the wire.
+            let old = try decoder.decode(Project.self, from: bareProject)
+            guard own.defaultLeadDays == 180, own.setsOwnLead, own.effectiveLeadDays == 180,
+                  // omitempty drops a zero defaultLeadDays entirely: the child
+                  // sets none of its own but still gets the derived answer.
+                  inherited.defaultLeadDays == 0, !inherited.setsOwnLead,
+                  inherited.effectiveLeadDays == 180, inherited.hasEffectiveLead,
+                  old.defaultLeadDays == 0, old.effectiveLeadDays == 0,
+                  !old.setsOwnLead, !old.hasEffectiveLead
+            else {
+                throw NSError(domain: "decode-check", code: 53, userInfo: [
+                    NSLocalizedDescriptionKey: "lead days decoded wrong: \(own) / \(inherited) / \(old)",
+                ])
+            }
+        }
+
+        // Owner (rock 3). Same two-spellings problem as parentId: omitempty
+        // drops an unset owner, and a server that sends "" means the same
+        // thing — one notion of "nobody owns this", not two.
+        let ownedProject = Data("""
+        {"id":"prj_owner_own","name":"Document Expirations","goal":"","createdBy":"user","createdAt":"2026-09-01T08:09:00Z","updatedAt":"2026-09-01T08:09:00Z","health":"ok","severity":"S2","ownerBot":"bot_01M16K3W6TZ0EHQFPKZ490BDX2","effectiveOwner":"bot_01M16K3W6TZ0EHQFPKZ490BDX2","factCount":0,"childCount":1}
+        """.utf8)
+        let inheritedOwnerProject = Data("""
+        {"id":"prj_owner_child","name":"Passport","goal":"","parentId":"prj_owner_own","createdBy":"user","createdAt":"2026-09-01T08:10:00Z","updatedAt":"2026-09-01T08:10:00Z","health":"ok","severity":"S2","effectiveOwner":"bot_01M16K3W6TZ0EHQFPKZ490BDX2","factCount":2}
+        """.utf8)
+        let emptyOwnerProject = Data("""
+        {"id":"prj_owner_blank","name":"Loose","goal":"","createdBy":"user","createdAt":"2026-09-01T08:11:00Z","updatedAt":"2026-09-01T08:11:00Z","health":"ok","severity":"S2","ownerBot":"","effectiveOwner":"","factCount":1}
+        """.utf8)
+        await check("Project.ownerBot/effectiveOwner: own, inherited, \"\" and absent") {
+            let owned = try decoder.decode(Project.self, from: ownedProject)
+            let inherited = try decoder.decode(Project.self, from: inheritedOwnerProject)
+            let blank = try decoder.decode(Project.self, from: emptyOwnerProject)
+            let old = try decoder.decode(Project.self, from: bareProject)
+            guard owned.ownerBot == "bot_01M16K3W6TZ0EHQFPKZ490BDX2", owned.setsOwnOwner,
+                  owned.effectiveOwner == owned.ownerBot, owned.hasOwner,
+                  inherited.ownerBot == nil, !inherited.setsOwnOwner,
+                  inherited.effectiveOwner == "bot_01M16K3W6TZ0EHQFPKZ490BDX2", inherited.hasOwner,
+                  // "" is the other spelling of unset, and must not read as a
+                  // bot id no avatar can be drawn for.
+                  blank.ownerBot == nil, blank.effectiveOwner == nil, !blank.hasOwner,
+                  old.ownerBot == nil, old.effectiveOwner == nil, !old.hasOwner
+            else {
+                throw NSError(domain: "decode-check", code: 54, userInfo: [
+                    NSLocalizedDescriptionKey: "owner decoded wrong: \(owned) / \(inherited) / \(blank) / \(old)",
+                ])
+            }
+        }
+
+        // Which project a value was inherited FROM is not on the wire — the
+        // server sends only the rolled-up answer — so the tree answers it, and
+        // the pane's "via <parent>" and the sheets' "inherited (N d)" are two
+        // readings of that one walk rather than two walks of their own.
+        await check("ProjectTree resolves where a lead and an owner come from") {
+            let flat = try decoder.decode([Project].self, from: Data("""
+            [{"id":"p1","name":"Document Expirations","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2","defaultLeadDays":180,"effectiveLeadDays":180,"ownerBot":"bot_ada","effectiveOwner":"bot_ada","childCount":1},
+             {"id":"p2","name":"Passport","parentId":"p1","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2","effectiveLeadDays":180,"effectiveOwner":"bot_ada","childCount":1},
+             {"id":"p3","name":"Renewal appointment","parentId":"p2","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2","defaultLeadDays":7,"effectiveLeadDays":7,"ownerBot":"bot_lin","effectiveOwner":"bot_lin"},
+             {"id":"p9","name":"Singapore Pte Ltd","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2","effectiveLeadDays":30}]
+            """.utf8))
+            let tree = ProjectTree(flat)
+            guard // Self-first: who supplies the value in force today.
+                  tree.leadSource(for: "p1")?.id == "p1",
+                  tree.leadSource(for: "p2")?.id == "p1",
+                  tree.leadSource(for: "p3")?.id == "p3",
+                  tree.leadSource(for: "p9") == nil,
+                  tree.ownerSource(for: "p2")?.id == "p1",
+                  tree.ownerSource(for: "p3")?.id == "p3",
+                  tree.ownerSource(for: "p9") == nil,
+                  // Strict ancestors: what the project would fall back to if it
+                  // cleared its own, which is what the sheet has to say while
+                  // the stepper sits at 0.
+                  tree.inheritedLeadSource(for: "p3")?.id == "p1",
+                  tree.inheritedLeadDays(for: "p3") == 180,
+                  tree.inheritedOwnerSource(for: "p3")?.id == "p1",
+                  // Nobody above sets one: the global default, not 0.
+                  tree.inheritedLeadSource(for: "p1") == nil,
+                  tree.inheritedLeadDays(for: "p1") == Project.globalDefaultLeadDays,
+                  tree.inheritedLeadDays(for: "p9") == Project.globalDefaultLeadDays,
+                  tree.inheritedOwnerSource(for: "p1") == nil
+            else {
+                throw NSError(domain: "decode-check", code: 55, userInfo: [
+                    NSLocalizedDescriptionKey: "inheritance sources wrong: lead p2 \(String(describing: tree.leadSource(for: "p2")?.id)), owner p2 \(String(describing: tree.ownerSource(for: "p2")?.id))",
+                ])
+            }
+        }
+
+        // The four readings the sheets and the pane header print. They are a
+        // value, not view code, so a wording change is caught here rather than
+        // by eye in a screenshot.
+        await check("ProjectInheritance prints the own/inherited readings") {
+            let flat = try decoder.decode([Project].self, from: Data("""
+            [{"id":"p1","name":"Document Expirations","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2","defaultLeadDays":180,"effectiveLeadDays":180,"ownerBot":"bot_ada","effectiveOwner":"bot_ada","childCount":1},
+             {"id":"p2","name":"Passport","parentId":"p1","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2","effectiveLeadDays":180,"effectiveOwner":"bot_ada"},
+             {"id":"p9","name":"Singapore Pte Ltd","createdAt":"2026-09-01T08:00:00Z","updatedAt":"2026-09-01T08:00:00Z","health":"ok","severity":"S2","effectiveLeadDays":30}]
+            """.utf8))
+            let tree = ProjectTree(flat)
+            let names = ["bot_ada": "Ada"]
+            let parent = ProjectInheritance(project: tree.project("p1")!, tree: tree, botNames: names)
+            let child = ProjectInheritance(project: tree.project("p2")!, tree: tree, botNames: names)
+            let loose = ProjectInheritance(project: tree.project("p9")!, tree: tree, botNames: names)
+            guard // Header: the owner reads plainly on the project that sets it
+                  // and carries where it came from on the one that does not.
+                  parent.ownerName == "Ada", parent.ownerVia == nil,
+                  child.ownerName == "Ada", child.ownerVia == "via Document Expirations",
+                  loose.ownerName == nil, loose.ownerVia == nil,
+                  // Stepper: a draft of 0 is not "no lead", it is the inherited
+                  // one, so the row says which number that actually is.
+                  parent.leadStepperText(draft: 180) == "Default lead: 180 days",
+                  parent.leadStepperText(draft: 0) == "Default lead: inherited (30 d)",
+                  child.leadStepperText(draft: 0) == "Default lead: inherited (180 d)",
+                  child.leadStepperText(draft: 1) == "Default lead: 1 day",
+                  // Owner picker's None row.
+                  child.noneOwnerLabel == "None (inherited: Ada)",
+                  parent.noneOwnerLabel == "None",
+                  loose.noneOwnerLabel == "None",
+                  // The facts empty state names the lead a new dated fact gets.
+                  child.emptyFactsText.contains("180-day lead"),
+                  // A bot the client has no name for still renders, as its id.
+                  ProjectInheritance(project: tree.project("p2")!, tree: tree,
+                                     botNames: [:]).ownerName == "bot_ada"
+            else {
+                throw NSError(domain: "decode-check", code: 56, userInfo: [
+                    NSLocalizedDescriptionKey: "inheritance readings wrong: \(child.leadStepperText(draft: 0)) / \(String(describing: child.ownerVia)) / \(child.noneOwnerLabel)",
+                ])
+            }
+        }
+
         // The four kinds the sheet offers are a Swift enum with a field table;
         // the table is what decides which inputs show, so it is checked here
         // rather than only by eye in a screenshot.
@@ -972,6 +1115,45 @@ struct DecodeCheck {
                         throw NSError(domain: "decode-check", code: 53, userInfo: [
                             NSLocalizedDescriptionKey: "unreachable projects: \(ids.subtracting(reachable))",
                         ])
+                    }
+                } catch let e where APIClient.isUnimplemented(e) {}
+            }
+            // The client derives ONE thing the server does not send: what a
+            // project would inherit if it set nothing of its own. That
+            // derivation is only safe while it agrees with the server's rule,
+            // so the live list is the place it gets checked — on every project
+            // that already sets nothing, the client's walk must land on exactly
+            // the effective values the server derived.
+            await check("live projects: the client's inheritance walk matches the server's derivation") {
+                do {
+                    let projects = try await api.listProjects()
+                    let tree = ProjectTree(projects)
+                    for p in projects {
+                        // A server that predates the fields sends 0, which is
+                        // "no answer", not a zero-day lead — nothing to check.
+                        guard p.hasEffectiveLead else { continue }
+                        if p.setsOwnLead {
+                            guard p.effectiveLeadDays == p.defaultLeadDays else {
+                                throw NSError(domain: "decode-check", code: 57, userInfo: [
+                                    NSLocalizedDescriptionKey: "\(p.name) sets lead \(p.defaultLeadDays) but the server derived \(p.effectiveLeadDays)",
+                                ])
+                            }
+                        } else {
+                            guard tree.inheritedLeadDays(for: p.id) == p.effectiveLeadDays else {
+                                throw NSError(domain: "decode-check", code: 57, userInfo: [
+                                    NSLocalizedDescriptionKey: "\(p.name): client would inherit \(tree.inheritedLeadDays(for: p.id))d, the server derived \(p.effectiveLeadDays)d",
+                                ])
+                            }
+                        }
+                        // Same for the owner: whichever project the client's
+                        // walk lands on must be the one whose bot the server
+                        // rolled up.
+                        let source = tree.ownerSource(for: p.id)
+                        guard source?.ownerBot == p.effectiveOwner else {
+                            throw NSError(domain: "decode-check", code: 57, userInfo: [
+                                NSLocalizedDescriptionKey: "\(p.name): client's owner walk lands on \(source?.name ?? "nobody") (\(source?.ownerBot ?? "-")), the server derived \(p.effectiveOwner ?? "-")",
+                            ])
+                        }
                     }
                 } catch let e where APIClient.isUnimplemented(e) {}
             }

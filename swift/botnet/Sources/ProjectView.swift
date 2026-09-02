@@ -26,6 +26,13 @@ struct ProjectView: View {
 
     private var parent: Project? { tree.project(project.parentId ?? "") }
 
+    /// The lead and the owner in force, and where each came from. One value
+    /// shared with both project sheets, so the header's "via Passport" and the
+    /// Edit sheet's "None (inherited: Ada)" can never disagree about the chain.
+    private var inheritance: ProjectInheritance {
+        ProjectInheritance(project: project, tree: tree, botNames: store.botNames)
+    }
+
     /// The detail's own `children` is the fallback for a list that hasn't
     /// arrived yet — the route answers for this project specifically.
     private var children: [Project] {
@@ -129,6 +136,7 @@ struct ProjectView: View {
                 .foregroundStyle(Palette.primaryText)
                 .lineLimit(1)
             healthBadge
+            ownerChip
             Spacer()
             Button("New Sub-project") { sheet = .newSubProject }
                 .help("Create a project under \(project.name)")
@@ -173,6 +181,37 @@ struct ProjectView: View {
         .background(Palette.fieldFill, in: Capsule())
     }
 
+    // Who is answerable. Beside the badge because the two are read together:
+    // the badge says how bad it is, this says whose problem it is — and it is
+    // the bot the tick actually nudges when the badge gets worse.
+    //
+    // The avatar is the EFFECTIVE owner, so a sub-project under an owned parent
+    // shows a face rather than nothing; "via <parent>" is what keeps that from
+    // reading as a setting on this project. Nothing at all when no one owns it:
+    // an "Unowned" chip on every project would be noise on the common case.
+    @ViewBuilder
+    private var ownerChip: some View {
+        if let name = inheritance.ownerName, let botID = inheritance.ownerBotID {
+            HStack(spacing: 5) {
+                BotAvatar(botID: botID, size: Metric.ownerAvatar)
+                Text(name)
+                    .font(TypeScale.rowMeta)
+                    .foregroundStyle(Palette.secondaryText)
+                    .lineLimit(1)
+                if let via = inheritance.ownerVia {
+                    Text(via)
+                        .font(TypeScale.rowMeta)
+                        .foregroundStyle(Palette.tertiaryText)
+                        .lineLimit(1)
+                }
+            }
+            .layoutPriority(-1)
+            .help(inheritance.ownerVia == nil
+                  ? "\(name) owns \(project.name) and is nudged when its health gets worse"
+                  : "\(name) owns this by inheritance \(inheritance.ownerVia ?? "") and is nudged when its health gets worse")
+        }
+    }
+
     // The sub-projects, as links rather than as a second tree: the sidebar is
     // where the hierarchy is navigated, and duplicating its disclosure here
     // would be a second walk to keep in step. Each row says what the parent's
@@ -198,9 +237,13 @@ struct ProjectView: View {
         // the store keeps them apart so the pane can say which.
         if let facts = store.facts(for: project.id) {
             if facts.isEmpty {
-                Text("No facts yet. Add a deadline, a recurring obligation, a milestone or a note.")
+                // Names the lead a dated fact added here would get: it is the
+                // one project-level setting an empty list cannot show, and the
+                // number the Add Fact sheet is about to pre-fill.
+                Text(inheritance.emptyFactsText)
                     .font(TypeScale.rowPreview)
                     .foregroundStyle(Palette.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 VStack(alignment: .leading, spacing: Metric.eventRowGap) {
                     ForEach(facts) { fact in

@@ -464,9 +464,25 @@ struct NewProjectSheet: View {
 
     @State private var name = ""
     @State private var goal = ""
+    /// 0 is "set none of my own", which is what a new project usually wants:
+    /// the parent's lead is already the right answer, and the stepper says so.
+    @State private var defaultLeadDays = 0
+    /// "" is None. A new sub-project under an owned parent is already owned by
+    /// inheritance, so this starts empty rather than pre-picking the parent's
+    /// bot — copying it down would freeze the child against a later handover.
+    @State private var ownerBot = ""
     @State private var saving = false
 
     private var trimmedName: String { name.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    private var tree: ProjectTree { ProjectTree(store.projects) }
+
+    /// What the project WILL inherit, read off the parent the server has
+    /// already rolled up — the same value type the pane header and the Edit
+    /// sheet read, so all three say the same thing about the same chain.
+    private var inheritance: ProjectInheritance {
+        ProjectInheritance(newChildOf: parent, tree: tree, botNames: store.botNames)
+    }
 
     var body: some View {
         NavigationStack {
@@ -478,6 +494,13 @@ struct NewProjectSheet: View {
                     TextField("Name", text: $name)
                     if let parent {
                         LabeledContent("Parent", value: parent.name)
+                    }
+                    // Hidden against a botnetd that predates thresholds, which
+                    // would accept the keys and drop them.
+                    if tree.supportsThresholds {
+                        ProjectThresholdRows(inheritance: inheritance,
+                                             defaultLeadDays: $defaultLeadDays,
+                                             ownerBot: $ownerBot)
                     }
                 }
                 Section("Goal") {
@@ -503,7 +526,8 @@ struct NewProjectSheet: View {
                         Task {
                             let created = await store.createProject(
                                 name: trimmedName, goal: cleaned(goal),
-                                parentID: parent?.id ?? "")
+                                parentID: parent?.id ?? "",
+                                defaultLeadDays: defaultLeadDays, ownerBot: ownerBot)
                             saving = false
                             // A failed create (duplicate name) keeps the sheet
                             // open with the draft; the shared alert explains.
@@ -539,6 +563,11 @@ struct EditProjectSheet: View {
     /// "" is None, the top level — the same value the PATCH sends to clear it,
     /// so the picker's selection needs no translation on the way out.
     @State private var parentID: String
+    /// 0 is "inherit", and it is what the PATCH sends to clear an own lead —
+    /// same no-translation stance as `parentID`.
+    @State private var defaultLeadDays: Int
+    /// "" is None, which is also what the PATCH sends to clear the owner.
+    @State private var ownerBot: String
     @State private var saving = false
 
     init(project: Project) {
@@ -546,14 +575,31 @@ struct EditProjectSheet: View {
         _name = State(initialValue: project.name)
         _goal = State(initialValue: project.goal)
         _parentID = State(initialValue: project.parentId ?? "")
+        // The project's OWN settings, not the effective ones: an inherited
+        // value shown as this project's own would be written back as its own
+        // the moment anything else on the sheet changed.
+        _defaultLeadDays = State(initialValue: project.defaultLeadDays)
+        _ownerBot = State(initialValue: project.ownerBot ?? "")
     }
 
     private var trimmedName: String { name.trimmingCharacters(in: .whitespacesAndNewlines) }
 
+    private var tree: ProjectTree { ProjectTree(store.projects) }
+
     /// Rendered with each candidate's depth so two entries at different levels
     /// stay tellable apart; which projects qualify is the tree's own rule.
-    private var candidates: [ProjectTree.Row] {
-        ProjectTree(store.projects).parentCandidates(for: project.id)
+    private var candidates: [ProjectTree.Row] { tree.parentCandidates(for: project.id) }
+
+    /// Read against the DRAFT parent, not the stored one: with the Parent
+    /// picker moved to another project, "inherited (180 d)" has to be what this
+    /// project will take after Save, not what it takes now. An unchanged picker
+    /// reads the project itself, which also carries its effective values.
+    private var inheritance: ProjectInheritance {
+        guard parentID != (project.parentId ?? "") else {
+            return ProjectInheritance(project: project, tree: tree, botNames: store.botNames)
+        }
+        return ProjectInheritance(newChildOf: tree.project(parentID), tree: tree,
+                                  botNames: store.botNames)
     }
 
     var body: some View {
@@ -567,6 +613,11 @@ struct EditProjectSheet: View {
                             Text(String(repeating: "   ", count: row.depth) + row.project.name)
                                 .tag(row.project.id)
                         }
+                    }
+                    if tree.supportsThresholds {
+                        ProjectThresholdRows(inheritance: inheritance,
+                                             defaultLeadDays: $defaultLeadDays,
+                                             ownerBot: $ownerBot)
                     }
                 }
                 Section("Goal") {
@@ -590,7 +641,7 @@ struct EditProjectSheet: View {
                     Button(saving ? "Saving…" : "Save") {
                         saving = true
                         Task {
-                            let saved = await store.updateProject(project, fields: changes)
+                            let saved = await store.updateProject(project, values: changes)
                             saving = false
                             if saved { dismiss() }
                         }
@@ -601,15 +652,53 @@ struct EditProjectSheet: View {
         }
     }
 
-    private var changes: [String: String] {
-        var fields: [String: String] = [:]
+    /// Heterogeneous because `defaultLeadDays` is an int on the wire; the rest
+    /// are strings. Only what changed goes, so a bot writing another field
+    /// while the sheet was open keeps its write.
+    private var changes: [String: Any] {
+        var fields: [String: Any] = [:]
         if trimmedName != project.name { fields["name"] = trimmedName }
         let trimmedGoal = goal.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedGoal != project.goal { fields["goal"] = trimmedGoal }
         // Only on a real move, and "" is how the wire says "back to the top
         // level" — the key's presence is what asks for the change at all.
         if parentID != (project.parentId ?? "") { fields["parentId"] = parentID }
+        // 0 and "" are real values here, not omissions: they clear an own
+        // setting back to inherited, which is why the comparison is against the
+        // project's OWN value and never against the effective one.
+        if defaultLeadDays != project.defaultLeadDays {
+            fields["defaultLeadDays"] = defaultLeadDays
+        }
+        if ownerBot != (project.ownerBot ?? "") { fields["ownerBot"] = ownerBot }
         return fields
+    }
+}
+
+/// The two threshold rows both project sheets show, in one place so the New and
+/// Edit forms cannot drift apart on the wording or on what 0/"" mean. The
+/// readings come from `ProjectInheritance`, which is where they are proven.
+private struct ProjectThresholdRows: View {
+    @EnvironmentObject var store: AppStore
+    let inheritance: ProjectInheritance
+    @Binding var defaultLeadDays: Int
+    @Binding var ownerBot: String
+
+    var body: some View {
+        // 0 is a legal value here, unlike the Add Fact sheet's per-fact lead:
+        // it means "take the one above me", and the label says which number
+        // that is rather than printing "0 days".
+        Stepper(inheritance.leadStepperText(draft: defaultLeadDays),
+                value: $defaultLeadDays, in: 0...365)
+            .help("Days before a dated fact's due date that count as due soon. 0 takes the lead from the parent project.")
+        Picker("Owner", selection: $ownerBot) {
+            Text(inheritance.noneOwnerLabel).tag("")
+            // By display name, which is what the tool's `owner` argument takes
+            // and the only handle a person has on a bot.
+            ForEach(store.bots) { bot in
+                Text(bot.displayName).tag(bot.id)
+            }
+        }
+        .help("The bot nudged when this project's health gets worse.")
     }
 }
 
@@ -631,7 +720,7 @@ struct AddFactSheet: View {
     @State private var kind: FactKind
     @State private var title = ""
     @State private var due = AddFactSheet.defaultDue()
-    @State private var leadDays = 30
+    @State private var leadDays: Int
     @State private var rrule = ""
     @State private var tz = TimeZone.current.identifier
     @State private var blocker = ""
@@ -642,6 +731,12 @@ struct AddFactSheet: View {
         self.project = project
         self.initialKind = initialKind
         _kind = State(initialValue: initialKind)
+        // The project's lead, not a flat 30: a fact created with no lead of its
+        // own gets exactly this server-side, so the sheet opening on anything
+        // else would show a number the fact is not going to have. A botnetd
+        // that derives none falls back to the global default it applies.
+        _leadDays = State(initialValue: project.hasEffectiveLead
+                          ? project.effectiveLeadDays : Project.globalDefaultLeadDays)
     }
 
     private var trimmedTitle: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }

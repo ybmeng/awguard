@@ -229,9 +229,10 @@ struct APIClient {
 
     // MARK: projects
     //
-    // A project's health, severity, nextDue, factCount and childCount are
-    // derived server-side and read-only here — a PATCH carries only
-    // {name, goal, parentId}. Facts are typed, so their bodies are
+    // A project's health, severity, nextDue, factCount, childCount,
+    // effectiveLeadDays and effectiveOwner are derived server-side and
+    // read-only here — a PATCH carries only the settable
+    // {name, goal, parentId, defaultLeadDays, ownerBot}. Facts are typed, so their bodies are
     // heterogeneous JSON ({done: bool, leadDays: int}) rather than the flat
     // string maps the calendar routes use. 404 on any of these means a botnetd
     // that predates projects, which callers hide.
@@ -252,19 +253,35 @@ struct APIClient {
     /// createdBy is the server's call: a project posted here is "user".
     /// An empty goal is omitted rather than sent as "", matching the wire shape
     /// a bot's tool call produces; an empty parentId likewise means top level,
-    /// and the server validates that a given one exists.
-    func createProject(name: String, goal: String, parentID: String = "") async throws -> Project {
-        var body = ["name": name]
+    /// and the server validates that a given one exists. A zero lead and an
+    /// empty owner are omitted for the same reason: on a create they mean "set
+    /// none", which is what leaving the key out already says.
+    func createProject(name: String, goal: String, parentID: String = "",
+                       defaultLeadDays: Int = 0, ownerBot: String = "") async throws -> Project {
+        var body: [String: Any] = ["name": name]
         if !goal.isEmpty { body["goal"] = goal }
         if !parentID.isEmpty { body["parentId"] = parentID }
-        return try await send("/v1/projects", method: "POST", body: body)
+        // An int on the wire, not a string — which is why the create body is
+        // heterogeneous JSON like a fact's rather than a flat string map.
+        if defaultLeadDays > 0 { body["defaultLeadDays"] = defaultLeadDays }
+        if !ownerBot.isEmpty { body["ownerBot"] = ownerBot }
+        return try await send("/v1/projects", method: "POST", json: body)
     }
 
     /// `fields` is any subset of {name, goal, parentId}; an empty string clears
     /// the goal, and `parentId: ""` moves the project back to the top level.
     /// The derived fields are not patchable and must never appear here.
     func updateProject(_ id: String, fields: [String: String]) async throws -> Project {
-        try await send("/v1/projects/\(id)", method: "PATCH", body: fields)
+        try await updateProject(id, values: fields)
+    }
+
+    /// The same PATCH with a heterogeneous body, for the keys that are not
+    /// strings: `defaultLeadDays` is an int (0 clears it back to inherited),
+    /// while `ownerBot` is a bot id and "" clears it. Separate from the string
+    /// form rather than replacing it so the callers that only move or rename
+    /// keep their typed dictionaries.
+    func updateProject(_ id: String, values: [String: Any]) async throws -> Project {
+        try await send("/v1/projects/\(id)", method: "PATCH", json: values)
     }
 
     /// CASCADES server-side: the project's facts and their projected calendar

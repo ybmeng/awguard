@@ -23,6 +23,11 @@ enum Palette {
     static let hairline = dynamic(light: 0xE4E4E1, dark: 0x38383A)
     static let primaryText = dynamic(light: 0x111111, dark: 0xF2F2F2)
     static let secondaryText = dynamic(light: 0x8B8B90, dark: 0x98989E)
+    /// A third step down, for a qualifier that must not compete with the thing
+    /// it qualifies — the project header's "via <parent>" beside its owner's
+    /// name. Set apart from secondaryText enough to read as a lower tier at
+    /// rowMeta size without disappearing on either ground.
+    static let tertiaryText = dynamic(light: 0xAEAEB2, dark: 0x76767C)
     static let attention = dynamic(light: 0xE1830B, dark: 0xF0A03C)
 
     // The six calendar colors, named for the server's color enum. Each pair is
@@ -182,6 +187,10 @@ enum Metric {
     /// A project's health dot in the sidebar and in the pane's badge. Same size
     /// family as freshnessDot, separate so the two can retune apart.
     static let healthDot: CGFloat = 7
+    /// The owner's avatar in the project pane's header. Smaller than
+    /// avatarSmall: it sits inline with rowMeta text beside the health badge,
+    /// where a sidebar-sized blob would outweigh the project's own name.
+    static let ownerAvatar: CGFloat = 16
     /// How far one level of the project tree indents its rows. Smaller than
     /// sidebarIndent (which sets a whole section in from its header): these
     /// steps stack, and a section three projects deep must not run out of row.

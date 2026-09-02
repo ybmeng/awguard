@@ -8,6 +8,13 @@ import Foundation
 @MainActor
 final class AppStore: ObservableObject {
     @Published private(set) var bots: [Bot] = []
+    /// Display names by bot id, for the places that name a bot they do not own
+    /// — a project's owner is one. Derived from `bots` on read rather than
+    /// cached, so a rename propagates with the next refresh like everything
+    /// else, and an id no longer in the list simply misses.
+    var botNames: [String: String] {
+        bots.reduce(into: [:]) { $0[$1.id] = $1.displayName }
+    }
     @Published private(set) var conversations: [String: [Message]] = [:] // botId → messages
     @Published private(set) var segments: [String: [Segment]] = [:]      // botId → chain
     @Published private(set) var models: [ModelOption] = ModelOption.roster
@@ -518,9 +525,12 @@ final class AppStore: ObservableObject {
 
     /// Returns the created project so the caller can select it; nil when the
     /// create failed, which keeps the sheet open with its draft.
-    func createProject(name: String, goal: String, parentID: String = "") async -> Project? {
+    func createProject(name: String, goal: String, parentID: String = "",
+                       defaultLeadDays: Int = 0, ownerBot: String = "") async -> Project? {
         do {
-            let created = try await api.createProject(name: name, goal: goal, parentID: parentID)
+            let created = try await api.createProject(
+                name: name, goal: goal, parentID: parentID,
+                defaultLeadDays: defaultLeadDays, ownerBot: ownerBot)
             await refreshProjects()
             // The parent's own detail now has one more child and possibly a
             // worse rolled-up severity; its cached copy has neither.
@@ -537,9 +547,18 @@ final class AppStore: ObservableObject {
     /// bot's tool wrote to it while the sheet was open.
     @discardableResult
     func updateProject(_ project: Project, fields: [String: String]) async -> Bool {
+        await updateProject(project, values: fields)
+    }
+
+    /// The same edit with a heterogeneous body — `defaultLeadDays` is an int
+    /// and 0 clears it, `ownerBot` is a bot id and "" clears it — so the sheet
+    /// can send a threshold without stringifying a number the server parses as
+    /// one.
+    @discardableResult
+    func updateProject(_ project: Project, values fields: [String: Any]) async -> Bool {
         guard !fields.isEmpty else { return true }
         do {
-            let updated = try await api.updateProject(project.id, fields: fields)
+            let updated = try await api.updateProject(project.id, values: fields)
             if let i = projects.firstIndex(where: { $0.id == updated.id }) {
                 projects[i] = updated
             }
