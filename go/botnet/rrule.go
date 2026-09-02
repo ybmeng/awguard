@@ -1,4 +1,14 @@
-package calendar
+package botnet
+
+// The RRULE expander: PORTED from go/std/bg_services/calendar (now retired),
+// adapted to botnet's Event. The engine is unchanged — parse a supported
+// RFC 5545 subset, iterate period-by-period on a wall-clock carrier, anchor
+// each occurrence into the event's zone — so the std suite's table-driven
+// DST/ordinal/BYSETPOS fixtures pin it here too (rrule_test.go). What the
+// adaptation changes is only the boundary: botnet stores absolute RFC3339 UTC
+// instants (StartsAt/EndsAt, the FIRST occurrence), so expandEvent first
+// recovers the wall clock from StartsAt in TZ, and botnet's v1 has no EXDATE
+// and no all-day events, so those two knobs did not come along.
 
 import (
 	"fmt"
@@ -6,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	_ "time/tzdata" // embed the IANA zone db; never depend on host /usr/share/zoneinfo
 )
 
 // maxPeriods caps how many candidate periods expansion will walk, so a rule
@@ -31,10 +43,10 @@ type byDayEntry struct {
 	wd  time.Weekday
 }
 
-// rule is a parsed RRULE, restricted to the supported v1 subset. Anything
+// rrule is a parsed RRULE, restricted to the supported subset. Anything
 // outside it is rejected by parseRRULE with an error naming the offending
 // param — never silently dropped.
-type rule struct {
+type rrule struct {
 	freq       freq
 	interval   int       // >= 1; default 1
 	count      int       // 0 = unset; mutually exclusive with until
@@ -51,11 +63,20 @@ var weekdayCodes = map[string]time.Weekday{
 	"TH": time.Thursday, "FR": time.Friday, "SA": time.Saturday,
 }
 
+// rruleWallLayout is the wall-clock form UNTIL accepts alongside the RFC-basic
+// ones: RFC3339 without an offset, matching the rule's wall-clock semantics.
+const (
+	rruleWallLayout = "2006-01-02T15:04:05"
+	rruleDateLayout = "2006-01-02"
+)
+
 // parseRRULE parses an RFC 5545 recurrence rule string like
 // "FREQ=WEEKLY;BYDAY=MO;COUNT=4". It runs at the write boundary (so bad rules
-// never reach the store) and again before expansion.
-func parseRRULE(s string) (*rule, error) {
-	r := &rule{interval: 1, wkst: time.Monday}
+// never reach the store) and again before expansion. Its errors are the
+// instructive text the tool and REST paths surface, so they teach: an
+// unsupported param echoes the whole supported subset.
+func parseRRULE(s string) (*rrule, error) {
+	r := &rrule{interval: 1, wkst: time.Monday}
 	seenFreq := false
 	for _, part := range strings.Split(strings.TrimPrefix(s, "RRULE:"), ";") {
 		key, val, ok := strings.Cut(part, "=")
@@ -76,7 +97,7 @@ func parseRRULE(s string) (*rule, error) {
 			case "YEARLY":
 				r.freq = freqYearly
 			case "HOURLY", "MINUTELY", "SECONDLY":
-				return nil, fmt.Errorf("rrule: FREQ=%s is not supported in v1 (sub-daily frequencies are out of scope)", val)
+				return nil, fmt.Errorf("rrule: FREQ=%s is not supported (sub-daily frequencies are out of scope)", val)
 			default:
 				return nil, fmt.Errorf("rrule: unknown FREQ %q (want DAILY, WEEKLY, MONTHLY or YEARLY)", val)
 			}
@@ -138,7 +159,7 @@ func parseRRULE(s string) (*rule, error) {
 			}
 			r.wkst = wd
 		default:
-			return nil, fmt.Errorf("rrule: param %s is not supported in v1 (supported: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH, BYSETPOS, WKST)", key)
+			return nil, fmt.Errorf("rrule: param %s is not supported (supported: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH, BYSETPOS, WKST)", key)
 		}
 	}
 	if !seenFreq {
@@ -158,7 +179,7 @@ func parseRRULE(s string) (*rule, error) {
 		return nil, fmt.Errorf("rrule: BYMONTHDAY cannot be combined with FREQ=WEEKLY (RFC 5545)")
 	}
 	if r.freq == freqYearly && len(r.byDay) > 0 && len(r.byMonth) == 0 {
-		return nil, fmt.Errorf("rrule: FREQ=YEARLY with BYDAY requires BYMONTH in v1 (full-year weekday expansion is not supported)")
+		return nil, fmt.Errorf("rrule: FREQ=YEARLY with BYDAY requires BYMONTH (full-year weekday expansion is not supported)")
 	}
 	if len(r.bySetPos) > 0 && len(r.byDay)+len(r.byMonthDay)+len(r.byMonth) == 0 {
 		return nil, fmt.Errorf("rrule: BYSETPOS requires another BY* part to select from (RFC 5545)")
@@ -168,18 +189,19 @@ func parseRRULE(s string) (*rule, error) {
 
 // parseUntil reads an UNTIL value.
 //
-// DECISION: UNTIL is compared on the wall clock in the event's zone,
-// inclusive, per RFC. The RFC-basic forms ("19971224T000000Z", with or
-// without the Z) are accepted so canonical rules transcribe directly, but a Z
-// suffix is still read as wall clock — v1 stores no absolute times.
+// DECISION (kept from the std expander): UNTIL is compared on the wall clock
+// in the event's zone, inclusive, per RFC. The RFC-basic forms
+// ("19971224T000000Z", with or without the Z) are accepted so canonical rules
+// transcribe directly, but a Z suffix is still read as wall clock — the rule
+// carries no absolute times.
 func parseUntil(val string) (time.Time, error) {
 	v := strings.TrimSuffix(val, "Z")
-	for _, layout := range []string{wallLayout, dateLayout, "20060102T150405", "20060102"} {
+	for _, layout := range []string{rruleWallLayout, rruleDateLayout, "20060102T150405", "20060102"} {
 		if t, err := time.ParseInLocation(layout, v, time.UTC); err == nil {
 			return t, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("rrule: bad UNTIL %q (want %s, %s, or RFC basic 20060102T150405)", val, wallLayout, dateLayout)
+	return time.Time{}, fmt.Errorf("rrule: bad UNTIL %q (want %s, %s, or RFC basic 20060102T150405)", val, rruleWallLayout, rruleDateLayout)
 }
 
 func parseByDay(entry string) (byDayEntry, error) {
@@ -204,70 +226,85 @@ func dayCode(wd time.Weekday) string {
 	return [...]string{"SU", "MO", "TU", "WE", "TH", "FR", "SA"}[wd]
 }
 
-// Expand returns the concrete instances of ev intersecting [from, to), sorted
-// ascending by start. Iteration happens on the wall-clock carrier; only the
-// emitted instants are anchored into the event's zone, which is what keeps a
-// "9am weekly" at 9am on both sides of a DST switch.
+// expandEvent returns the concrete instances of ev intersecting [from, to),
+// sorted ascending by start. A single event (no RRule) passes through as one
+// instance under the same overlap rule ListEvents uses (endsAt > from AND
+// startsAt < to). A recurring event iterates on the wall-clock carrier
+// recovered from StartsAt in TZ; only the emitted instants are anchored back
+// into the zone, which is what keeps a "9am weekly" at 9am on both sides of a
+// DST switch.
 //
-// DECISION (DTSTART): the event's Start is not special-cased — instances come
-// purely from the rule, iterated period-by-period from Start (never from
-// `from`, because COUNT counts from DTSTART). An event whose Start does not
-// itself match its RRULE simply does not yield that phantom first instance.
+// DECISION (DTSTART, kept from the std expander): the event's StartsAt is not
+// special-cased — instances come purely from the rule, iterated
+// period-by-period from StartsAt (never from `from`, because COUNT counts
+// from DTSTART). An event whose start does not itself match its RRULE simply
+// does not yield that phantom first instance.
 //
-// DECISION (instance end): each instance's end is the wall-clock delta between
-// the event's Start and End carriers added to the instance's wall start, then
-// anchored — so a 9–10am meeting is 9–10am on both sides of a DST switch, not
-// a fixed absolute duration.
-func Expand(ev Event, from, to time.Time) ([]Instance, error) {
+// DECISION (instance end, kept): each instance's end is the wall-clock delta
+// between the event's start and end carriers added to the instance's wall
+// start, then anchored — so a 9–10am meeting is 9–10am on both sides of a DST
+// switch, not a fixed absolute duration.
+func expandEvent(ev Event, from, to time.Time) ([]Instance, error) {
+	if ev.RRule == "" {
+		if ev.EndsAt.After(from) && ev.StartsAt.Before(to) {
+			return []Instance{instanceOf(ev, ev.StartsAt, ev.EndsAt, false)}, nil
+		}
+		return nil, nil
+	}
 	loc, err := time.LoadLocation(ev.TZ)
 	if err != nil {
 		return nil, fmt.Errorf("event %s: unknown tz %q: %w", ev.ID, ev.TZ, err)
 	}
-	startW, err := parseWall(ev.Start, ev.AllDay)
+	r, err := parseRRULE(ev.RRule)
 	if err != nil {
-		return nil, fmt.Errorf("event %s: start: %w", ev.ID, err)
+		return nil, fmt.Errorf("event %s: %w", ev.ID, err)
 	}
-	endW, err := parseWall(ev.End, ev.AllDay)
-	if err != nil {
-		return nil, fmt.Errorf("event %s: end: %w", ev.ID, err)
-	}
-	dur := endW.Sub(startW)
-
-	walls := []time.Time{startW}
-	if ev.RRULE != "" {
-		r, err := parseRRULE(ev.RRULE)
-		if err != nil {
-			return nil, fmt.Errorf("event %s: %w", ev.ID, err)
-		}
-		walls = r.occurrences(startW, wallLimit(to, loc))
-	}
-
-	excluded := make(map[string]bool, len(ev.EXDATE))
-	for _, x := range ev.EXDATE {
-		w, err := parseWall(x, ev.AllDay)
-		if err != nil {
-			return nil, fmt.Errorf("event %s: exdate: %w", ev.ID, err)
-		}
-		excluded[formatWall(w, ev.AllDay)] = true
-	}
+	startW := wallCarrier(ev.StartsAt, loc)
+	dur := wallCarrier(ev.EndsAt, loc).Sub(startW)
 
 	var out []Instance
-	for _, w := range walls {
-		if excluded[formatWall(w, ev.AllDay)] {
-			continue
-		}
+	for _, w := range r.occurrences(startW, wallLimit(to, loc)) {
 		st := anchor(w, loc)
 		en := anchor(w.Add(dur), loc)
 		if !st.Before(to) || !en.After(from) {
 			continue
 		}
-		out = append(out, Instance{
-			EventID: ev.ID, Title: ev.Title, Location: ev.Location,
-			AllDay: ev.AllDay, Start: st, End: en,
-		})
+		out = append(out, instanceOf(ev, st, en, true))
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Start.Before(out[j].Start) })
+	sort.Slice(out, func(i, j int) bool { return out[i].StartsAt.Before(out[j].StartsAt) })
 	return out, nil
+}
+
+// instanceOf projects one occurrence of a master event.
+func instanceOf(ev Event, st, en time.Time, recurring bool) Instance {
+	return Instance{
+		EventID: ev.ID, CalendarID: ev.CalendarID, Title: ev.Title,
+		StartsAt: st, EndsAt: en,
+		Location: ev.Location, Notes: ev.Notes, Automation: ev.Automation,
+		Recurring: recurring, CreatedBy: ev.CreatedBy,
+	}
+}
+
+// wallCarrier strips an absolute instant to its wall-clock components in loc,
+// carried in time.UTC. UTC here is NOT a claim about the zone — it is a pure
+// calendar-arithmetic space with no DST, so recurrence iteration can add days
+// and months without ever crossing a transition. anchor() is the inverse.
+func wallCarrier(t time.Time, loc *time.Location) time.Time {
+	w := t.In(loc)
+	return time.Date(w.Year(), w.Month(), w.Day(), w.Hour(), w.Minute(), w.Second(), 0, time.UTC)
+}
+
+// anchor turns a wall-clock carrier into the absolute instant with those wall
+// components in loc.
+//
+// DECISION (nonexistent wall times, kept from the std expander): a wall time
+// inside a spring-forward gap (e.g. 02:30 on a US DST start date) does not
+// exist in loc; time.Date resolves it to a real instant by normalization (for
+// the US gap, 02:30 comes back as 01:30 standard time). That is the defined
+// behavior, not fought — skipping or erroring would lose instances users
+// expect to see.
+func anchor(w time.Time, loc *time.Location) time.Time {
+	return time.Date(w.Year(), w.Month(), w.Day(), w.Hour(), w.Minute(), w.Second(), 0, loc)
 }
 
 // wallLimit converts the window's exclusive end into a wall-clock carrier
@@ -281,9 +318,9 @@ func wallLimit(to time.Time, loc *time.Location) time.Time {
 // occurrences generates the rule's wall-clock instance starts from startW
 // (DTSTART) up to limit. Per period: candidates are generated (expansions) or
 // filtered (limits), sorted, BYSETPOS selects, candidates before DTSTART are
-// dropped, then COUNT/UNTIL terminate. EXDATE and the window filter are the
-// caller's, applied after — an excluded instance still consumes COUNT.
-func (r *rule) occurrences(startW, limit time.Time) []time.Time {
+// dropped, then COUNT/UNTIL terminate. The window filter is the caller's,
+// applied after.
+func (r *rrule) occurrences(startW, limit time.Time) []time.Time {
 	var out []time.Time
 	emitted := 0
 	emit := func(cands []time.Time) (stop bool) {
@@ -318,7 +355,7 @@ func (r *rule) occurrences(startW, limit time.Time) []time.Time {
 	return out
 }
 
-func (r *rule) daily(startW, limit time.Time, emit func([]time.Time) bool) {
+func (r *rrule) daily(startW, limit time.Time, emit func([]time.Time) bool) {
 	clock := clockOf(startW)
 	day := dayOf(startW)
 	for i := 0; i < maxPeriods; i++ {
@@ -332,7 +369,7 @@ func (r *rule) daily(startW, limit time.Time, emit func([]time.Time) bool) {
 	}
 }
 
-func (r *rule) weekly(startW, limit time.Time, emit func([]time.Time) bool) {
+func (r *rrule) weekly(startW, limit time.Time, emit func([]time.Time) bool) {
 	clock := clockOf(startW)
 	weekStart := startOfWeek(dayOf(startW), r.wkst)
 	weekdays := make(map[time.Weekday]bool, len(r.byDay))
@@ -360,7 +397,7 @@ func (r *rule) weekly(startW, limit time.Time, emit func([]time.Time) bool) {
 	}
 }
 
-func (r *rule) monthly(startW, limit time.Time, emit func([]time.Time) bool) {
+func (r *rrule) monthly(startW, limit time.Time, emit func([]time.Time) bool) {
 	clock := clockOf(startW)
 	idx := startW.Year()*12 + int(startW.Month()) - 1
 	for i := 0; i < maxPeriods; i++ {
@@ -385,7 +422,7 @@ func (r *rule) monthly(startW, limit time.Time, emit func([]time.Time) bool) {
 // yearly expands BYMONTH (or the start's month) then applies the monthly
 // day logic within each month. BYSETPOS still selects over the whole year's
 // candidate list — the period is the year, per RFC.
-func (r *rule) yearly(startW, limit time.Time, emit func([]time.Time) bool) {
+func (r *rrule) yearly(startW, limit time.Time, emit func([]time.Time) bool) {
 	clock := clockOf(startW)
 	months := r.byMonth
 	if len(months) == 0 {
@@ -412,11 +449,11 @@ func (r *rule) yearly(startW, limit time.Time, emit func([]time.Time) bool) {
 
 // monthDays returns the sorted days of (y, m) the rule selects.
 //
-// DECISION (short months): a MONTHLY/YEARLY rule with neither BYMONTHDAY nor
-// BYDAY recurs on the start's day-of-month, and a month lacking that day
-// (Jan 31 -> February) produces no instance rather than clamping to the
-// month's last day.
-func (r *rule) monthDays(y int, m time.Month, startDay int) []int {
+// DECISION (short months, kept): a MONTHLY/YEARLY rule with neither
+// BYMONTHDAY nor BYDAY recurs on the start's day-of-month, and a month
+// lacking that day (Jan 31 -> February) produces no instance rather than
+// clamping to the month's last day.
+func (r *rrule) monthDays(y int, m time.Month, startDay int) []int {
 	n := daysIn(y, m)
 	var set map[int]bool
 	switch {
@@ -452,7 +489,7 @@ func (r *rule) monthDays(y int, m time.Month, startDay int) []int {
 // every such weekday, ord n the nth, ord -n the nth from the month's end.
 // Out-of-range ordinals (a fifth Monday in a four-Monday month) select
 // nothing.
-func (r *rule) byDaySet(y int, m time.Month, n int) map[int]bool {
+func (r *rrule) byDaySet(y int, m time.Month, n int) map[int]bool {
 	set := map[int]bool{}
 	for _, bd := range r.byDay {
 		var days []int
@@ -515,11 +552,11 @@ func applySetPos(cands []time.Time, pos []int) []time.Time {
 	return out
 }
 
-func (r *rule) pastUntil(periodStart time.Time) bool {
+func (r *rrule) pastUntil(periodStart time.Time) bool {
 	return !r.until.IsZero() && periodStart.After(r.until)
 }
 
-func (r *rule) monthAllowed(m time.Month) bool {
+func (r *rrule) monthAllowed(m time.Month) bool {
 	if len(r.byMonth) == 0 {
 		return true
 	}
@@ -533,7 +570,7 @@ func (r *rule) monthAllowed(m time.Month) bool {
 
 // dayAllowed applies the DAILY limits: BYMONTH, BYMONTHDAY and BYDAY all
 // filter the day rather than expanding anything.
-func (r *rule) dayAllowed(day time.Time) bool {
+func (r *rrule) dayAllowed(day time.Time) bool {
 	if !r.monthAllowed(day.Month()) {
 		return false
 	}

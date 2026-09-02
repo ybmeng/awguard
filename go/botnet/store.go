@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -181,6 +182,19 @@ CREATE TABLE IF NOT EXISTS events (
 );
 -- The calendar is read as a time range far more than by id.
 CREATE INDEX IF NOT EXISTS idx_events_starts ON events(starts_at);
+-- Named calendars partition the events table. No default flag and no reserved
+-- id: the default is the calendar NAMED "Personal", ensured on demand — see the
+-- Calendar DECISIONs in schema.go. Name uniqueness is case-insensitive, and the
+-- index makes the database enforce it rather than a Go check remembering to.
+CREATE TABLE IF NOT EXISTS calendars (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    color      TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_calendars_name ON calendars(name COLLATE NOCASE);
 -- Bookkeeping for one-shot migration steps; see once().
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -194,7 +208,7 @@ CREATE TABLE IF NOT EXISTS meta (
 -- cursor silently resolve to the wrong place instead of failing.
 CREATE TABLE IF NOT EXISTS change_log (
     seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity    TEXT NOT NULL, -- 'bot' | 'message' | 'segment' | 'event'
+    entity    TEXT NOT NULL, -- 'bot' | 'message' | 'segment' | 'event' | 'calendar'
     entity_id TEXT NOT NULL,
     op        TEXT NOT NULL  -- 'created' | 'updated' | 'destroyed'
 );
@@ -234,6 +248,15 @@ END;
 CREATE TRIGGER IF NOT EXISTS chg_event_destroyed AFTER DELETE ON events BEGIN
     INSERT INTO change_log (entity, entity_id, op) VALUES ('event', OLD.id, 'destroyed');
 END;
+CREATE TRIGGER IF NOT EXISTS chg_calendar_created AFTER INSERT ON calendars BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('calendar', NEW.id, 'created');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_calendar_updated AFTER UPDATE ON calendars BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('calendar', NEW.id, 'updated');
+END;
+CREATE TRIGGER IF NOT EXISTS chg_calendar_destroyed AFTER DELETE ON calendars BEGIN
+    INSERT INTO change_log (entity, entity_id, op) VALUES ('calendar', OLD.id, 'destroyed');
+END;
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -257,6 +280,20 @@ END;
 		// (the common case). Same rationale as citations: it rides the message
 		// INSERT, so change_log capture needs no new write path.
 		{"messages", "tool_calls", `TEXT NOT NULL DEFAULT ''`},
+		// calendar_id is logically NOT NULL without a real default: the DEFAULT ''
+		// exists only so the column can be added to a live table, and the backfill
+		// below immediately points every '' row at the ensured Personal calendar.
+		// Current write paths always resolve a real calendar before inserting.
+		{"events", "calendar_id", `TEXT NOT NULL DEFAULT ''`},
+		// Recurrence + firing (the Event DECISIONs in schema.go). '' / 0 are the
+		// real defaults — a pre-recurrence row decodes as a single, non-firing
+		// event with no backfill to run. The fields ride the existing rows, so
+		// the chg_event_*/chg_calendar_* triggers capture their edits with no
+		// new write path and NO new synced entity.
+		{"events", "rrule", `TEXT NOT NULL DEFAULT ''`},
+		{"events", "tz", `TEXT NOT NULL DEFAULT ''`},
+		{"events", "automation", `TEXT NOT NULL DEFAULT ''`},
+		{"calendars", "executable", `INTEGER NOT NULL DEFAULT 0`},
 	}
 	for _, c := range added {
 		if err := s.addColumn(c.table, c.column, c.decl); err != nil {
@@ -425,6 +462,24 @@ SELECT b.id, m.sent_at, m.content FROM bots b
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_one_awaiting
 		   ON messages(bot_id) WHERE status = 'awaiting'`); err != nil {
 		return fmt.Errorf("create one-awaiting index: %w", err)
+	}
+
+	// 7. Every pre-calendar event joins the Personal calendar, through the SAME
+	//    ensure every unqualified write uses. The guard is the '' the column was
+	//    added with, so a database with no stragglers — a fresh one included —
+	//    never conjures a Personal calendar just by being opened.
+	var one int
+	err = s.db.QueryRow(`SELECT 1 FROM events WHERE calendar_id = '' LIMIT 1`).Scan(&one)
+	if err == nil {
+		personal, err := s.EnsurePersonalCalendar()
+		if err != nil {
+			return fmt.Errorf("backfill event calendars: %w", err)
+		}
+		if _, err := s.db.Exec(`UPDATE events SET calendar_id = ? WHERE calendar_id = ''`, personal.ID); err != nil {
+			return fmt.Errorf("backfill event calendars: %w", err)
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("backfill event calendars: %w", err)
 	}
 	return nil
 }
@@ -1121,6 +1176,308 @@ func getBot(q dbtx, id BotID) (Bot, error) {
 	return b, nil
 }
 
+// ── Calendars ─────────────────────────────────────────────────────────────────
+// Named calendars partition the events table. Everything here is an ordinary
+// INSERT/UPDATE/DELETE, so the chg_calendar_* triggers capture every write with
+// no Go code remembering to. Timestamps use the events table's fixed-width
+// format: ListCalendars orders by created_at as TEXT, and only fixed width
+// makes that agree with chronology — the same lesson the events table carries.
+
+const calendarColumns = `id, name, color, created_by, created_at, updated_at, executable`
+
+// calendarColors is the color enum, in the order create cycles through when
+// the caller names no color.
+var calendarColors = []string{"blue", "green", "orange", "purple", "red", "teal"}
+
+// personalCalendarName is the name the default-calendar ensure keys on — see
+// the Calendar DECISION in schema.go: an ensure by name, not a flag.
+const personalCalendarName = "Personal"
+
+func scanCalendar(sc interface{ Scan(...any) error }) (Calendar, error) {
+	var c Calendar
+	var createdAt, updatedAt string
+	var executable int
+	if err := sc.Scan(&c.ID, &c.Name, &c.Color, &c.CreatedBy, &createdAt, &updatedAt, &executable); err != nil {
+		return Calendar{}, err
+	}
+	c.Executable = executable != 0
+	var err error
+	if c.CreatedAt, err = parseEventTime(createdAt); err != nil {
+		return Calendar{}, fmt.Errorf("parse created_at: %w", err)
+	}
+	if c.UpdatedAt, err = parseEventTime(updatedAt); err != nil {
+		return Calendar{}, fmt.Errorf("parse updated_at: %w", err)
+	}
+	return c, nil
+}
+
+// validateCalendar is the ONE place a calendar's own rules live, so the REST
+// handlers and the tool commands — which all come through the store methods
+// below — cannot end up enforcing different ones. It runs on the calendar as
+// it would be STORED, name already trimmed and color already assigned.
+func validateCalendar(c Calendar) error {
+	if c.Name == "" {
+		return fmt.Errorf("%w: name must not be empty", ErrInvalid)
+	}
+	if len([]rune(c.Name)) > 64 {
+		return fmt.Errorf("%w: name must be at most 64 characters", ErrInvalid)
+	}
+	valid := false
+	for _, v := range calendarColors {
+		valid = valid || v == c.Color
+	}
+	if !valid {
+		return fmt.Errorf("%w: color %q is not one of %s", ErrInvalid, c.Color, strings.Join(calendarColors, ", "))
+	}
+	return nil
+}
+
+// CreateCalendar stores one calendar and returns it as stored. The id, the
+// author and both timestamps are stamped here, exactly as CreateEvent stamps
+// an event's. An empty color is assigned by cycling calendarColors on the
+// count of existing calendars, so a run of unnamed creates comes out visually
+// distinct rather than uniformly blue. executable marks the calendar whose
+// events may fire automations (see the Calendar DECISION); it is authored on
+// create like name and color, and flippable later via UpdateCalendar.
+func (s *Store) CreateCalendar(name, color, createdBy string, executable bool) (Calendar, error) {
+	var cal Calendar
+	err := s.tx(func(q dbtx) error {
+		var err error
+		cal, err = createCalendar(q, name, color, createdBy, executable)
+		return err
+	})
+	if err != nil {
+		return Calendar{}, err
+	}
+	return cal, nil
+}
+
+// createCalendar is the one insert path, shared by CreateCalendar and the
+// Personal ensure. It runs inside the caller's transaction so the dup-name
+// check and the insert cannot interleave; the NOCASE unique index is the
+// structural backstop, and the check exists so a duplicate reports ErrInvalid
+// rather than a raw constraint violation.
+func createCalendar(q dbtx, name, color, createdBy string, executable bool) (Calendar, error) {
+	now := time.Now().UTC().Truncate(time.Second)
+	cal := Calendar{
+		ID:         CalendarID(newID("cal_")),
+		Name:       strings.TrimSpace(name),
+		Color:      color,
+		CreatedBy:  createdBy,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Executable: executable,
+	}
+	if cal.Color == "" {
+		var n int
+		if err := q.QueryRow(`SELECT COUNT(*) FROM calendars`).Scan(&n); err != nil {
+			return Calendar{}, fmt.Errorf("count calendars: %w", err)
+		}
+		cal.Color = calendarColors[n%len(calendarColors)]
+	}
+	if err := validateCalendar(cal); err != nil {
+		return Calendar{}, err
+	}
+	if existing, err := calendarByName(q, cal.Name); err == nil {
+		return Calendar{}, fmt.Errorf("%w: a calendar named %q already exists", ErrInvalid, existing.Name)
+	} else if !errors.Is(err, ErrNotFound) {
+		return Calendar{}, err
+	}
+	if _, err := q.Exec(
+		`INSERT INTO calendars (`+calendarColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		cal.ID, cal.Name, cal.Color, cal.CreatedBy,
+		fmtEventTime(cal.CreatedAt), fmtEventTime(cal.UpdatedAt), boolInt(cal.Executable)); err != nil {
+		return Calendar{}, fmt.Errorf("create calendar: %w", err)
+	}
+	return cal, nil
+}
+
+// boolInt is SQLite's boolean: the executable column stores 0/1.
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// GetCalendar loads one calendar by id.
+func (s *Store) GetCalendar(id CalendarID) (Calendar, error) { return getCalendar(s.db, id) }
+
+func getCalendar(q dbtx, id CalendarID) (Calendar, error) {
+	c, err := scanCalendar(q.QueryRow(`SELECT `+calendarColumns+` FROM calendars WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Calendar{}, ErrNotFound
+	}
+	if err != nil {
+		return Calendar{}, fmt.Errorf("get calendar: %w", err)
+	}
+	return c, nil
+}
+
+// CalendarByName finds a calendar by its name, case-insensitively — how the
+// calendar tool resolves the name a model typed, and how the Personal ensure
+// decides whether it has anything to do.
+func (s *Store) CalendarByName(name string) (Calendar, error) { return calendarByName(s.db, name) }
+
+func calendarByName(q dbtx, name string) (Calendar, error) {
+	c, err := scanCalendar(q.QueryRow(
+		`SELECT `+calendarColumns+` FROM calendars WHERE name = ? COLLATE NOCASE`,
+		strings.TrimSpace(name)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Calendar{}, ErrNotFound
+	}
+	if err != nil {
+		return Calendar{}, fmt.Errorf("calendar by name: %w", err)
+	}
+	return c, nil
+}
+
+// EnsurePersonalCalendar returns the calendar named "Personal"
+// (case-insensitively), creating it — color "blue", createdBy "user" — if it
+// does not exist. Idempotent by construction: the lookup and the create share
+// a transaction, so two ensures cannot both insert. Every write path that
+// needs a calendar and was given none comes here, the migration backfill
+// included, which is what makes deleting "Personal" legal — it self-heals on
+// the next unqualified write.
+func (s *Store) EnsurePersonalCalendar() (Calendar, error) {
+	var cal Calendar
+	err := s.tx(func(q dbtx) error {
+		var err error
+		cal, err = ensurePersonalCalendar(q)
+		return err
+	})
+	if err != nil {
+		return Calendar{}, err
+	}
+	return cal, nil
+}
+
+func ensurePersonalCalendar(q dbtx) (Calendar, error) {
+	cal, err := calendarByName(q, personalCalendarName)
+	if err == nil {
+		return cal, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return Calendar{}, err
+	}
+	return createCalendar(q, personalCalendarName, "blue", userAuthor, false)
+}
+
+// CalendarPatch is the set of fields an update may change; a nil field is left
+// alone. No version to condition on — calendars are last-write-wins, the same
+// DECISION events carry.
+type CalendarPatch struct {
+	Name       *string `json:"name"`
+	Color      *string `json:"color"`
+	Executable *bool   `json:"executable"` // flips whether its events may fire automations
+}
+
+// UpdateCalendar applies a partial patch and returns the calendar as stored.
+// The read, the dup-name check and the write share a transaction, for the same
+// reason UpdateEvent's do: last-write-wins is about which value survives, not
+// about letting a concurrent patch clobber a field it never named.
+func (s *Store) UpdateCalendar(id CalendarID, p CalendarPatch) (Calendar, error) {
+	var cal Calendar
+	err := s.tx(func(q dbtx) error {
+		var err error
+		if cal, err = getCalendar(q, id); err != nil {
+			return err
+		}
+		if p.Name != nil {
+			cal.Name = strings.TrimSpace(*p.Name)
+		}
+		if p.Color != nil {
+			cal.Color = *p.Color
+		}
+		if p.Executable != nil {
+			cal.Executable = *p.Executable
+		}
+		if err := validateCalendar(cal); err != nil {
+			return err
+		}
+		if existing, err := calendarByName(q, cal.Name); err == nil && existing.ID != id {
+			return fmt.Errorf("%w: a calendar named %q already exists", ErrInvalid, existing.Name)
+		} else if err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		cal.UpdatedAt = time.Now().UTC().Truncate(time.Second)
+		if _, err := q.Exec(`UPDATE calendars SET name = ?, color = ?, executable = ?, updated_at = ? WHERE id = ?`,
+			cal.Name, cal.Color, boolInt(cal.Executable), fmtEventTime(cal.UpdatedAt), id); err != nil {
+			return fmt.Errorf("update calendar: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return Calendar{}, err
+	}
+	return cal, nil
+}
+
+// DeleteCalendar removes a calendar AND its events, in one transaction — the
+// cascade behind REST DELETE /v1/calendars/{id}, which the UI confirms before
+// calling (the tool's delete_calendar refuses instead; see the DECISION on
+// Calendar). The events go through an explicit DELETE on their own table, and
+// SQLite row triggers fire once per deleted row, so a sync client gets a real
+// chg_event tombstone for every event alongside the calendar's own — exactly
+// as DeleteBot tombstones a bot's messages.
+func (s *Store) DeleteCalendar(id CalendarID) error {
+	return s.tx(func(q dbtx) error {
+		if _, err := getCalendar(q, id); err != nil {
+			return err
+		}
+		if _, err := q.Exec(`DELETE FROM events WHERE calendar_id = ?`, id); err != nil {
+			return fmt.Errorf("delete calendar events: %w", err)
+		}
+		if _, err := q.Exec(`DELETE FROM calendars WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("delete calendar: %w", err)
+		}
+		return nil
+	})
+}
+
+// ListCalendars returns every calendar, oldest first. Ascending createdAt is a
+// stable order for the UI's chip row — a new calendar appends rather than
+// reshuffling the ones the user knows the position of. rowid breaks the tie
+// two same-second creates leave in the truncated timestamp: insertion order,
+// which two ULIDs minted in the same millisecond cannot promise.
+func (s *Store) ListCalendars() ([]Calendar, error) {
+	rows, err := s.db.Query(`SELECT ` + calendarColumns + ` FROM calendars ORDER BY created_at, rowid`)
+	if err != nil {
+		return nil, fmt.Errorf("list calendars: %w", err)
+	}
+	defer rows.Close()
+	var out []Calendar
+	for rows.Next() {
+		c, err := scanCalendar(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan calendar: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// EventCount reports how many events a calendar holds — what the tool's
+// delete_calendar refusal and list_calendars rendering are built from.
+func (s *Store) EventCount(id CalendarID) (int, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM events WHERE calendar_id = ?`, id).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count events: %w", err)
+	}
+	return n, nil
+}
+
+// resolveCalendarID verifies a caller-named calendar id exists, mapping a
+// missing one to ErrInvalid: the caller named a bad CALENDAR, which is that
+// write's 400, not a 404 about the event it was writing.
+func resolveCalendarID(q dbtx, id CalendarID) error {
+	_, err := getCalendar(q, id)
+	if errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("%w: no calendar %q — GET /v1/calendars lists them", ErrInvalid, id)
+	}
+	return err
+}
+
 // ── Events ────────────────────────────────────────────────────────────────────
 // The calendar service. Events belong to the net rather than to a bot, so the
 // REST path (the user's Calendar panel) and the calendar tool (a bot, mid-turn)
@@ -1128,13 +1485,13 @@ func getBot(q dbtx, id BotID) (Bot, error) {
 // write here is an ordinary INSERT/UPDATE/DELETE, so the chg_event_* triggers
 // capture it into change_log with no Go code remembering to.
 
-const eventColumns = `id, title, starts_at, ends_at, location, notes, created_by, created_at, updated_at`
+const eventColumns = `id, calendar_id, title, starts_at, ends_at, location, notes, created_by, created_at, updated_at, rrule, tz, automation`
 
 func scanEvent(sc interface{ Scan(...any) error }) (Event, error) {
 	var e Event
 	var startsAt, endsAt, createdAt, updatedAt string
-	if err := sc.Scan(&e.ID, &e.Title, &startsAt, &endsAt, &e.Location, &e.Notes,
-		&e.CreatedBy, &createdAt, &updatedAt); err != nil {
+	if err := sc.Scan(&e.ID, &e.CalendarID, &e.Title, &startsAt, &endsAt, &e.Location, &e.Notes,
+		&e.CreatedBy, &createdAt, &updatedAt, &e.RRule, &e.TZ, &e.Automation); err != nil {
 		return Event{}, err
 	}
 	for _, f := range []struct {
@@ -1161,11 +1518,15 @@ func scanEvent(sc interface{ Scan(...any) error }) (Event, error) {
 // (the no-If-Match DECISION on Event) — and neither CreatedBy nor the
 // timestamps are patchable, because they are the write path's to stamp.
 type EventPatch struct {
-	Title    *string    `json:"title"`
-	StartsAt *time.Time `json:"startsAt"`
-	EndsAt   *time.Time `json:"endsAt"`
-	Location *string    `json:"location"`
-	Notes    *string    `json:"notes"`
+	Title      *string     `json:"title"`
+	StartsAt   *time.Time  `json:"startsAt"`
+	EndsAt     *time.Time  `json:"endsAt"`
+	Location   *string     `json:"location"`
+	Notes      *string     `json:"notes"`
+	CalendarID *CalendarID `json:"calendarId"` // moves the event; must resolve
+	RRule      *string     `json:"rrule"`      // "" clears: the event becomes single again
+	TZ         *string     `json:"tz"`
+	Automation *string     `json:"automation"` // "" clears: the event stops firing
 }
 
 // validateEvent is the ONE place an event's own rules live, so the REST handler
@@ -1183,13 +1544,52 @@ func validateEvent(e Event) error {
 		return fmt.Errorf("%w: endsAt %s precedes startsAt %s",
 			ErrInvalid, fmtEventTime(e.EndsAt), fmtEventTime(e.StartsAt))
 	}
+	if e.RRule != "" {
+		if e.TZ == "" {
+			return fmt.Errorf("%w: a recurring event needs a tz (an IANA id like \"America/New_York\") — "+
+				"the rrule's wall clock has no meaning without one", ErrInvalid)
+		}
+		if _, err := parseRRULE(e.RRule); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalid, err)
+		}
+	}
+	if e.TZ != "" {
+		if _, err := time.LoadLocation(e.TZ); err != nil {
+			return fmt.Errorf("%w: unknown tz %q (want an IANA id like \"America/New_York\")", ErrInvalid, e.TZ)
+		}
+	}
+	return nil
+}
+
+// requireExecutable enforces the automation DECISION (see Event in schema.go)
+// inside the caller's transaction: an event naming an automation must sit on
+// an executable calendar — a lunch cannot fire a fetcher. It runs on the
+// event as it would be STORED, after the calendar is resolved, so a patch
+// that moves a firing event to a plain calendar is caught the same as a
+// create that starts there. The error names the calendar and the fix.
+func requireExecutable(q dbtx, e Event) error {
+	if e.Automation == "" {
+		return nil
+	}
+	cal, err := getCalendar(q, e.CalendarID)
+	if err != nil {
+		return err
+	}
+	if !cal.Executable {
+		return fmt.Errorf("%w: automation %q is only allowed on an executable calendar, and %q is not — "+
+			"make it executable first, or use one that is", ErrInvalid, e.Automation, cal.Name)
+	}
 	return nil
 }
 
 // CreateEvent stores one event and returns it as stored. The caller authors
-// title, times, location and notes; the id, the author and both timestamps are
-// stamped HERE, so an event can never claim an author or a creation time it did
-// not have. createdBy is a BotID for a tool write and "user" for a UI one.
+// title, times, location, notes and (optionally) the calendar; the id, the
+// author and both timestamps are stamped HERE, so an event can never claim an
+// author or a creation time it did not have. createdBy is a BotID for a tool
+// write and "user" for a UI one. A zero CalendarID gets the Personal ensure; a
+// named one must resolve or the write is ErrInvalid — either way no event row
+// can dangle. The resolution and the insert share a transaction, so the
+// calendar cannot be deleted out from under the row between the two.
 func (s *Store) CreateEvent(e Event, createdBy string) (Event, error) {
 	now := time.Now().UTC().Truncate(time.Second)
 	e.ID = EventID(newID("evt_"))
@@ -1200,11 +1600,29 @@ func (s *Store) CreateEvent(e Event, createdBy string) (Event, error) {
 	if err := validateEvent(e); err != nil {
 		return Event{}, err
 	}
-	if _, err := s.db.Exec(
-		`INSERT INTO events (`+eventColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
-		e.CreatedBy, fmtEventTime(e.CreatedAt), fmtEventTime(e.UpdatedAt)); err != nil {
-		return Event{}, fmt.Errorf("create event: %w", err)
+	err := s.tx(func(q dbtx) error {
+		if e.CalendarID == "" {
+			cal, err := ensurePersonalCalendar(q)
+			if err != nil {
+				return err
+			}
+			e.CalendarID = cal.ID
+		} else if err := resolveCalendarID(q, e.CalendarID); err != nil {
+			return err
+		}
+		if err := requireExecutable(q, e); err != nil {
+			return err
+		}
+		if _, err := q.Exec(
+			`INSERT INTO events (`+eventColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			e.ID, e.CalendarID, e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
+			e.CreatedBy, fmtEventTime(e.CreatedAt), fmtEventTime(e.UpdatedAt), e.RRule, e.TZ, e.Automation); err != nil {
+			return fmt.Errorf("create event: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return Event{}, err
 	}
 	return e, nil
 }
@@ -1249,14 +1667,34 @@ func (s *Store) UpdateEvent(id EventID, p EventPatch) (Event, error) {
 		if p.Notes != nil {
 			e.Notes = *p.Notes
 		}
+		if p.CalendarID != nil {
+			if err := resolveCalendarID(q, *p.CalendarID); err != nil {
+				return err
+			}
+			e.CalendarID = *p.CalendarID
+		}
+		if p.RRule != nil {
+			e.RRule = *p.RRule
+		}
+		if p.TZ != nil {
+			e.TZ = *p.TZ
+		}
+		if p.Automation != nil {
+			e.Automation = *p.Automation
+		}
 		if err := validateEvent(e); err != nil {
+			return err
+		}
+		// The merged event, not the patch: a calendar move under a live
+		// automation is exactly what this must catch.
+		if err := requireExecutable(q, e); err != nil {
 			return err
 		}
 		e.UpdatedAt = time.Now().UTC().Truncate(time.Second)
 		if _, err := q.Exec(
-			`UPDATE events SET title = ?, starts_at = ?, ends_at = ?, location = ?, notes = ?, updated_at = ? WHERE id = ?`,
-			e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
-			fmtEventTime(e.UpdatedAt), id); err != nil {
+			`UPDATE events SET calendar_id = ?, title = ?, starts_at = ?, ends_at = ?, location = ?, notes = ?, rrule = ?, tz = ?, automation = ?, updated_at = ? WHERE id = ?`,
+			e.CalendarID, e.Title, fmtEventTime(e.StartsAt), fmtEventTime(e.EndsAt), e.Location, e.Notes,
+			e.RRule, e.TZ, e.Automation, fmtEventTime(e.UpdatedAt), id); err != nil {
 			return fmt.Errorf("update event: %w", err)
 		}
 		return nil
@@ -1320,6 +1758,101 @@ func (s *Store) ListEvents(from, to time.Time) ([]Event, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// Instances returns the expanded calendar over [from, to), sorted by start
+// (event id breaking ties, so a page is deterministic): single events pass
+// through under ListEvents' overlap rule, recurring events expand through
+// their RRULE (expandEvent). Instances are DERIVED — nothing here writes, and
+// nothing here reaches the change feed.
+//
+// Candidate selection differs from ListEvents on purpose: a recurring event's
+// stored StartsAt/EndsAt are its FIRST occurrence, so the master row of a
+// series can lie far before a window its instances land in — the overlap test
+// would wrongly drop it. A rule cannot produce an instance before its own
+// DTSTART, so starts_at < to is the one bound that is safe to push into SQL.
+func (s *Store) Instances(from, to time.Time) ([]Instance, error) {
+	rows, err := s.db.Query(`SELECT `+eventColumns+` FROM events
+		 WHERE (rrule = '' AND ends_at > ? AND starts_at < ?) OR (rrule != '' AND starts_at < ?)`,
+		fmtEventTime(from), fmtEventTime(to), fmtEventTime(to))
+	if err != nil {
+		return nil, fmt.Errorf("instance candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []Instance
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan instance candidate: %w", err)
+		}
+		ins, err := expandEvent(ev, from, to)
+		if err != nil {
+			// Validation keeps bad rules out of the store; reaching this means
+			// the store itself is inconsistent, which is not the caller's 400.
+			return nil, fmt.Errorf("expand: %w", err)
+		}
+		out = append(out, ins...)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("instance candidates: %w", err)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].StartsAt.Equal(out[j].StartsAt) {
+			return out[i].StartsAt.Before(out[j].StartsAt)
+		}
+		return out[i].EventID < out[j].EventID
+	})
+	return out, nil
+}
+
+// Fireable returns the automations due at the given instant — the read behind
+// GET /v1/fireable, execcal's one query. A row is an instance that is ACTIVE
+// (startsAt <= at < endsAt), on an executable calendar, naming an automation;
+// its window bounds are the instance's own, the frame the automations
+// service's idempotence checks run in. The candidate filter lives in SQL so a
+// calendar full of lunches costs nothing here.
+func (s *Store) Fireable(at time.Time) ([]Fireable, error) {
+	rows, err := s.db.Query(`SELECT ` + eventColumns + ` FROM events
+		 WHERE automation != ''
+		   AND calendar_id IN (SELECT id FROM calendars WHERE executable = 1)`)
+	if err != nil {
+		return nil, fmt.Errorf("fireable candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []Fireable
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan fireable candidate: %w", err)
+		}
+		// A [at, at+1s) window catches exactly the instances overlapping the
+		// instant; the explicit bounds check below is the contract's
+		// half-open rule, kept separate so it cannot drift into the overlap.
+		ins, err := expandEvent(ev, at, at.Add(time.Second))
+		if err != nil {
+			return nil, fmt.Errorf("expand: %w", err)
+		}
+		for _, in := range ins {
+			if !in.StartsAt.After(at) && at.Before(in.EndsAt) {
+				out = append(out, Fireable{
+					Automation:  in.Automation,
+					EventID:     in.EventID,
+					WindowStart: in.StartsAt,
+					WindowEnd:   in.EndsAt,
+				})
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fireable candidates: %w", err)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Automation != out[j].Automation {
+			return out[i].Automation < out[j].Automation
+		}
+		return out[i].EventID < out[j].EventID
+	})
+	return out, nil
 }
 
 // GetNet loads a net and populates its Bots membership from the bots table.

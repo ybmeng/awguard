@@ -170,6 +170,39 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 		{"segment", string(seg1.ID), "created"},
 	}, "Seal")
 
+	// The calendar partition. The Personal ensure is a real write the FIRST
+	// time and a no-op ever after: the feed sees the birth exactly once, and a
+	// repeat ensure must not wake clients with a phantom change.
+	mark = topSeq(t, s)
+	personal, err := s.EnsurePersonalCalendar()
+	if err != nil {
+		t.Fatalf("ensure personal calendar: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark),
+		[]changeRow{{"calendar", string(personal.ID), "created"}}, "EnsurePersonalCalendar (first)")
+
+	mark = topSeq(t, s)
+	if _, err := s.EnsurePersonalCalendar(); err != nil {
+		t.Fatalf("re-ensure personal calendar: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark), nil, "EnsurePersonalCalendar (again)")
+
+	mark = topSeq(t, s)
+	earnings, err := s.CreateCalendar("Company Earnings", "", string(bot.ID), false)
+	if err != nil {
+		t.Fatalf("create calendar: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark),
+		[]changeRow{{"calendar", string(earnings.ID), "created"}}, "CreateCalendar")
+
+	mark = topSeq(t, s)
+	teal := "teal"
+	if _, err := s.UpdateCalendar(earnings.ID, CalendarPatch{Color: &teal}); err != nil {
+		t.Fatalf("update calendar: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark),
+		[]changeRow{{"calendar", string(earnings.ID), "updated"}}, "UpdateCalendar")
+
 	// The calendar service. Events are owned by the net, not by the bot, so
 	// they survive DeleteBot below — but each of the three writes must emit,
 	// or a second client's Calendar panel goes stale.
@@ -198,6 +231,27 @@ func TestEveryMutatingCallSiteEmitsItsChangeRows(t *testing.T) {
 		t.Fatalf("delete event: %v", err)
 	}
 	expectRows(t, logAfter(t, s, mark), []changeRow{{"event", string(ev.ID), "destroyed"}}, "DeleteEvent")
+
+	// DeleteCalendar CASCADES: a real tombstone per event, then the calendar's
+	// own — the explicit event DELETE is what fires the chg_event_* triggers,
+	// so a sync client is never left holding events of a calendar it saw die.
+	inEarnings, err := s.CreateEvent(Event{
+		Title:      "Q3 earnings call",
+		StartsAt:   time.Date(2026, 9, 15, 21, 0, 0, 0, time.UTC),
+		EndsAt:     time.Date(2026, 9, 15, 22, 0, 0, 0, time.UTC),
+		CalendarID: earnings.ID,
+	}, string(bot.ID))
+	if err != nil {
+		t.Fatalf("create event in calendar: %v", err)
+	}
+	mark = topSeq(t, s)
+	if err := s.DeleteCalendar(earnings.ID); err != nil {
+		t.Fatalf("delete calendar: %v", err)
+	}
+	expectRows(t, logAfter(t, s, mark), []changeRow{
+		{"event", string(inEarnings.ID), "destroyed"},
+		{"calendar", string(earnings.ID), "destroyed"},
+	}, "DeleteCalendar")
 
 	// DeleteBot tombstones everything the bot owned: both messages, both
 	// segments, then the bot itself.

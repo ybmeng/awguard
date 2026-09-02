@@ -1,0 +1,23 @@
+{
+  "automation": "korea-trass",
+  "status": "ok",
+  "form_used": 3,
+  "artifacts": [
+    {
+      "path": "data/monthly.csv",
+      "rows": 49,
+      "newest": "2026.07"
+    },
+    {
+      "path": "data/monthly_by_country.csv",
+      "rows": 1178,
+      "newest": "2026.07"
+    },
+    {
+      "path": "data/tentative.csv",
+      "rows": 24,
+      "newest": "202608 01~31"
+    }
+  ],
+  "escalation_reason": null
+}

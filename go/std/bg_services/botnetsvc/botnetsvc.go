@@ -72,6 +72,12 @@ type Config struct {
 	// server's config endpoint. Empty means DefaultKeyPath().
 	KeyPath string
 
+	// Automations, when non-nil, is mounted into the botnet server so the
+	// app's one backend also answers the automations read/run routes. stdd
+	// passes the automations service's Handler(); standalone botnetd mounts
+	// nothing and the routes are absent.
+	Automations http.Handler
+
 	// Logger receives startup lines. Nil means the standard logger.
 	Logger *log.Logger
 }
@@ -79,10 +85,11 @@ type Config struct {
 // Service is the botnet HTTP server hosted under stdd. It implements
 // bgservices.Service.
 type Service struct {
-	addr    string
-	dbPath  string
-	keyPath string
-	logger  *log.Logger
+	addr        string
+	dbPath      string
+	keyPath     string
+	automations http.Handler
+	logger      *log.Logger
 
 	mu    sync.Mutex
 	bound string
@@ -93,10 +100,11 @@ type Service struct {
 // never touches the real ~/.botnet.
 func New(cfg Config) (*Service, error) {
 	s := &Service{
-		addr:    cfg.Addr,
-		dbPath:  cfg.DBPath,
-		keyPath: cfg.KeyPath,
-		logger:  cfg.Logger,
+		addr:        cfg.Addr,
+		dbPath:      cfg.DBPath,
+		keyPath:     cfg.KeyPath,
+		automations: cfg.Automations,
+		logger:      cfg.Logger,
 	}
 	if s.addr == "" {
 		s.addr = DefaultAddr()
@@ -172,6 +180,8 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("botnet: %w", err)
 	}
 	srv.ConfigureKeyPersistence(s.keyPath)
+	// nil is the unmounted state: Handler() then leaves the routes absent.
+	srv.MountAutomations(s.automations)
 
 	// Client-side web search: offer the model our own web_search tool when a
 	// backend key resolves (SEARCH_BACKEND / EXA_API_KEY / BRAVE_API_KEY /

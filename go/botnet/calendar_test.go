@@ -479,9 +479,11 @@ func TestCalendarToolValidation(t *testing.T) {
 		{"bad json", `not json`,
 			`error: arguments must be a JSON object like {"command": "list"}`},
 		{"missing command", `{}`,
-			"error: missing 'command' — valid: create, list, update, delete"},
+			"error: missing 'command' — valid: create, list, update, delete, " +
+				"create_calendar, list_calendars, rename_calendar, delete_calendar"},
 		{"unknown command", `{"command":"reschedule"}`,
-			"error: unknown command 'reschedule' — valid: create, list, update, delete"},
+			"error: unknown command 'reschedule' — valid: create, list, update, delete, " +
+				"create_calendar, list_calendars, rename_calendar, delete_calendar"},
 		{"create without title", `{"command":"create","start":"2026-08-31T12:00:00Z"}`,
 			"error: 'create' requires a 'title' field"},
 		{"create without start", `{"command":"create","title":"lunch"}`,
@@ -496,7 +498,7 @@ func TestCalendarToolValidation(t *testing.T) {
 		{"update without an id", `{"command":"update","title":"x"}`,
 			"error: 'update' requires a 'event_id' field"},
 		{"update with nothing to change", `{"command":"update","event_id":"` + string(existing.ID) + `"}`,
-			"error: 'update' needs at least one of title, start, end, location, notes to change"},
+			"error: 'update' needs at least one of title, start, end, location, notes, calendar, rrule, tz, automation to change"},
 		{"update of an unknown event", `{"command":"update","event_id":"evt_NOPE","title":"x"}`,
 			"error: no such event — call list to see the current ids"},
 		{"delete without an id", `{"command":"delete"}`,
@@ -602,9 +604,20 @@ func TestToolLoopBooksAnEvent(t *testing.T) {
 	if ev.CreatedBy != string(bot.ID) {
 		t.Errorf("createdBy = %q, want the bot that booked it (%q)", ev.CreatedBy, bot.ID)
 	}
-	// And a second client sees it: the write went through the triggers.
-	expectRows(t, logAfter(t, s, mark),
-		[]changeRow{{"event", string(ev.ID), "created"}}, "calendar tool create")
+	// And a second client sees it: the write went through the triggers. The
+	// unqualified create on a fresh store also ensured the Personal calendar,
+	// whose birth the feed reports too.
+	personal, err := s.CalendarByName(personalCalendarName)
+	if err != nil {
+		t.Fatalf("personal calendar after an unqualified create: %v", err)
+	}
+	if ev.CalendarID != personal.ID {
+		t.Errorf("calendarId = %q, want the ensured Personal calendar %q", ev.CalendarID, personal.ID)
+	}
+	expectRows(t, logAfter(t, s, mark), []changeRow{
+		{"calendar", string(personal.ID), "created"},
+		{"event", string(ev.ID), "created"},
+	}, "calendar tool create")
 }
 
 // TestToolsEndpointIncludesCalendar: the inspector reads /v1/tools, so the
@@ -633,14 +646,16 @@ func TestToolsEndpointIncludesCalendar(t *testing.T) {
 			enum = append(enum, v.(string))
 		}
 	}
-	if strings.Join(enum, ",") != "create,list,update,delete" {
-		t.Errorf("command enum = %v, want create,list,update,delete", enum)
+	want := "create,list,update,delete,create_calendar,list_calendars,rename_calendar,delete_calendar"
+	if strings.Join(enum, ",") != want {
+		t.Errorf("command enum = %v, want %s", enum, want)
 	}
 	if req, ok := def.Parameters["required"].([]any); !ok || len(req) != 1 || req[0] != "command" {
 		t.Errorf("required = %v, want just command", def.Parameters["required"])
 	}
 	// Flat strings, no nested union — the whole reason this shape was chosen.
-	for _, field := range []string{"event_id", "title", "start", "end", "location", "notes", "from", "to"} {
+	// The firing surface (rrule, tz, automation, executable) is flat too.
+	for _, field := range []string{"event_id", "title", "start", "end", "location", "notes", "from", "to", "calendar", "name", "color", "rrule", "tz", "automation", "executable"} {
 		spec, ok := props[field].(map[string]any)
 		if !ok {
 			t.Errorf("parameters miss the %q field", field)
@@ -650,7 +665,8 @@ func TestToolsEndpointIncludesCalendar(t *testing.T) {
 			t.Errorf("%q is %v, want a flat string", field, spec["type"])
 		}
 	}
-	for _, must := range []string{`"create"`, `"list"`, `"update"`, `"delete"`, "RFC3339"} {
+	for _, must := range []string{`"create"`, `"list"`, `"update"`, `"delete"`,
+		`"create_calendar"`, `"list_calendars"`, `"rename_calendar"`, `"delete_calendar"`, "RFC3339"} {
 		if !strings.Contains(def.Description, must) {
 			t.Errorf("tool description misses %s: %q", must, def.Description)
 		}

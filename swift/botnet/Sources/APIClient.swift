@@ -104,8 +104,11 @@ struct APIClient {
     }
 
     /// createdBy is the server's call, not ours: an event posted here is "user".
+    /// A nil calendarId is omitted, not sent as "": the server then files the
+    /// event under "Personal" (creating it if needed), which is the contract's
+    /// default and also what an older client's create already means.
     func createEvent(title: String, startsAt: Date, endsAt: Date,
-                     location: String, notes: String) async throws -> Event {
+                     location: String, notes: String, calendarId: String? = nil) async throws -> Event {
         var body = [
             "title": title,
             "startsAt": Self.wireTime(startsAt),
@@ -115,6 +118,7 @@ struct APIClient {
         // call produces; the server treats both as unset anyway.
         if !location.isEmpty { body["location"] = location }
         if !notes.isEmpty { body["notes"] = notes }
+        if let calendarId { body["calendarId"] = calendarId }
         return try await send("/v1/events", method: "POST", body: body)
     }
 
@@ -127,8 +131,100 @@ struct APIClient {
         _ = try await raw("/v1/events/\(id)", method: "DELETE", body: nil)
     }
 
+    /// Expanded instances of every event overlapping the window, ascending by
+    /// start: single events pass through, recurring events expand server-side.
+    /// Both bounds are required by the contract (window cap 400 days), so
+    /// neither is optional here. 404 means a botnetd that predates instances;
+    /// callers fall back to the wholesale events list.
+    func listInstances(from: Date, to: Date) async throws -> [EventInstance] {
+        try await get("/v1/instances?from=" + escaped(Self.wireTime(from))
+                      + "&to=" + escaped(Self.wireTime(to)))
+    }
+
+    // MARK: calendars (the named collections events file under)
+    //
+    // Same era and same rules as the calendar-tool routes above: last-write-wins,
+    // and a 404 on any of them means a botnetd that predates multiple calendars,
+    // which callers read through `isUnimplemented` and hide rather than report.
+
+    /// Ascending by createdAt, as the server orders them. Never null on the
+    /// wire — an empty list is `[]`, and a valid answer.
+    func listCalendars() async throws -> [EventCalendar] {
+        try await get("/v1/calendars")
+    }
+
+    /// A nil color is omitted: the server then cycles its enum by calendar
+    /// count, which spreads the colors without the client hardcoding the order.
+    func createCalendar(name: String, color: String? = nil) async throws -> EventCalendar {
+        var body = ["name": name]
+        if let color { body["color"] = color }
+        return try await send("/v1/calendars", method: "POST", body: body)
+    }
+
+    /// `fields` is any subset of {name, color}, PATCHed partially like an event.
+    func updateCalendar(_ id: String, fields: [String: String]) async throws -> EventCalendar {
+        try await send("/v1/calendars/\(id)", method: "PATCH", body: fields)
+    }
+
+    /// CASCADES server-side: the calendar's events are deleted with it. The UI
+    /// confirms before calling; the wire call itself is unconditional.
+    func deleteCalendar(_ id: String) async throws {
+        _ = try await raw("/v1/calendars/\(id)", method: "DELETE", body: nil)
+    }
+
     private func escaped(_ value: String) -> String {
         value.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? value
+    }
+
+    // MARK: automations (bridged from the stdd automations service)
+    //
+    // Five read/run routes botnet mounts when it hosts the automations
+    // service; 404 on all of them means an unmounted bridge (standalone
+    // botnetd, old server), which callers read through `isUnimplemented` and
+    // hide the whole section rather than report.
+
+    /// Every discovered automation, without runs. Never null on the wire.
+    func listAutomations() async throws -> [Automation] {
+        try await get("/v1/automations")
+    }
+
+    /// The list row plus its last 20 runs, newest first. 404 is ambiguous
+    /// here (unknown name vs unmounted bridge); callers treat both as "not
+    /// available" since the name came from the list moments ago.
+    func automationDetail(_ name: String) async throws -> Automation {
+        try await get("/v1/automations/\(pathSegment(name))")
+    }
+
+    /// Starts a manual run; the 202 body carries the run id to poll. A 409
+    /// (one already in flight) surfaces as a ServerError callers classify
+    /// with `isBusy` — a notice, not a failure.
+    func runAutomation(_ name: String) async throws -> String {
+        let body: [String: String] = try decode(
+            await raw("/v1/automations/\(pathSegment(name))/run", method: "POST", body: nil),
+            from: "POST /v1/automations/\(name)/run")
+        guard let id = body["runId"] else {
+            throw ServerError(message: "run accepted but no runId returned", status: 0, body: Data())
+        }
+        return id
+    }
+
+    /// One run in full: summary + envelope + stderr tail + error. Polled
+    /// until `finished` is non-empty after a manual run.
+    func runDetail(_ id: String) async throws -> RunDetail {
+        try await get("/v1/runs/\(pathSegment(id))")
+    }
+
+    /// True when the server refused because a run is already in flight.
+    static func isBusy(_ error: Error) -> Bool {
+        (error as? ServerError)?.status == 409
+    }
+
+    /// Automation names come from manifest frontmatter, so unlike ids they
+    /// can hold characters that would break out of a path segment.
+    private func pathSegment(_ value: String) -> String {
+        value.addingPercentEncoding(
+            withAllowedCharacters: CharacterSet.urlPathAllowed.subtracting(
+                CharacterSet(charactersIn: "/?#"))) ?? value
     }
 
     func createBot(displayName: String, systemPrompt: String, model: String) async throws -> Bot {

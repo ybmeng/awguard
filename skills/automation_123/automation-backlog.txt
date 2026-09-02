@@ -1,0 +1,9 @@
+# automation-123 backlog — queued, NOT started. Iterate on the live instances first.
+
+- china-housing-index: China newly-built residential price index, national 70-city aggregate plus
+  Beijing / Shanghai / (HK separately — HK is Rating and Valuation Dept, not NBS). NBS monthly
+  release ~17th-18th.
+- china-unemployment: China surveyed urban unemployment rate, monthly NBS release (with the
+  youth-rate series and its methodology-change caveat).
+- yield-curve-snapshot: daily US Treasury yield curve (1M..30Y) with history at multiple
+  lookback windows (1d/1w/1m/1y overlays). Treasury.gov daily par yield CSV/XML, no auth.

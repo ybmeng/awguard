@@ -38,10 +38,11 @@ type Changes struct {
 // ChangedIDs buckets one page's changes by entity type, so a client watching
 // only the sidebar can ignore message churn without a separate cursor.
 type ChangedIDs struct {
-	Bots     ChangeBucket `json:"bots"`
-	Messages ChangeBucket `json:"messages"`
-	Segments ChangeBucket `json:"segments"`
-	Events   ChangeBucket `json:"events"`
+	Bots      ChangeBucket `json:"bots"`
+	Messages  ChangeBucket `json:"messages"`
+	Segments  ChangeBucket `json:"segments"`
+	Events    ChangeBucket `json:"events"`
+	Calendars ChangeBucket `json:"calendars"`
 }
 
 // ChangeBucket lists what happened to one entity type since the client's
@@ -215,7 +216,7 @@ func emptyChangedIDs() ChangedIDs {
 	empty := func() ChangeBucket {
 		return ChangeBucket{Created: []string{}, Updated: []string{}, Destroyed: []string{}}
 	}
-	return ChangedIDs{Bots: empty(), Messages: empty(), Segments: empty(), Events: empty()}
+	return ChangedIDs{Bots: empty(), Messages: empty(), Segments: empty(), Events: empty(), Calendars: empty()}
 }
 
 func (c *ChangedIDs) bucket(entity string) *ChangeBucket {
@@ -228,6 +229,8 @@ func (c *ChangedIDs) bucket(entity string) *ChangeBucket {
 		return &c.Segments
 	case "event":
 		return &c.Events
+	case "calendar":
+		return &c.Calendars
 	}
 	return nil
 }
@@ -235,7 +238,7 @@ func (c *ChangedIDs) bucket(entity string) *ChangeBucket {
 // sortAll orders every id list so a page is deterministic — map iteration must
 // not leak into the API.
 func (c *ChangedIDs) sortAll() {
-	for _, b := range []*ChangeBucket{&c.Bots, &c.Messages, &c.Segments, &c.Events} {
+	for _, b := range []*ChangeBucket{&c.Bots, &c.Messages, &c.Segments, &c.Events, &c.Calendars} {
 		sort.Strings(b.Created)
 		sort.Strings(b.Updated)
 		sort.Strings(b.Destroyed)

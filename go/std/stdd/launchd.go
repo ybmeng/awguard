@@ -37,6 +37,8 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
         <string>%s</string>
         <string>-botnet-db</string>
         <string>%s</string>
+        <string>-automations-repo</string>
+        <string>%s</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -135,9 +137,10 @@ func launchctl(args ...string) error {
 
 // installService writes the LaunchAgent plist pointing at the current binary
 // and bootstraps it into the user's launchd session. The botnet address and
-// database are baked into the plist as flags: a launchd agent does not inherit
-// the shell environment, so BOTNET_ADDR / BOTNET_DB would not reach it.
-func installService(dir string, interval time.Duration, botnetAddr, botnetDB string) error {
+// database and the automations repo are baked into the plist as flags: a
+// launchd agent does not inherit the shell environment, so BOTNET_ADDR /
+// BOTNET_DB / AUTOMATIONS_REPO would not reach it.
+func installService(dir string, interval time.Duration, botnetAddr, botnetDB, automationsRepo string) error {
 	if err := requireDarwin(); err != nil {
 		return err
 	}
@@ -173,7 +176,7 @@ func installService(dir string, interval time.Duration, botnetAddr, botnetDB str
 		return err
 	}
 
-	content := fmt.Sprintf(plistTemplate, launchdLabel, exe, absDir, interval, botnetAddr, botnetDB, logs, logs)
+	content := fmt.Sprintf(plistTemplate, launchdLabel, exe, absDir, interval, botnetAddr, botnetDB, automationsRepo, logs, logs)
 	if err := os.WriteFile(plist, []byte(content), 0o644); err != nil {
 		return err
 	}
@@ -188,7 +191,11 @@ func installService(dir string, interval time.Duration, botnetAddr, botnetDB str
 	if err := launchctl("bootstrap", fmt.Sprintf("gui/%d", os.Getuid()), plist); err != nil {
 		return err
 	}
-	fmt.Printf("stdd: installed %s\n  binary: %s\n  dir:    %s\n  botnet: http://%s\n  logs:   %s\n", launchdLabel, exe, absDir, botnetAddr, logs)
+	repoLine := automationsRepo
+	if repoLine == "" {
+		repoLine = "(none — zero automations)"
+	}
+	fmt.Printf("stdd: installed %s\n  binary: %s\n  dir:    %s\n  botnet: http://%s\n  automations repo: %s\n  logs:   %s\n", launchdLabel, exe, absDir, botnetAddr, repoLine, logs)
 	return nil
 }
 

@@ -16,9 +16,10 @@ import (
 // ── IDs ─────────────────────────────────────────────────────────────────────
 // Prefixed ULID strings: sortable by creation time, generatable client-side
 // with no coordinator, self-describing in logs. e.g. "bot_01J9X..." .
-type BotID string     // "bot_" + ULID
-type SegmentID string // "seg_" + ULID
-type EventID string   // "evt_" + ULID
+type BotID string      // "bot_" + ULID
+type SegmentID string  // "seg_" + ULID
+type EventID string    // "evt_" + ULID
+type CalendarID string // "cal_" + ULID
 
 // ── Bot ──────────────────────────────────────────────────────────────────────
 // Minimal v0: a bot is a system prompt pointed at a model. That's enough to
@@ -274,6 +275,59 @@ const (
 	StatusFailed   MessageStatus = "failed"   // user turn, model call failed; Error is set
 )
 
+// ── Calendar ──────────────────────────────────────────────────────────────────
+// A named calendar: events are partitioned into calendars ("Personal", "Company
+// Earnings", "Financial Updates") so the user and the bots can keep booked
+// lunches apart from fed announcements. A Calendar is a service entity like
+// Event — owned by the net, written by both the REST path and the calendar
+// tool, and a fifth trigger-captured sync citizen.
+//
+// DECISION (no If-Match): calendars are last-write-wins, the same call already
+// made for Event and Bot.Memory. A calendar has two authored fields — a name
+// and a color — edited by one user and the odd bot; version-checking that would
+// be ceremony with no contention to protect against. There is no derived
+// Version field, so there is nothing for a client to send.
+//
+// DECISION (the default calendar is an ENSURE, not a flag): there is no
+// isDefault column and no reserved id. When a write needs a calendar and none
+// was named — a REST create without calendarId, a tool create without a
+// calendar arg, the migration backfill — the server uses the calendar NAMED
+// "Personal" (case-insensitive), creating it (color "blue", createdBy "user")
+// if missing. A flag would be one more piece of state to sync, to migrate and
+// to fight over; a name-keyed ensure is idempotent and self-healing — deleting
+// "Personal" is legal, and it simply comes back on the next unqualified write.
+// GET /v1/calendars deliberately does NOT ensure: an empty list is a valid
+// answer, not a prompt to create state on a read.
+//
+// DECISION (delete is asymmetric by writer): REST DELETE /v1/calendars/{id}
+// CASCADES — it deletes the calendar's events in the same transaction, as
+// explicit per-row event DELETEs so the chg_event_* triggers hand sync clients
+// real tombstones — because the UI confirms with the user first ("Delete
+// calendar and its N events"). The tool's delete_calendar REFUSES a non-empty
+// calendar with an instructive error naming the event count: a cheap model must
+// not be able to wipe a calendar in one call, so the destructive form is
+// UI-only.
+type Calendar struct {
+	ID    CalendarID `json:"id"`
+	Name  string     `json:"name"`  // trimmed, non-empty, <= 64 chars, unique case-insensitively
+	Color string     `json:"color"` // one of calendarColors; omitted on create → assigned by cycling
+
+	// Executable marks a calendar whose events may name an Automation to
+	// fire (see Event.Automation). Set on create, editable via PATCH; false
+	// is the default and exactly the pre-firing behavior. DECISION: this is a
+	// property of the CALENDAR, not the event, so "which events can run
+	// things" is one visible partition rather than a per-row surprise.
+	Executable bool `json:"executable"`
+
+	// CreatedBy follows Event.CreatedBy exactly: a BotID for a tool write, the
+	// "user" sentinel for a REST one, stamped by the write path and never by
+	// the caller.
+	CreatedBy string `json:"createdBy"`
+
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 // ── Event ─────────────────────────────────────────────────────────────────────
 // The calendar: the first SERVICE, as opposed to a property of a bot. An Event
 // is owned by the net rather than by any one bot, because the point of it is
@@ -306,17 +360,56 @@ const (
 // makes lexicographic order agree with chronological order by construction, and
 // second precision is all a calendar means.
 //
-// OPEN (recurrence, all-day, invitees, reminders): v0 is a flat interval with a
-// title. Recurrence in particular is NOT a bolt-on — an RRULE turns one row into
-// an expansion at read time, which changes what ListEvents even is — so decide
-// it before the calendar has data worth migrating.
+// DECISION (recurrence, resolving the former OPEN): an event may carry an
+// RRULE, and expansion happens at READ time — one row is the whole series.
+// StartsAt/EndsAt stay fixed-width RFC3339 UTC and are the FIRST occurrence;
+// expansion converts StartsAt to wall-clock in TZ, runs the rule on the wall
+// clock, and anchors each occurrence back into an instant, so "13:05 every 4th
+// Tuesday" stays 13:05 local across DST (see rrule.go, ported from the retired
+// go/std calendar service). ListEvents still serves master rows; the expanded
+// view is GET /v1/instances, and instances are derived — never stored, never
+// synced. DELETE of a recurring event deletes the whole series (it is one row).
+//
+// DECISION (the calendar is the firing brain): an event on an EXECUTABLE
+// calendar may name an Automation; while one of its instances is active, that
+// automation is fireable (GET /v1/fireable — execcal's one query). Scheduling
+// therefore lives here, on the calendar, not in a second scheduler.
+//
+// OPEN (all-day, invitees, reminders): still a flat timed interval otherwise.
 type Event struct {
-	ID       EventID   `json:"id"`
+	ID EventID `json:"id"`
+
+	// CalendarID names the calendar this event belongs to. Always present and
+	// always resolvable from a current server: a write that names no calendar
+	// gets the Personal ensure (see Calendar), and one that names an unknown
+	// calendar is rejected, so no event row can dangle.
+	CalendarID CalendarID `json:"calendarId"`
+
 	Title    string    `json:"title"`
 	StartsAt time.Time `json:"startsAt"`
 	EndsAt   time.Time `json:"endsAt"` // must not precede StartsAt
 	Location string    `json:"location,omitempty"`
 	Notes    string    `json:"notes,omitempty"`
+
+	// RRule is an RFC 5545 recurrence rule ("FREQ=MONTHLY;BYDAY=4TU"); empty
+	// means a single event — exactly the pre-recurrence behavior. The
+	// supported subset is parseRRULE's: FREQ ∈ {DAILY, WEEKLY, MONTHLY,
+	// YEARLY}, INTERVAL, COUNT, UNTIL, BYDAY (incl. ordinals), BYMONTHDAY,
+	// BYMONTH, WKST, BYSETPOS. Anything else is rejected at the write boundary
+	// with an instructive error, never silently dropped.
+	RRule string `json:"rrule,omitempty"`
+
+	// TZ is the IANA zone id the recurrence's wall clock lives in
+	// (validated via time.LoadLocation; the zone db is embedded with
+	// time/tzdata). REQUIRED when RRule is set — a rule without a zone cannot
+	// keep its wall-clock promise across DST.
+	TZ string `json:"tz,omitempty"`
+
+	// Automation is the automation-123 name this event fires while an
+	// instance is active. DECISION: only allowed on events whose calendar is
+	// Executable (400 otherwise, naming the calendar) — a lunch cannot fire a
+	// fetcher.
+	Automation string `json:"automation,omitempty"`
 
 	// CreatedBy is the BotID that created the event, or "user" for one created
 	// in the UI. It is set by the write path, never by the caller: a tool write
@@ -331,6 +424,38 @@ type Event struct {
 // userAuthor is the CreatedBy sentinel for an event the user created in the UI,
 // as opposed to one a bot booked with the calendar tool.
 const userAuthor = "user"
+
+// ── Instance ──────────────────────────────────────────────────────────────────
+// One concrete occurrence of an event, produced by read-time expansion
+// (expandEvent in rrule.go) and served by GET /v1/instances. Instances are
+// DERIVED: never stored, never in the change feed — a client that wants fresh
+// instances refetches the window after an event change. StartsAt/EndsAt are
+// absolute instants; every other field is a projection of the master event,
+// EventID being the way back to it.
+type Instance struct {
+	EventID    EventID    `json:"eventId"`
+	CalendarID CalendarID `json:"calendarId"`
+	Title      string     `json:"title"`
+	StartsAt   time.Time  `json:"startsAt"`
+	EndsAt     time.Time  `json:"endsAt"`
+	Location   string     `json:"location,omitempty"`
+	Notes      string     `json:"notes,omitempty"`
+	Automation string     `json:"automation,omitempty"`
+	Recurring  bool       `json:"recurring"` // an RRULE produced this, vs. a single event passing through
+	CreatedBy  string     `json:"createdBy"`
+}
+
+// Fireable is one automation due to run: an instance on an EXECUTABLE calendar
+// that names an Automation and is active at the queried time
+// (startsAt <= at < endsAt). Served by GET /v1/fireable — the one query the
+// execcal bridge makes; the window bounds are the instance's, handed to the
+// automations service so its idempotence checks have a frame.
+type Fireable struct {
+	Automation  string    `json:"automation"`
+	EventID     EventID   `json:"eventId"`
+	WindowStart time.Time `json:"windowStart"`
+	WindowEnd   time.Time `json:"windowEnd"`
+}
 
 // ── PrivateBotNet ─────────────────────────────────────────────────────────────
 // Top-level owner: which bots exist. Shared resources (tools, membership) land

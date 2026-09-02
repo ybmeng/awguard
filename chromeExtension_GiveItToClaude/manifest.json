@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "GiveItToClaude",
+  "version": "1.0",
+  "description": "Save the current page's full HTML into Downloads/GiveItToClaude for Claude to ingest.",
+  "action": {
+    "default_title": "Give this page to Claude"
+  },
+  "permissions": ["activeTab", "scripting", "downloads"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

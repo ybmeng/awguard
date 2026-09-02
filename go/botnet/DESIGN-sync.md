@@ -615,12 +615,25 @@ mutation.
 | `Seal` | segment | updated (sealed) + created (next segment) |
 | `failInterruptedSends` (startup sweep) | messages | updated |
 | `markExistingBotsRead` (one-shot backfill) | bots | updated |
-| `CreateEvent` | event | created (both writers: `POST /v1/events` and the `calendar` tool) |
-| `UpdateEvent` | event | updated (a field-only patch still emits — row trigger) |
+| `CreateEvent` | event | created (both writers: `POST /v1/events` and the `calendar` tool). An unqualified create (no calendar named) that has to ensure "Personal" ALSO emits calendar created, once ever |
+| `UpdateEvent` | event | updated (a field-only patch still emits — row trigger; a calendar move is a field-only patch) |
 | `DeleteEvent` | event | destroyed (tombstone) |
+| `CreateCalendar` / `EnsurePersonalCalendar` | calendar | created (the ensure only the FIRST time — a repeat ensure is a no-op and emits nothing) |
+| `UpdateCalendar` | calendar | updated |
+| `DeleteCalendar` (REST cascade) | calendar + its events | destroyed: one tombstone per event (the explicit `DELETE FROM events WHERE calendar_id = ?` fires the row trigger per row), then the calendar's own |
+| migrate step 7 (calendar backfill) | events (+ calendar) | updated per backfilled event, after the ensured Personal's created — a reconnecting client refetches rows whose calendarId just appeared |
 
 Note `AppendMessage` also updates `bots.last_message_at`/`last_message_text`, so it emits
 **two** change rows (message created, bot updated). Easy to miss; the sidebar depends on it.
+
+**Recurrence/firing (2026-09-01) added NO rows to this table.** `events.rrule/tz/automation`
+and `calendars.executable` are fields on already-triggered rows, so every edit of them is the
+existing `UpdateEvent`/`UpdateCalendar` row (pinned by
+`TestRecurringEventUpdateEmitsOneChangeRow`); `CreateCalendar` merely grew an `executable`
+argument. **Instances and fireable are derived reads** (`GET /v1/instances`,
+`GET /v1/fireable` → `Store.Instances`/`Store.Fireable`): they expand recurring events at
+read time, write nothing, and are deliberately outside the change feed — a client that wants
+fresh instances refetches its window after an `events` change row.
 
 The startup sweep **should** emit change rows — a client reconnecting after a restart needs
 to see those failures, and the state token will have moved regardless.
@@ -637,6 +650,9 @@ to see those failures, and the state token will have moved regardless.
 5. `failInterruptedSends()` — **must precede step 6**; a crashed process could have left two
    awaiting rows for one bot and the index cannot be built over them.
 6. `CREATE UNIQUE INDEX idx_messages_one_awaiting ON messages(bot_id) WHERE status = 'awaiting'`.
+7. Calendar backfill — every event row with the `''` its `calendar_id` column was added with
+   is pointed at the ensured "Personal" calendar. Guarded by the `''` it erases, so a fresh
+   database (no stragglers) never conjures a calendar just by being opened.
 
 A change-log table joins step 1. The sequence column must be `INTEGER PRIMARY KEY
 AUTOINCREMENT` — see §3.

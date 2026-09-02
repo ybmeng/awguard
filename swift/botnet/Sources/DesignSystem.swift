@@ -25,6 +25,58 @@ enum Palette {
     static let secondaryText = dynamic(light: 0x8B8B90, dark: 0x98989E)
     static let attention = dynamic(light: 0xE1830B, dark: 0xF0A03C)
 
+    // The six calendar colors, named for the server's color enum. Each pair is
+    // tuned to read as a small dot on both the light and dark chrome — the dark
+    // variants are lifted, not just reused, because the light values sink into
+    // the dark ground at dot size.
+    static let calendarBlue = dynamic(light: 0x3574E0, dark: 0x6BA0F5)
+    static let calendarGreen = dynamic(light: 0x3D9B4E, dark: 0x62C273)
+    static let calendarOrange = dynamic(light: 0xE07A16, dark: 0xF0A04C)
+    static let calendarPurple = dynamic(light: 0x8E5BD9, dark: 0xB48AF0)
+    static let calendarRed = dynamic(light: 0xD9463C, dark: 0xF07A72)
+    static let calendarTeal = dynamic(light: 0x0F9490, dark: 0x45C4C0)
+
+    /// The wire color string to its token. A value this build doesn't know —
+    /// a newer server's seventh color — draws as the quiet neutral rather than
+    /// failing or shouting; secondaryText is already that gray on both grounds.
+    static func calendar(_ wire: String) -> Color {
+        switch wire {
+        case "blue": return calendarBlue
+        case "green": return calendarGreen
+        case "orange": return calendarOrange
+        case "purple": return calendarPurple
+        case "red": return calendarRed
+        case "teal": return calendarTeal
+        default: return secondaryText
+        }
+    }
+
+    /// An automation's freshness to its sidebar-dot color. Quiet by default:
+    /// only a healthy schedule is green and only trouble is loud — pending,
+    /// never and unscheduled are states, not problems, so they share the
+    /// neutral gray. An unknown future value falls back the same way.
+    static func freshness(_ wire: String) -> Color {
+        switch wire {
+        case "ok": return calendarGreen
+        case "stale": return attention
+        case "failed": return calendarRed
+        default: return secondaryText // pending, never, unscheduled, future values
+        }
+    }
+
+    /// A run's status to its label color — the same temperature scale as the
+    /// freshness dot: green for a clean envelope, orange for degraded and
+    /// needs_human (the run spoke, but wants eyes), red for failed and for
+    /// error (no envelope at all), gray for the in-flight states.
+    static func runStatus(_ wire: String) -> Color {
+        switch wire {
+        case "ok": return calendarGreen
+        case "degraded", "needs_human": return attention
+        case "failed", "error": return calendarRed
+        default: return secondaryText // queued, running, future values
+        }
+    }
+
     // The avatar colors. Index is chosen by hashing the bot id, so a bot keeps
     // the same face for its whole life without storing anything server-side.
     static let avatarColors: [Color] = [
@@ -61,6 +113,24 @@ enum Metric {
 
     static let avatarSmall: CGFloat = 20
     static let avatarRow: CGFloat = 30
+
+    /// How far a section's rows sit in from its chevron header — what makes
+    /// the sidebar read as an explorer tree rather than three flat lists.
+    static let sidebarIndent: CGFloat = 12
+    /// The fixed chevron column on a section header, so the three section
+    /// labels start at one x whichever way their carets point.
+    static let sectionChevronWidth: CGFloat = 12
+    /// An automation's freshness dot in the sidebar; same size family as
+    /// calendarDot, separate because the two can retune apart.
+    static let freshnessDot: CGFloat = 7
+
+    /// The automation pane's content column stops growing here, same reason
+    /// as calendarListWidth: a run row's trailing fields must stay near the
+    /// name, not a window's width away.
+    static let automationListWidth: CGFloat = 680
+    /// A disclosed run's stderr tail scrolls inside this rather than growing
+    /// the row by up to 8KB of text.
+    static let stderrMaxHeight: CGFloat = 160
 
     static let bubbleRadius: CGFloat = 17
     static let bubbleHPad: CGFloat = 14
@@ -122,6 +192,15 @@ enum Metric {
     static let chipVPad: CGFloat = 2
     /// The circle behind today's date number.
     static let todayMarker: CGFloat = 19
+
+    /// A calendar's color dot: on a list row and a filter chip.
+    static let calendarDot: CGFloat = 7
+    /// The header's type-to-filter field. Fixed, not flexible: the header's
+    /// controls keep their place as the window resizes.
+    static let calendarSearchWidth: CGFloat = 200
+    /// The same dot inside a month-grid chip, where three chips share a cell
+    /// barely a hundred points wide and the dot must not eat title width.
+    static let chipDot: CGFloat = 5
 }
 
 enum TypeScale {
@@ -154,6 +233,12 @@ enum TypeScale {
     static let gridMeta = Font.system(size: 10)
     /// An event chip inside a day cell — the smallest readable text in the app.
     static let chip = Font.system(size: 10.5)
+    /// The repeat/bolt marks on an event row, a calendar chip, and a manage
+    /// row — sized to sit beside rowTitle/rowMeta text without competing.
+    static let eventGlyph = Font.system(size: 10, weight: .medium)
+    /// The same marks inside a month-grid chip, where three chips share a cell
+    /// barely a hundred points wide.
+    static let chipGlyph = Font.system(size: 8, weight: .medium)
 }
 
 // MARK: - Avatar

@@ -55,6 +55,16 @@ struct ContentView: View {
                 }
             case .service(.calendar)?:
                 CalendarView(mode: $calendarMode)
+            case .automation(let name)?:
+                // Same live-resolve rule as bots: the automation comes off
+                // store.automations at render time, so a refresh moves the
+                // freshness badge and a vanished automation (manifest deleted,
+                // repo rescanned) falls back rather than rendering a ghost.
+                if let automation = store.automations.first(where: { $0.name == name }) {
+                    AutomationView(automation: automation)
+                } else {
+                    nothingSelected
+                }
             case .service(.artifacts)?, nil:
                 nothingSelected
             }

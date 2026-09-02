@@ -29,12 +29,13 @@ const turnTimeout = 5 * time.Minute
 // outcome is reported to that original caller — it is written to the store,
 // which is the only place the client reads from anyway.
 type Server struct {
-	store   *Store
-	llm     LLM
-	netID   string
-	keyPath string  // where SetKey persists the OpenRouter key; "" disables persistence
-	search  *Router // web-search backend router; nil disables the client web_search tool
-	turns   sync.WaitGroup
+	store       *Store
+	llm         LLM
+	netID       string
+	keyPath     string       // where SetKey persists the OpenRouter key; "" disables persistence
+	search      *Router      // web-search backend router; nil disables the client web_search tool
+	automations http.Handler // mounted automations service; nil leaves the routes absent
+	turns       sync.WaitGroup
 }
 
 // Wait blocks until every in-flight model call has finished. Tests use it to
@@ -45,6 +46,13 @@ func (s *Server) Wait() { s.turns.Wait() }
 // ConfigureKeyPersistence tells the server where to save a key set via the
 // config endpoint, so it survives a restart.
 func (s *Server) ConfigureKeyPersistence(path string) { s.keyPath = path }
+
+// MountAutomations installs the automations service's handler, so the app's
+// one backend (this server) also answers the automations read/run routes.
+// stdd passes the in-process service's Handler(); standalone botnetd mounts
+// nothing, and the routes are then absent (404 — the app's hide-the-section
+// signal). Call it before Handler(), which is where the mux is built.
+func (s *Server) MountAutomations(h http.Handler) { s.automations = h }
 
 // ConfigureSearch installs the web-search backend router. botnetd builds it from
 // the environment (NewRouterFromEnv) and calls this; a server left unconfigured
@@ -83,11 +91,29 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/bots/{id}/compact", s.compact)
 	mux.HandleFunc("GET /v1/messages/{id}", s.getMessage)
 	mux.HandleFunc("GET /v1/messages", s.batchMessages)
+	mux.HandleFunc("GET /v1/calendars", s.listCalendars)
+	mux.HandleFunc("POST /v1/calendars", s.createCalendar)
+	mux.HandleFunc("PATCH /v1/calendars/{id}", s.patchCalendar)
+	mux.HandleFunc("DELETE /v1/calendars/{id}", s.deleteCalendar)
 	mux.HandleFunc("GET /v1/events", s.listEvents)
 	mux.HandleFunc("POST /v1/events", s.createEvent)
 	mux.HandleFunc("PATCH /v1/events/{id}", s.patchEvent)
 	mux.HandleFunc("DELETE /v1/events/{id}", s.deleteEvent)
+	mux.HandleFunc("GET /v1/instances", s.listInstances)
+	mux.HandleFunc("GET /v1/fireable", s.listFireable)
 	mux.HandleFunc("GET /v1/changes", s.getChanges)
+	// The automations bridge, delegated verbatim to the mounted service (same
+	// paths, bodies, status codes). DECISION: allowlist at the gateway — the
+	// app keeps exactly ONE backend, and only these five client-facing routes
+	// cross it; the pipeline-internal POST .../fire and POST /tick are never
+	// registered here, so the unix socket remains the pipeline's own surface.
+	if s.automations != nil {
+		mux.Handle("GET /v1/automations", s.automations)
+		mux.Handle("GET /v1/automations/{name}", s.automations)
+		mux.Handle("GET /v1/automations/{name}/runs", s.automations)
+		mux.Handle("POST /v1/automations/{name}/run", s.automations)
+		mux.Handle("GET /v1/runs/{id}", s.automations)
+	}
 	return mux
 }
 
@@ -466,6 +492,89 @@ func (s *Server) writeChain(w http.ResponseWriter, botID BotID, code int) {
 	writeJSON(w, code, segs)
 }
 
+// ── Calendars ─────────────────────────────────────────────────────────────────
+// The named-calendar REST face. Like events there is no If-Match and no
+// version; unlike events, DELETE here CASCADES to the calendar's events — the
+// UI confirms with the user first, and the wire call itself is unconditional
+// (the tool's delete_calendar is the path that refuses; see the DECISION on
+// Calendar in schema.go).
+
+// calendarInput is the wire body for POST and PATCH. Pointers make PATCH
+// partial: absent leaves a field alone.
+type calendarInput struct {
+	Name       *string `json:"name"`
+	Color      *string `json:"color"`
+	Executable *bool   `json:"executable"` // absent on POST → false; on PATCH → left alone
+}
+
+// listCalendars returns every calendar, oldest first, with the sync token the
+// other collection GETs carry. It deliberately does NOT ensure "Personal" — an
+// empty list is a valid answer, and a read must not create state.
+func (s *Server) listCalendars(w http.ResponseWriter, _ *http.Request) {
+	s.stateHeader(w)
+	cals, err := s.store.ListCalendars()
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	if cals == nil {
+		cals = []Calendar{}
+	}
+	writeJSON(w, http.StatusOK, cals)
+}
+
+// createCalendar adds a calendar from the UI. createdBy is the "user" sentinel,
+// never taken from the body; an omitted color is assigned by the store. A
+// duplicate name or an unknown color is ErrInvalid, which maps to a 400 in the
+// existing error shape.
+func (s *Server) createCalendar(w http.ResponseWriter, r *http.Request) {
+	var in calendarInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if in.Name == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("name is required"))
+		return
+	}
+	color := ""
+	if in.Color != nil {
+		color = *in.Color
+	}
+	cal, err := s.store.CreateCalendar(*in.Name, color, userAuthor, in.Executable != nil && *in.Executable)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cal)
+}
+
+// patchCalendar renames or recolors a calendar; omitted fields are left alone.
+func (s *Server) patchCalendar(w http.ResponseWriter, r *http.Request) {
+	var in calendarInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	cal, err := s.store.UpdateCalendar(CalendarID(r.PathValue("id")),
+		CalendarPatch{Name: in.Name, Color: in.Color, Executable: in.Executable})
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cal)
+}
+
+// deleteCalendar removes the calendar AND its events — real tombstones for all
+// of them reach the change feed. The UI has already confirmed the cascade.
+func (s *Server) deleteCalendar(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteCalendar(CalendarID(r.PathValue("id"))); err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ── Events ────────────────────────────────────────────────────────────────────
 // The calendar's REST face: the user's half of the service whose other half is
 // the bot's calendar tool. Both write the same table, so an event a bot booked
@@ -480,11 +589,15 @@ func (s *Server) writeChain(w http.ResponseWriter, botID BotID, code int) {
 // Every field is a pointer, which is what makes PATCH partial: absent leaves the
 // field alone, and "" is a real value that clears a location or a note.
 type eventInput struct {
-	Title    *string `json:"title"`
-	StartsAt *string `json:"startsAt"`
-	EndsAt   *string `json:"endsAt"`
-	Location *string `json:"location"`
-	Notes    *string `json:"notes"`
+	Title      *string `json:"title"`
+	StartsAt   *string `json:"startsAt"`
+	EndsAt     *string `json:"endsAt"`
+	Location   *string `json:"location"`
+	Notes      *string `json:"notes"`
+	CalendarID *string `json:"calendarId"` // absent on POST → the Personal ensure; unknown → 400
+	RRule      *string `json:"rrule"`      // "" on PATCH clears the recurrence
+	TZ         *string `json:"tz"`
+	Automation *string `json:"automation"` // "" on PATCH stops the firing
 }
 
 // eventTime parses one RFC3339 field from the wire, naming the field so a 400
@@ -565,6 +678,20 @@ func (s *Server) createEvent(w http.ResponseWriter, r *http.Request) {
 	if in.Notes != nil {
 		ev.Notes = *in.Notes
 	}
+	if in.RRule != nil {
+		ev.RRule = *in.RRule
+	}
+	if in.TZ != nil {
+		ev.TZ = *in.TZ
+	}
+	if in.Automation != nil {
+		ev.Automation = *in.Automation
+	}
+	// A zero CalendarID gets the Personal ensure in the store; a supplied one
+	// must resolve or the create is a 400.
+	if in.CalendarID != nil {
+		ev.CalendarID = CalendarID(*in.CalendarID)
+	}
 	// The remaining rules (empty title, an end before its start) live in the
 	// store, so the tool path enforces exactly the same ones; ErrInvalid maps
 	// to 400 through writeStatus.
@@ -584,7 +711,12 @@ func (s *Server) patchEvent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	p := EventPatch{Title: in.Title, Location: in.Location, Notes: in.Notes}
+	p := EventPatch{Title: in.Title, Location: in.Location, Notes: in.Notes,
+		RRule: in.RRule, TZ: in.TZ, Automation: in.Automation}
+	if in.CalendarID != nil {
+		id := CalendarID(*in.CalendarID)
+		p.CalendarID = &id
+	}
 	if in.StartsAt != nil {
 		t, err := eventTime("startsAt", *in.StartsAt)
 		if err != nil {
@@ -607,6 +739,80 @@ func (s *Server) patchEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ev)
+}
+
+// maxInstanceWindow caps one /v1/instances window. Expansion is O(window), so
+// an unbounded ask would let one request walk decades of a daily rule; 400
+// days covers every "show me next year" view with room to spare.
+const maxInstanceWindow = 400 * 24 * time.Hour
+
+// listInstances is the expanded calendar: every instance of every event
+// overlapping [from, to) — single events pass through, recurring events
+// multiply — sorted by start. Both bounds are REQUIRED: unlike /v1/events
+// there is no "whole calendar" here, because an unbounded recurring series
+// has no whole. The UI's month grid and list render from this; an old server
+// without it 404s, which is the client's fallback signal.
+func (s *Server) listInstances(w http.ResponseWriter, r *http.Request) {
+	fromRaw, toRaw := r.URL.Query().Get("from"), r.URL.Query().Get("to")
+	if fromRaw == "" || toRaw == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf(
+			"from and to are both required (RFC3339) — instances only exist over a bounded window"))
+		return
+	}
+	from, err := eventTime("from", fromRaw)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	to, err := eventTime("to", toRaw)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if !from.Before(to) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("from %s must be before to %s", fromRaw, toRaw))
+		return
+	}
+	if to.Sub(from) > maxInstanceWindow {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf(
+			"window is %s, at most 400 days per request — page with narrower windows", to.Sub(from)))
+		return
+	}
+	s.stateHeader(w)
+	ins, err := s.store.Instances(from, to)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	if ins == nil {
+		ins = []Instance{}
+	}
+	writeJSON(w, http.StatusOK, ins)
+}
+
+// listFireable answers "which automations should be running right now" — the
+// one query the execcal bridge makes on every tick. ?at= overrides the clock
+// (RFC3339; tests and backfills), absent means now. The reply is derived and
+// idempotent: asking twice changes nothing, which is what lets ping fire the
+// tick blindly.
+func (s *Server) listFireable(w http.ResponseWriter, r *http.Request) {
+	at := time.Now().UTC()
+	if raw := r.URL.Query().Get("at"); raw != "" {
+		var err error
+		if at, err = eventTime("at", raw); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	due, err := s.store.Fireable(at)
+	if err != nil {
+		writeErr(w, writeStatus(err), err)
+		return
+	}
+	if due == nil {
+		due = []Fireable{}
+	}
+	writeJSON(w, http.StatusOK, due)
 }
 
 func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request) {

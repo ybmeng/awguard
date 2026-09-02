@@ -64,13 +64,30 @@ From `swift/botnet/`:
   line); verify mixed open/closed states with `snapshot --details
   --collapse-memory`. State that must survive collapse (drafts) lives on
   BotDetails, not inside the content closure — collapse destroys content.
-- `SidebarView.swift` — the Services section, bot list, search, delete context
-  menu. Owns `SidebarSelection` (`.bot(id)` | `.service(kind)`) and
-  `ServiceKind`; ContentView switches the detail pane on that enum, so a new
-  service is a case plus a pane, never a sentinel id.
-- `CalendarView.swift` — the Calendar service's pane: events grouped by day
+- `SidebarView.swift` — search pinned on top, then an explorer tree of
+  collapsible sections (Services, Automations, Bots) with chevron headers,
+  per-section @AppStorage expansion, and a `collapsedOverride` init param the
+  Snapshot tool uses instead of writing UserDefaults. Owns `SidebarSelection`
+  (`.bot(id)` | `.service(kind)` | `.automation(name)`), `ServiceKind` and
+  `SidebarSection`; ContentView switches the detail pane on that enum, so a
+  new section is a SidebarSection case + rows + (if selectable) a selection
+  case plus a pane, never a sentinel id. A non-empty search force-reveals the
+  Bots section (chevron turns with it) without touching the persisted choice.
+- `AutomationView.swift` — one automation's pane (freshness badge, schedule
+  summary, scheduleError, Run now with poll-until-finished, runs list with
+  inline-disclosed RunDetail) plus `FolderOpener`, the open-in-Cursor /
+  reveal-in-Finder seam: its `launch`/`reveal` are static closure vars so a
+  scratch harness proves the exact `open -a Cursor <path>` argv and the
+  Finder fallback without launching anything.
+- `CalendarView.swift` — the Calendar service's pane: instances grouped by day
   (upcoming, then "Earlier"), each row showing its author. Grouping lives in
-  `EventGroups`/`EventDay` in the same file, not in the view body.
+  `EventGroups`/`EventDay` in the same file, not in the view body. The pane
+  renders `EventInstance` (from /v1/instances over the Store's bounded window),
+  NEVER `Event`: a recurring event is one row server-side but many instances,
+  and clicking any of them opens the MASTER event
+  (`store.event(id: instance.eventId)`). On a 404 the Store synthesizes
+  instances one-to-one from the wholesale events list, so old servers render
+  exactly as before — new view code must keep working off that synthesis.
 - `Store.swift` — AppStore, thin @MainActor client over botnetd; caches server
   responses, owns no durable state. `awaitReply` polls a sent turn until it
   settles, then `refreshBotList()` — that refetch is what live-updates
@@ -108,8 +125,11 @@ From `swift/botnet/`:
   store data a view loads in `.task` must also be awaited explicitly in
   Snapshot.main() before render (as refresh/loadConversation/loadTools are).
 - Snapshot renders one pane beside the sidebar; pick it with a flag
-  (`--calendar`, `--event-sheet [--new-event]`) — a rendering mode is not the
-  banned `--seed-*` flag. A sheet has to be drawn flat, at its own
+  (`--calendar [--month] [--filter-calendar <name>] [--search <text>]`,
+  `--event-sheet [--new-event]`, `--manage-calendars`) — a rendering mode is
+  not the banned `--seed-*` flag. A mode that resolves a name (like
+  `--filter-calendar`) should fail loudly on no-match, or a typo'd run passes
+  review as the unfiltered pane. A sheet has to be drawn flat, at its own
   `.frame(width:height:)`, and its NavigationStack toolbar (Cancel/Save) will
   NOT appear — the toolbar needs a real window, same as `.inspector`. Verify
   those buttons by reading the code, not the PNG.
@@ -138,11 +158,66 @@ From `swift/botnet/`:
   `Section("Title") { TextField("e.g. Lunch…") }` prints the field's name twice
   the moment it has a value ("e.g. Lunch with Alex" | "Chase sign-in call").
   Label the field (`TextField("Title", …)`) and keep a section header only for
-  a multiline field whose label would sit oddly beside a tall box.
+  a multiline field whose label would sit oddly beside a tall box. The same
+  label slot bites inside a custom HStack row: a grouped Form still prints the
+  TextField's label ahead of the row and right-aligns the field ("Name |
+  Personal | …" on every ManageCalendarsSheet row). For an inline editable
+  field in a composed row, add `.labelsHidden()` +
+  `.multilineTextAlignment(.leading)`.
+- Don't shadow a Foundation type with a model name: the calendar entity is
+  `EventCalendar`, not `Calendar`, because `Calendar.current` runs all through
+  the date math and shadowing it would force `Foundation.Calendar` onto every
+  call site. Check what the obvious name collides with before mirroring a
+  server entity.
 - A pane that fills the window pushes a row's trailing column (an author, a
   stamp) to the far edge, a hand's width from the content it belongs to. Cap
   the list's own width the way `Metric.bubbleWidthFraction` caps a bubble —
   `Metric.calendarListWidth` is the calendar's version — and left-align it.
+- When the contract endpoint hasn't landed in go/ yet (parallel server agent),
+  don't stall and don't fake data into Store: stand up a contract-shaped stub
+  HTTP server in the SCRATCHPAD (static JSON per the contract, python
+  http.server on an odd port) and point BOTNET_API at it — the real APIClient
+  decodes real HTTP and the snapshot proves the rendering. Label those PNGs as
+  stub-verified in the report and re-run against the real botnetd once the
+  route lands. The stub never enters the tree.
+- Seeding times for grid review: the grid groups by LOCAL day, so pick UTC
+  instants that stay on the intended local date (a 17:05Z event is next-day in
+  UTC+8, and your "4th Tuesday" chip renders on a Wednesday). Check `date +%z`
+  before choosing seed times.
+- A multi-month grid check (a recurring series on several correct days across
+  two months) doesn't fit 900pt: run `snapshot --calendar --month --height
+  1250` so both month sections are in frame.
+- Automations wire shapes: a run's `started`/`finished` are RFC3339 STRINGS,
+  never Dates — `finished` is `""` while queued/running and would blow up any
+  date decoder. Decode as String with `startedAt`/`finishedAt` computed
+  helpers. The run envelope is lenient at the RunDetail layer (`try?` around
+  the typed decode) so an unknown future shape degrades to nil, while inside
+  RunEnvelope a present-but-wrong-typed key still throws — half an alien
+  envelope rendered as truth is worse than none.
+- Verifying against a scratch `stdd run` stack: the unix sockets fail with
+  `bind: invalid argument` when the root path exceeds sockaddr_un's ~104
+  bytes — the deep scratchpad path does. Use a short root (e.g.
+  /tmp/<task>-<port>). The trap: botnet's TCP routes still work (the
+  automations handler is mounted in-process), so the crash-looping runner is
+  invisible until a POST run never executes — grep the stdd log for
+  "invalid argument" before trusting the stack.
+- Seeding every sidebar freshness state needs only manual runs, thanks to
+  the service's precedence (unscheduled > never > pending > stale > failed >
+  ok): scheduled manifest + ok manual run → "ok"; scheduled + failed run →
+  "failed"; a scheduleError manifest → schedule nil → "unscheduled" even
+  with an error run; scheduled + no runs → "never".
+- A view state gated on THIS machine (a FileManager.fileExists check, like
+  the artifact open-in-Cursor links) cannot be proven against a seeded demo —
+  the demo DB's paths don't exist, so the affordance silently renders as its
+  degraded form and the PNG passes review while showing nothing. Point the
+  snapshot at the live daemon instead (`BOTNET_API=http://127.0.0.1:8730`,
+  READ-ONLY panes only — every fetch behind the rendered pane must be a GET,
+  same discipline as decode-check's live probes), where the machine-state is
+  actually true. Choose the snapshot backend by where the state you're
+  proving lives, not by habit.
+- Snapshot must not write UserDefaults to pose @AppStorage state (defaults
+  litter, cross-run pollution): give the view an override init param
+  (`collapsedOverride`) that wins over the stored value, nil in the app.
 - Markdown in bot bubbles: `Text(String)` renders literally — parse with
   `AttributedString(markdown:options:)` at `.inlineOnlyPreservingWhitespace`
   (keeps single newlines, leaves block syntax literal), raw-text fallback on

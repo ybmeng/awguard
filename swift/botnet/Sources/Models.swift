@@ -193,6 +193,32 @@ struct Segment: Identifiable, Codable, Hashable {
     var isOpen: Bool { sealed == nil }
 }
 
+// One named calendar — mirrors go/botnet/schema.go's Calendar. Named
+// EventCalendar because Foundation.Calendar is all over the date math in the
+// calendar views, and shadowing it would force the namespace onto every
+// `Calendar.current`. `color` is the server's enum string ("blue"…"teal");
+// Palette.calendar(_:) maps it to a token and absorbs any value this build
+// doesn't know. Calendars are last-write-wins like events.
+struct EventCalendar: Identifiable, Codable, Hashable {
+    var id: String            // "cal_" + ULID
+    var name: String
+    var color: String
+    /// Whether events on this calendar may fire automations. Nil means an older
+    /// botnetd, which cannot fire anything, so absent reads as not-executable.
+    var executable: Bool?
+    /// The bot id that created it, or `Event.userAuthor` for one made in the UI.
+    var createdBy: String
+    var createdAt: Date
+    var updatedAt: Date
+
+    var isExecutable: Bool { executable == true }
+
+    /// The server's color enum, in the order it cycles them for an unnamed
+    /// color. The recolor menus iterate this; Palette.calendar(_:) tolerates a
+    /// value beyond it.
+    static let colors = ["blue", "green", "orange", "purple", "red", "teal"]
+}
+
 // One calendar entry — mirrors go/botnet/schema.go's Event. The server sends
 // location and notes with omitempty, so an unset one is absent from the JSON
 // rather than "": both are Optional here and read as empty either way. Events
@@ -204,10 +230,26 @@ struct Event: Identifiable, Codable, Hashable {
     var endsAt: Date
     var location: String?
     var notes: String?
+    /// The calendar this event files under. Always present from a server with
+    /// multiple calendars; nil means an older botnetd, never a real value.
+    var calendarId: String?
+    /// RFC 5545 recurrence rule (the server's supported subset). Omitted for a
+    /// single event and by an older botnetd; startsAt/endsAt are the FIRST
+    /// occurrence when set. The UI shows it read-only — bots and the
+    /// registration tick author these, per the firing contract.
+    var rrule: String?
+    /// IANA timezone the rule expands in; present exactly when rrule is.
+    var tz: String?
+    /// The automation this event fires while an instance is active. Only legal
+    /// on an executable calendar; omitted (nil) everywhere else.
+    var automation: String?
     /// The bot id that created it, or `Event.userAuthor` for one made in the UI.
     var createdBy: String
     var createdAt: Date
     var updatedAt: Date
+
+    var isRecurring: Bool { !(rrule ?? "").isEmpty }
+    var firesAutomation: Bool { !(automation ?? "").isEmpty }
 
     /// The server's marker for an event the user made rather than a bot; it is
     /// not a bot id, so nothing may look it up in the bot list.
@@ -221,6 +263,53 @@ struct Event: Identifiable, Codable, Hashable {
 
     var hasLocation: Bool { !(location ?? "").isEmpty }
     var hasNotes: Bool { !(notes ?? "").isEmpty }
+}
+
+// One occurrence of an event inside a queried window — decoded from
+// GET /v1/instances, the calendar pane's data source. A recurring event arrives
+// as several of these sharing its eventId; a single event passes through as
+// exactly one. Instances are derived server-side and never synced or edited:
+// opening one edits the MASTER event it points at, which is why eventId is the
+// only id on the wire.
+struct EventInstance: Identifiable, Codable, Hashable {
+    var eventId: String       // the master Event's id
+    /// Same optionality and meaning as Event.calendarId; nil only on an
+    /// instance synthesized from an old server's event.
+    var calendarId: String?
+    var title: String
+    var startsAt: Date
+    var endsAt: Date
+    var location: String?
+    var notes: String?
+    /// The automation the master fires; nil when it fires nothing.
+    var automation: String?
+    /// True on every instance expanded from an RRULE — what the repeat glyph
+    /// marks — and false on a single event's pass-through.
+    var recurring: Bool
+    var createdBy: String
+
+    /// Distinct per occurrence: two instances of one event share eventId, and a
+    /// list keyed on eventId alone would collapse the series onto one row.
+    var id: String { "\(eventId)@\(startsAt.timeIntervalSinceReferenceDate)" }
+
+    /// The day the instance files under; same start-keyed rule as Event.day.
+    var day: Date { Calendar.current.startOfDay(for: startsAt) }
+
+    var isUserCreated: Bool { createdBy == Event.userAuthor }
+    var hasLocation: Bool { !(location ?? "").isEmpty }
+    var hasNotes: Bool { !(notes ?? "").isEmpty }
+    var firesAutomation: Bool { !(automation ?? "").isEmpty }
+
+    /// The old-server fallback: a botnetd without /v1/instances still shows its
+    /// events, mapped one-to-one. Such a server expands nothing and fires
+    /// nothing, so recurring is false and automation nil by construction.
+    static func single(_ event: Event) -> EventInstance {
+        EventInstance(
+            eventId: event.id, calendarId: event.calendarId, title: event.title,
+            startsAt: event.startsAt, endsAt: event.endsAt,
+            location: event.location, notes: event.notes,
+            automation: nil, recurring: false, createdBy: event.createdBy)
+    }
 }
 
 // Decoded from GET /v1/tools: the exact tools the server sends the model each
@@ -336,6 +425,156 @@ enum JSONValue: Decodable, Hashable {
         else { return String(describing: obj) }
         return text
     }
+}
+
+// One automation as the bridge serves it — mirrors automationView in
+// go/std/bg_services/automations/server.go, reached through botnet's mounted
+// /v1/automations routes. The list row omits `runs`; the detail row carries
+// the last 20, newest first. `freshness` stays a wire string (like a
+// calendar's color): the closed set is ok|pending|stale|failed|never|
+// unscheduled today, and Palette.freshness(_:) absorbs a value this build
+// doesn't know rather than a decoder throwing on it.
+struct Automation: Identifiable, Decodable, Hashable {
+    var name: String
+    var goal: String
+    /// Repo-relative directory, for display.
+    var dir: String
+    /// The absolute directory path Open in Cursor launches on. Added by the
+    /// bridge; nil on a service that predates it, never a real value — the
+    /// open/reveal actions hide rather than guessing a path.
+    var path: String?
+    /// Nil for an unscheduled automation: discovered, listed, manually
+    /// runnable, never auto-run.
+    var schedule: AutomationSchedule?
+    /// The manifest's schedule-block parse error, verbatim, when it has one;
+    /// such an automation is treated as unscheduled server-side.
+    var scheduleError: String?
+    var freshness: String
+    var lastRun: RunSummary?
+    /// Detail endpoint only; nil on a list row, never an empty real value.
+    var runs: [RunSummary]?
+
+    var id: String { name }
+}
+
+// A manifest's schedule template, echoed verbatim by the API — the botnet
+// calendar owns the actual future; this is what provisioned it. retryEvery /
+// retryFor are the manifest's raw Go-duration strings ("2h", "30h").
+struct AutomationSchedule: Decodable, Hashable {
+    var rrule: String
+    /// Wall-clock "HH:MM" in tz.
+    var at: String
+    var tz: String
+    var retryEvery: String
+    var retryFor: String
+
+    /// "FREQ=MONTHLY;BYDAY=4TU · 13:05 America/New_York · retry 2h/30h" —
+    /// the rule verbatim (the rrule IS the spec), same separator the calendar
+    /// summaries use.
+    var summary: String {
+        "\(rrule) · \(at) \(tz) · retry \(retryEvery)/\(retryFor)"
+    }
+}
+
+// One recorded run, without its envelope body — mirrors runSummary in the
+// automations service. `started`/`finished` are RFC3339 strings on the wire,
+// not Dates: `finished` is "" while the run is queued or in flight, which no
+// date decoder may see. status is queued|running|ok|degraded|failed|
+// needs_human|error; Palette.runStatus(_:) absorbs anything newer.
+struct RunSummary: Identifiable, Decodable, Hashable {
+    var id: String            // "run_" + ULID
+    var automation: String
+    var trigger: String       // "schedule" | "manual"
+    var started: String
+    var finished: String
+    var exitCode: Int
+    var status: String
+    /// Which automation-123 form the driver reported; 0 until an envelope
+    /// arrives.
+    var formUsed: Int
+    var escalationReason: String?
+
+    var isFinished: Bool { !finished.isEmpty }
+
+    var startedAt: Date? { Self.parse(started) }
+    var finishedAt: Date? { Self.parse(finished) }
+
+    /// Wall-clock run length; nil while unfinished or unparseable.
+    var duration: TimeInterval? {
+        guard let s = startedAt, let f = finishedAt else { return nil }
+        return f.timeIntervalSince(s)
+    }
+
+    // The service writes fixed-width RFC3339 UTC (whole seconds); the plain
+    // parser is enough, but tolerate a fractional stamp should that change.
+    private static let iso = ISO8601DateFormatter()
+    private static let isoFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static func parse(_ raw: String) -> Date? {
+        guard !raw.isEmpty else { return nil }
+        return iso.date(from: raw) ?? isoFractional.date(from: raw)
+    }
+}
+
+// GET /v1/runs/{id}: the summary flattened together with the envelope, the
+// stderr tail and the service-side error. The Go side embeds runSummary, so
+// the keys are flat; `summary` re-decodes them from the same container.
+struct RunDetail: Decodable, Hashable {
+    var summary: RunSummary
+    /// The parsed result envelope. Nil when the run produced none (error
+    /// runs) AND when it arrives in a shape this build can't read — the
+    /// envelope's schema is the automations spec's to evolve, so an unknown
+    /// shape degrades to nil rather than failing the whole run's decode.
+    var envelope: RunEnvelope?
+    var stderrTail: String
+    var error: String
+
+    private enum Keys: String, CodingKey { case envelope, stderrTail, error }
+    init(from decoder: Decoder) throws {
+        summary = try RunSummary(from: decoder)
+        let c = try decoder.container(keyedBy: Keys.self)
+        envelope = try? c.decodeIfPresent(RunEnvelope.self, forKey: .envelope)
+        stderrTail = try c.decodeIfPresent(String.self, forKey: .stderrTail) ?? ""
+        error = try c.decodeIfPresent(String.self, forKey: .error) ?? ""
+    }
+}
+
+// The automation-123 result envelope a run's driver emitted — snake_case keys
+// per the spec. Every key is optional (absence reads as "not reported"), but a
+// key present with the wrong type throws here so RunDetail's lenient wrapper
+// degrades the WHOLE envelope to nil — half an alien envelope rendered as
+// truth would be worse than none.
+struct RunEnvelope: Decodable, Hashable {
+    var automation: String?
+    var status: String?
+    var formUsed: Int?
+    var artifacts: [RunArtifact]
+    var escalationReason: String?
+
+    private enum Keys: String, CodingKey {
+        case automation, status
+        case formUsed = "form_used"
+        case artifacts
+        case escalationReason = "escalation_reason"
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        automation = try c.decodeIfPresent(String.self, forKey: .automation)
+        status = try c.decodeIfPresent(String.self, forKey: .status)
+        formUsed = try c.decodeIfPresent(Int.self, forKey: .formUsed)
+        artifacts = try c.decodeIfPresent([RunArtifact].self, forKey: .artifacts) ?? []
+        escalationReason = try c.decodeIfPresent(String.self, forKey: .escalationReason)
+    }
+}
+
+/// One artifact a run touched: path, row count, newest period present.
+struct RunArtifact: Decodable, Hashable {
+    var path: String
+    var rows: Int
+    var newest: String
 }
 
 // Decoded from GET /v1/models ({name, id}); mirrors go/lib/modelSelector.

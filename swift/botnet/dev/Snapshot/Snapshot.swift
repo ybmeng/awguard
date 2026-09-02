@@ -4,7 +4,16 @@
 //
 //   ./dev/snapshot.sh                       # light + dark into build/snapshots
 //   snapshot --calendar [--month]           # the Calendar panel, list or grid
+//   snapshot --calendar --filter-calendar <name>  # with that calendar's chip active
+//   snapshot --calendar --search <text>     # with the header search narrowing it
 //   snapshot --event-sheet [--new-event]    # the event editor, rendered flat
+//   snapshot --event-sheet --event-title <t>  # the editor on that exact event
+//   snapshot --manage-calendars             # the calendar manager, rendered flat
+//   snapshot --automation <name>            # that automation's pane
+//   snapshot --automation <name> --disclose-run <status|index>
+//                                           # with that run's detail disclosed
+//   snapshot --collapse <sections>          # sidebar sections rendered
+//                                           # collapsed: services,automations,bots
 //
 // It talks to whatever BOTNET_API points at, so point it at the demo server
 // from dev/seed-demo.sh rather than the real ~/.botnet/net.db.
@@ -15,10 +24,18 @@ import SwiftUI
 /// Which surface the capture puts beside the sidebar.
 private enum Pane {
     case chat
-    case calendar(CalendarMode)
+    /// The filter is a calendar id (resolved from --filter-calendar's name),
+    /// the query is --search's text: CalendarView opens with that chip active
+    /// and that text typed — states a click can't produce offscreen.
+    case calendar(CalendarMode, filter: String?, query: String)
     /// The event editor. The app presents it as a sheet; offscreen it is drawn
     /// flat, like BotDetails, because a sheet needs a real window to present.
     case eventSheet(EventTarget)
+    /// The calendar manager, drawn flat for the same reason.
+    case manageCalendars
+    /// One automation's pane, optionally with a run's detail disclosed — a
+    /// state a click can't produce offscreen.
+    case automation(Automation, discloseRunID: String?)
 }
 
 @main
@@ -44,23 +61,92 @@ struct Snapshot {
         // Same for CalendarView's events: store.refresh() has already loaded
         // them, but the dependency belongs here where the capture can see it.
         await store.refreshEvents()
+        // And for the sidebar's Automations section / the automation pane:
+        // refresh() fetched the list; the pane's runs need the detail row too.
+        await store.refreshAutomations()
+        if let name = argument("--automation") {
+            await store.loadAutomationDetail(name)
+        }
 
         guard let bot = store.bots.first else {
             fail("no bots at \(ProcessInfo.processInfo.environment["BOTNET_API"] ?? "the default port") — is the demo server running?")
         }
         await store.loadConversation(bot.id)
 
-        render(store: store, bot: bot, pane: pane(store), dark: dark, details: details,
-               collapseMemory: collapseMemory,
+        let pane = pane(store)
+        // The disclosed run's full row is a .task fetch in the app; awaited
+        // here for the same capture-window reason as loadTools above.
+        if case .automation(_, let runID?) = pane {
+            await store.loadRunDetail(runID)
+        }
+
+        render(store: store, bot: bot, pane: pane, dark: dark, details: details,
+               collapseMemory: collapseMemory, collapsed: collapsedSections(),
                size: CGSize(width: width, height: height), to: out)
+    }
+
+    /// --collapse's sections, parsed strictly: a typo'd section name must not
+    /// pass review as an expanded sidebar.
+    private static func collapsedSections() -> Set<SidebarSection>? {
+        guard let raw = argument("--collapse") else { return nil }
+        var sections = Set<SidebarSection>()
+        for part in raw.split(separator: ",") {
+            guard let section = SidebarSection(rawValue: String(part)) else {
+                fail("unknown sidebar section \(part) (want a comma-joined subset of services,automations,bots)")
+            }
+            sections.insert(section)
+        }
+        return sections
     }
 
     @MainActor
     private static func pane(_ store: AppStore) -> Pane {
         let flags = CommandLine.arguments
+        if flags.contains("--manage-calendars") { return .manageCalendars }
+        // Loudly on both lookups, like --filter-calendar: a typo'd automation
+        // or run selector must not pass review as some other pane.
+        if let name = argument("--automation") {
+            guard let automation = store.automations.first(where: { $0.name == name }) else {
+                fail("no automation named \(name) on the server (is the bridge mounted?)")
+            }
+            var runID: String?
+            if let selector = argument("--disclose-run") {
+                let runs = automation.runs ?? []
+                if let index = Int(selector), runs.indices.contains(index) {
+                    runID = runs[index].id
+                } else if let match = runs.first(where: { $0.status == selector }) {
+                    runID = match.id
+                } else {
+                    fail("no run of \(name) matching \(selector) (want a status or a list index)")
+                }
+            }
+            return .automation(automation, discloseRunID: runID)
+        }
         guard flags.contains("--event-sheet") else {
             guard flags.contains("--calendar") else { return .chat }
-            return .calendar(flags.contains("--month") ? .month : .list)
+            // Failing loudly beats a screenshot that silently shows "All":
+            // a typo'd name would otherwise pass review as an unfiltered pane.
+            var filter: String?
+            if let name = argument("--filter-calendar") {
+                guard let match = store.calendars.first(where: {
+                    $0.name.caseInsensitiveCompare(name) == .orderedSame
+                }) else {
+                    fail("no calendar named \(name) on the demo server")
+                }
+                filter = match.id
+            }
+            return .calendar(flags.contains("--month") ? .month : .list,
+                             filter: filter, query: argument("--search") ?? "")
+        }
+        // A named event fails loudly on no match, same as --filter-calendar:
+        // a typo'd title must not pass review as whatever events.first was.
+        if let title = argument("--event-title") {
+            guard let match = store.events.first(where: {
+                $0.title.caseInsensitiveCompare(title) == .orderedSame
+            }) else {
+                fail("no event titled \(title) on the demo server")
+            }
+            return .eventSheet(.existing(match))
         }
         // Editing an existing event is the interesting case; fall back to the
         // blank form when the calendar is empty rather than failing the run.
@@ -72,16 +158,21 @@ struct Snapshot {
 
     @MainActor
     private static func render(store: AppStore, bot: Bot, pane: Pane, dark: Bool, details: Bool,
-                               collapseMemory: Bool, size: CGSize, to path: String) {
+                               collapseMemory: Bool, collapsed: Set<SidebarSection>?,
+                               size: CGSize, to path: String) {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
 
         let selection: SidebarSelection = {
-            if case .chat = pane { return .bot(bot.id) }
-            return .service(.calendar)
+            switch pane {
+            case .chat: return .bot(bot.id)
+            case .automation(let automation, _): return .automation(automation.name)
+            default: return .service(.calendar)
+            }
         }()
 
         let content = HStack(spacing: 0) {
-            SidebarView(selection: .constant(selection), showNewBot: .constant(false))
+            SidebarView(selection: .constant(selection), showNewBot: .constant(false),
+                        collapsedOverride: collapsed)
                 .frame(width: Metric.sidebarWidth)
             Rectangle().fill(Palette.hairline).frame(width: 1)
             switch pane {
@@ -95,8 +186,10 @@ struct Snapshot {
                     BotDetails(bot: bot, expanded: .constant(!collapseMemory))
                         .frame(width: 300)
                 }
-            case .calendar(let mode):
-                CalendarView(mode: .constant(mode))
+            case .calendar(let mode, let filter, let query):
+                CalendarView(mode: .constant(mode), initialFilter: filter, initialQuery: query)
+            case .automation(let automation, let runID):
+                AutomationView(automation: automation, initialDisclosedRunID: runID)
             case .eventSheet(let target):
                 // Held at the sheet's own size on the pane's ground, so the
                 // capture reads like the presented sheet rather than a form
@@ -104,6 +197,13 @@ struct Snapshot {
                 // a real window and does not appear in a flat render.
                 EventSheet(target: target)
                     .frame(width: 460, height: 440)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Palette.chrome)
+            case .manageCalendars:
+                // Flat like the event sheet, and (also like it) without the
+                // window toolbar, so the Done button is verified in code.
+                ManageCalendarsSheet()
+                    .frame(width: 460, height: 400)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Palette.chrome)
             }

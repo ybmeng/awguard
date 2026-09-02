@@ -1,4 +1,4 @@
-package calendar
+package automations
 
 import (
 	"crypto/rand"
@@ -13,7 +13,9 @@ const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 // newID returns a prefixed, lexicographically-sortable id: prefix + 26-char
 // ULID. The first 10 chars encode a 48-bit millisecond timestamp, the last 16
 // encode 80 bits of randomness, so ids sort by creation time. Stdlib only.
-// (Local copy of the botnet id scheme — no cross-package import.)
+// (Local copy of the calendar/botnet id scheme — the calendar import is for
+// Expand; its newID is unexported and the two services' id spaces stay
+// independent.)
 func newID(prefix string) string {
 	var buf [16]byte
 	ms := uint64(time.Now().UnixMilli())
@@ -60,13 +62,12 @@ func newID(prefix string) string {
 	return prefix + string(out[:])
 }
 
-// validEventID reports whether a client-supplied event id has exactly the
-// shape newID emits: "evt_" + 26 uppercase Crockford base32 characters. It is
-// client input reaching a primary key, so the check is strict — nothing
-// looser than what the server itself would mint.
-func validEventID(id EventID) bool {
-	const prefix = "evt_"
-	if len(id) != len(prefix)+26 || !strings.HasPrefix(string(id), prefix) {
+// validRunID reports whether a client-supplied run id has exactly the shape
+// newID emits: "run_" + 26 uppercase Crockford base32 characters. It is client
+// input reaching a primary-key lookup, so the check is strict.
+func validRunID(id string) bool {
+	const prefix = "run_"
+	if len(id) != len(prefix)+26 || !strings.HasPrefix(id, prefix) {
 		return false
 	}
 	for _, c := range id[len(prefix):] {

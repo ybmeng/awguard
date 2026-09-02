@@ -11,9 +11,22 @@ go/std/
   bg_services/            Service contract + supervisor loop
     artifacts/            std_artifacts: the managed artifact store
     botnetsvc/            botnet: the PrivateBotNet HTTP server, hosted in-process
+    automations/          automation-123 runner: discovery, serial runs, fire arbiter
+    execcal/              stateless bridge: calendar fireable instances -> automation fires
+    ping/                 the only clock: POSTs /tick to execcal (1m) and automations (5m)
   drive/                  minimal stdlib-only Google Drive v3 client + syncer
   stdd/                   the service binary launchd runs, plus its control CLI
 ```
+
+The firing pipeline: the botnet calendar is the single source of truth for
+what fires. Recurring events on *executable* calendars name an automation;
+`ping` ticks `execcal` every minute; `execcal` asks the botnet
+(`GET /v1/fireable`) which of those instances are active and forwards each to
+the automations service (`POST /v1/automations/{name}/fire`), which answers
+satisfied / paced / enqueued purely from its runs table — so repeated, late,
+or double ticks are always safe. The automations service's own tick (every
+5m) rescans manifests and ensures each scheduled automation has a calendar
+event (ensure-if-absent; user and bot edits to the calendar stick).
 
 Every background service implements the same tiny contract
 (`bgservices.Service`):

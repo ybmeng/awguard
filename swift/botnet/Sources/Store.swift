@@ -18,6 +18,33 @@ final class AppStore: ObservableObject {
     // them. Empty on a botnetd without the routes, which reads as an empty
     // calendar rather than an error the user can do nothing about.
     @Published private(set) var events: [Event] = []
+    // What the calendar pane renders: expanded instances over the fetch window,
+    // ascending by start as the server sorts them. On a botnetd without
+    // /v1/instances these are the events above mapped one-to-one, so the pane
+    // reads exactly as it did before instances existed.
+    @Published private(set) var instances: [EventInstance] = []
+    // The named calendars, ascending by createdAt as the server sorts them.
+    @Published private(set) var calendars: [EventCalendar] = []
+    // True once /v1/calendars has 404'd: this botnetd predates multiple
+    // calendars, so the views drop the calendar chrome (chip row, picker,
+    // manage button) and the pane renders exactly as it did before them.
+    @Published private(set) var calendarsUnavailable = false
+    // The automations the bridge exposes, in the service's own order. Empty
+    // both before the first fetch and on a server without the routes; the
+    // sticky-ish flag below is what actually hides the nav section.
+    @Published private(set) var automations: [Automation] = []
+    // True once GET /v1/automations has 404'd: the bridge is unmounted (old
+    // server, standalone botnetd) and the whole nav section is absent. Cleared
+    // on a later success, so a restart onto a mounted server mid-run brings
+    // the section back on the next refresh.
+    @Published private(set) var automationsUnavailable = false
+    // Full run rows fetched for inline disclosure, by run id. Cached so
+    // reopening a row doesn't refetch a finished run (finished runs are
+    // immutable); an unfinished run's row is refetched by the poll loop.
+    @Published private(set) var runDetails: [String: RunDetail] = [:]
+    // Automation names with a manual run this client started still settling —
+    // what disables the Run now button between the POST and the poll's end.
+    @Published private(set) var manualRunsInFlight: Set<String> = []
     @Published var pendingBotIDs: Set<String> = []
     @Published var compactingBotIDs: Set<String> = []
     // Unsent composer text, per bot (botId → draft), in-memory only. Not
@@ -41,6 +68,7 @@ final class AppStore: ObservableObject {
         }
         await prefetchConversations()
         await refreshEvents()
+        await refreshAutomations()
     }
 
     // A server that denormalizes the preview onto the bot has already told us
@@ -152,18 +180,137 @@ final class AppStore: ObservableObject {
             guard !APIClient.isUnimplemented(error) else { return }
             lastError = error.localizedDescription
         }
+        // Events and calendars go stale together — a bot's tool call can make a
+        // calendar in the same turn it books into it — so every event refresh
+        // re-reads both. Instances derive from both, so they refresh last.
+        await refreshCalendars()
+        await refreshInstances()
+    }
+
+    // The instance fetch window. One window feeds both the list and the month
+    // grid — they render the same filtered array, and two windows would let
+    // the two readings disagree. A month of "Earlier", six months of future:
+    // enough for the grid to show a recurring series repeating, and 210 days
+    // stays well under the contract's 400-day cap.
+    private static let instanceWindowPast: TimeInterval = 30 * 86_400
+    private static let instanceWindowFuture: TimeInterval = 180 * 86_400
+
+    /// Re-derives the pane's instances. Runs after every event fetch and every
+    /// event mutation: instances are expanded server-side, so a saved edit to a
+    /// recurring master moves occurrences this cache can't compute locally.
+    func refreshInstances() async {
+        let today = Calendar.current.startOfDay(for: Date())
+        do {
+            instances = try await api.listInstances(
+                from: today.addingTimeInterval(-Self.instanceWindowPast),
+                to: today.addingTimeInterval(Self.instanceWindowFuture))
+        } catch {
+            guard !APIClient.isUnimplemented(error) else {
+                // Old server: nothing expands, so the wholesale events ARE the
+                // instances — including ones outside the window, exactly the
+                // pane's pre-instances behavior.
+                instances = events.map(EventInstance.single)
+                return
+            }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// The master event an instance points at, for opening the editor. Nil only
+    /// if the master vanished between the two fetches; the caller then does
+    /// nothing rather than editing a ghost.
+    func event(id: String) -> Event? {
+        events.first { $0.id == id }
+    }
+
+    func refreshCalendars() async {
+        do {
+            calendars = try await api.listCalendars()
+            calendarsUnavailable = false
+        } catch {
+            guard !APIClient.isUnimplemented(error) else {
+                // Not sticky by design: a restart onto a current botnetd mid-run
+                // brings the chrome back on the next refresh instead of
+                // pinning the old-server look for the whole session.
+                calendars = []
+                calendarsUnavailable = true
+                return
+            }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// The calendar an event files under, resolved against the live list at
+    /// render time — a recolor propagates to every row without a refetch. Nil
+    /// for an old server's events and for a calendar deleted since the fetch.
+    func calendar(id: String?) -> EventCalendar? {
+        guard let id else { return nil }
+        return calendars.first { $0.id == id }
+    }
+
+    /// How many cached events file under a calendar; what the delete
+    /// confirmation counts.
+    func eventCount(in calendar: EventCalendar) -> Int {
+        events.filter { $0.calendarId == calendar.id }.count
+    }
+
+    @discardableResult
+    func createCalendar(name: String, color: String?) async -> Bool {
+        do {
+            mergeCalendar(try await api.createCalendar(name: name, color: color))
+            return true
+        } catch {
+            lastError = calendarError(error, verb: "add a calendar")
+            return false
+        }
+    }
+
+    @discardableResult
+    func updateCalendar(_ calendar: EventCalendar, fields: [String: String]) async -> Bool {
+        guard !fields.isEmpty else { return true }
+        do {
+            mergeCalendar(try await api.updateCalendar(calendar.id, fields: fields))
+            return true
+        } catch {
+            lastError = calendarError(error, verb: "edit a calendar")
+            return false
+        }
+    }
+
+    /// The server cascades: the calendar's events go with it, so the cache
+    /// drops them too rather than stranding rows that point at a dead id.
+    func deleteCalendar(_ calendar: EventCalendar) async {
+        do {
+            try await api.deleteCalendar(calendar.id)
+            calendars.removeAll { $0.id == calendar.id }
+            events.removeAll { $0.calendarId == calendar.id }
+            instances.removeAll { $0.calendarId == calendar.id }
+        } catch {
+            lastError = calendarError(error, verb: "delete a calendar")
+        }
+    }
+
+    // Keeps the cache in the server's own order (createdAt ascending, id as the
+    // tiebreak), same splice as merge(_:) below and for the same reason.
+    private func mergeCalendar(_ calendar: EventCalendar) {
+        calendars.removeAll { $0.id == calendar.id }
+        let at = calendars.firstIndex {
+            ($0.createdAt, $0.id) > (calendar.createdAt, calendar.id)
+        } ?? calendars.endIndex
+        calendars.insert(calendar, at: at)
     }
 
     /// Returns whether the create landed, so the sheet can stay open with the
     /// draft intact when it didn't.
     @discardableResult
     func createEvent(title: String, startsAt: Date, endsAt: Date,
-                     location: String, notes: String) async -> Bool {
+                     location: String, notes: String, calendarId: String? = nil) async -> Bool {
         do {
             let created = try await api.createEvent(
                 title: title, startsAt: startsAt, endsAt: endsAt,
-                location: location, notes: notes)
+                location: location, notes: notes, calendarId: calendarId)
             merge(created)
+            await refreshInstances()
             return true
         } catch {
             lastError = calendarError(error, verb: "add an event")
@@ -178,6 +325,7 @@ final class AppStore: ObservableObject {
         guard !fields.isEmpty else { return true }
         do {
             merge(try await api.updateEvent(event.id, fields: fields))
+            await refreshInstances()
             return true
         } catch {
             lastError = calendarError(error, verb: "edit an event")
@@ -189,6 +337,9 @@ final class AppStore: ObservableObject {
         do {
             try await api.deleteEvent(event.id)
             events.removeAll { $0.id == event.id }
+            // The server deletes the whole series (a recurring event is one
+            // row), so every instance pointing at it goes too.
+            instances.removeAll { $0.eventId == event.id }
         } catch {
             lastError = calendarError(error, verb: "delete an event")
         }
@@ -209,6 +360,103 @@ final class AppStore: ObservableObject {
             ? "This botnetd is too old to \(verb) — restart it from the current build."
             : error.localizedDescription
     }
+
+    // MARK: automations
+    //
+    // The stdd automations service owns the registry and the runs; botnet
+    // only bridges its read/run routes through. Same caching stance as the
+    // calendar: these calls hold the server's answers for the views and
+    // nothing else.
+
+    func refreshAutomations() async {
+        do {
+            automations = try await api.listAutomations()
+            automationsUnavailable = false
+        } catch {
+            guard !APIClient.isUnimplemented(error) else {
+                automations = []
+                automationsUnavailable = true
+                return
+            }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Re-reads one automation with its runs (the detail row) and splices it
+    /// over the list row, so the pane and the sidebar dot refresh together.
+    func loadAutomationDetail(_ name: String) async {
+        do {
+            var detail = try await api.automationDetail(name)
+            // The wire omits `runs` entirely for an automation with zero runs
+            // (Go's omitempty), and the decoder honestly leaves that nil. THIS
+            // is the one place absence provably means "no runs yet" — the
+            // detail endpoint always reports runs — so normalize here, and the
+            // pane's nil keeps meaning "detail not loaded yet".
+            detail.runs = detail.runs ?? []
+            if let i = automations.firstIndex(where: { $0.name == detail.name }) {
+                automations[i] = detail
+            } else {
+                automations.append(detail)
+            }
+        } catch {
+            guard !APIClient.isUnimplemented(error) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Fetches one run's full row for inline disclosure. Finished runs are
+    /// immutable server-side, so a cached one is returned without a refetch.
+    func loadRunDetail(_ id: String) async {
+        if let cached = runDetails[id], cached.summary.isFinished { return }
+        do {
+            runDetails[id] = try await api.runDetail(id)
+        } catch {
+            guard !APIClient.isUnimplemented(error) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Starts a manual run and waits for it to settle, then re-reads the
+    /// detail so the runs list and freshness reflect the outcome. Returns a
+    /// short transient notice for the pane to flash (a 409 is "already
+    /// running", not an error state), or nil when nothing needs saying.
+    func runNow(_ name: String) async -> String? {
+        guard !manualRunsInFlight.contains(name) else { return nil }
+        manualRunsInFlight.insert(name)
+        defer { manualRunsInFlight.remove(name) }
+        do {
+            let id = try await api.runAutomation(name)
+            await pollRun(id)
+            await loadAutomationDetail(name)
+            return nil
+        } catch {
+            // Either way the server knows more than the cache does now.
+            await loadAutomationDetail(name)
+            guard !APIClient.isBusy(error) else {
+                return "A run is already in flight — showing it below."
+            }
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Polls a started run until `finished` is non-empty, per the contract.
+    /// Giving up on the deadline leaves the run visibly unfinished — the
+    /// service owns that state and the next detail load settles it — same
+    /// stance as awaitReply below.
+    private func pollRun(_ id: String) async {
+        let deadline = Date().addingTimeInterval(Self.runTimeout)
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard let run = try? await api.runDetail(id) else { continue }
+            runDetails[id] = run
+            if run.summary.isFinished { return }
+        }
+    }
+
+    /// Comfortably past the runner's own subprocess timeout, so the service
+    /// decides how a stuck run ends, not this poll.
+    private static let runTimeout: TimeInterval = 900
 
     func compact(_ bot: Bot) async {
         guard !compactingBotIDs.contains(bot.id) else { return }
@@ -324,6 +572,9 @@ final class AppStore: ObservableObject {
             // cached events as stale as the sidebar preview and for the same
             // reason: the server wrote and nobody told the client.
             await refreshEvents()
+            // Freshness dots age the same way: a scheduled fire can land while
+            // the user chats, and this settle is the one refresh moment.
+            await refreshAutomations()
             return
         }
     }

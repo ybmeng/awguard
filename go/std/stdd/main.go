@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	stdd run -dir DIR [-interval D] [-botnet-addr A] [-botnet-db F]
+//	stdd run -dir DIR [-interval D] [-botnet-addr A] [-botnet-db F] [-automations-repo DIR]
 //	                                  run all services in the foreground (what launchd executes)
 //	stdd insert -dir DIR FILE...      move files into a managed artifact dir, print its id
 //	stdd ls -dir DIR                  list managed dirs with their state-machine stage
@@ -15,7 +15,7 @@
 // store's single writer; without a running service they operate directly.
 //
 //	stdd verify                       fast self-check of every service, then exit
-//	stdd install -dir DIR [-botnet-addr A] [-botnet-db F]
+//	stdd install -dir DIR [-botnet-addr A] [-botnet-db F] [-automations-repo DIR]
 //	                                  install + start the macOS LaunchAgent
 //	stdd uninstall                    stop + remove the LaunchAgent
 //	stdd start | stop | restart       control the installed service
@@ -39,8 +39,10 @@ import (
 
 	bgservices "stdtools/go/std/bg_services"
 	"stdtools/go/std/bg_services/artifacts"
+	"stdtools/go/std/bg_services/automations"
 	"stdtools/go/std/bg_services/botnetsvc"
-	"stdtools/go/std/bg_services/calendar"
+	"stdtools/go/std/bg_services/execcal"
+	"stdtools/go/std/bg_services/ping"
 	"stdtools/go/std/drive"
 )
 
@@ -63,26 +65,53 @@ Commands:
   status                       show launchd state for the service
 
 Botnet flags (run, install):
-  -botnet-addr A               botnet listen address (default $BOTNET_ADDR, else 127.0.0.1:8730)
-  -botnet-db F                 botnet SQLite file (default $BOTNET_DB, else ~/.botnet/net.db)`)
+  -botnet-addr A               botnet listen address (default $BOTNET_ADDR, else 127.0.0.1:8730);
+                               execcal and the automations calendar registration talk to it too
+  -botnet-db F                 botnet SQLite file (default $BOTNET_DB, else ~/.botnet/net.db)
+
+Automations flags (run, install):
+  -automations-repo DIR        repo checkout scanned for automation manifests
+                               (default $AUTOMATIONS_REPO, else empty = zero automations)`)
 	os.Exit(2)
 }
 
-// services builds the full roster of std background services.
-func services(root string, interval time.Duration, syncer artifacts.Syncer, bot botnetsvc.Config) ([]bgservices.Service, error) {
+// services builds the full roster of std background services. The firing
+// pipeline is wired here: ping (the only clock) ticks execcal every minute
+// and the automations service every five; execcal bridges the botnet
+// calendar's fireable instances to automations /fire.
+func services(root string, interval time.Duration, syncer artifacts.Syncer, bot botnetsvc.Config, automationsRepo string) ([]bgservices.Service, error) {
 	art, err := artifacts.New(artifacts.Config{Root: root, Interval: interval, Syncer: syncer})
 	if err != nil {
 		return nil, err
 	}
+	// The automations service is constructed FIRST so its handler can be
+	// mounted into botnet: the app talks to exactly one backend (botnet's
+	// TCP port), which bridges the client-facing automations routes
+	// in-process; the unix socket remains the pipeline's own surface.
+	auto, err := automations.New(automations.Config{Root: root, RepoDir: automationsRepo, BotnetAddr: bot.Addr})
+	if err != nil {
+		return nil, err
+	}
+	bot.Automations = auto.Handler()
 	botSvc, err := botnetsvc.New(bot)
 	if err != nil {
 		return nil, err
 	}
-	cal, err := calendar.New(calendar.Config{Root: root, Interval: interval})
+	exec, err := execcal.New(execcal.Config{
+		Root: root, BotnetAddr: bot.Addr,
+		AutomationsSocket: automations.SocketPath(root),
+	})
 	if err != nil {
 		return nil, err
 	}
-	return []bgservices.Service{art, botSvc, cal}, nil
+	pinger, err := ping.New(ping.Config{Root: root, Targets: []ping.Target{
+		{Name: "execcal-tick", URL: "unix://" + execcal.SocketPath(root) + "/tick", Interval: time.Minute},
+		{Name: "automations-tick", URL: "unix://" + automations.SocketPath(root) + "/tick", Interval: 5 * time.Minute},
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return []bgservices.Service{art, botSvc, auto, exec, pinger}, nil
 }
 
 // loadSyncer builds the Google Drive syncer from the persisted auth config,
@@ -165,9 +194,17 @@ func botnetFlags(fs *flag.FlagSet) (addr, db *string) {
 	return addr, db
 }
 
+// automationsFlags registers the automations service's flag on fs. Its default
+// is the env-resolved value, so AUTOMATIONS_REPO still wins over the built-in
+// default (empty = zero automations) and an explicit flag wins over both.
+func automationsFlags(fs *flag.FlagSet) (repo *string) {
+	return fs.String("automations-repo", automations.DefaultRepoDir(), "repo checkout scanned for automation manifests")
+}
+
 func cmdRun(args []string) error {
 	fs, dir, interval := runFlags("run")
 	botnetAddr, botnetDB := botnetFlags(fs)
+	automationsRepo := automationsFlags(fs)
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("-dir is required")
@@ -177,7 +214,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	svcs, err := services(*dir, *interval, syncer, botnetsvc.Config{Addr: *botnetAddr, DBPath: *botnetDB})
+	svcs, err := services(*dir, *interval, syncer, botnetsvc.Config{Addr: *botnetAddr, DBPath: *botnetDB}, *automationsRepo)
 	if err != nil {
 		return err
 	}
@@ -211,7 +248,7 @@ func cmdVerify(args []string) error {
 	}
 	defer os.RemoveAll(tmp)
 
-	svcs, err := services(tmp, artifacts.DefaultInterval, artifacts.NopSyncer{}, botnetsvc.Config{})
+	svcs, err := services(tmp, artifacts.DefaultInterval, artifacts.NopSyncer{}, botnetsvc.Config{}, "")
 	if err != nil {
 		return err
 	}
@@ -292,11 +329,12 @@ func cmdInsert(args []string) error {
 func cmdInstall(args []string) error {
 	fs, dir, interval := runFlags("install")
 	botnetAddr, botnetDB := botnetFlags(fs)
+	automationsRepo := automationsFlags(fs)
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("-dir is required")
 	}
-	return installService(*dir, *interval, *botnetAddr, *botnetDB)
+	return installService(*dir, *interval, *botnetAddr, *botnetDB, *automationsRepo)
 }
 
 // cmdLs lists every managed dir with its state-machine stage, through the
