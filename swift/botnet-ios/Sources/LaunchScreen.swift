@@ -23,8 +23,15 @@ enum LaunchScreen: String {
     case project
     /// That project, with its Add Fact sheet already up.
     case addFact = "add-fact"
+    /// The same sheet opened on `recurring`, the kind whose extra inputs prove
+    /// the sheet is driven by FactKind.fields rather than by a fixed form.
+    case addFactRecurring = "add-fact-recurring"
 
     static let key = "openScreen"
+
+    var opensAddFact: Bool { self == .addFact || self == .addFactRecurring }
+
+    var factKind: FactKind { self == .addFactRecurring ? .recurring : .deadline }
 
     static var requested: LaunchScreen? {
         UserDefaults.standard.string(forKey: key).flatMap(LaunchScreen.init(rawValue:))

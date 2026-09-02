@@ -23,6 +23,10 @@ struct CalendarScreen: View {
         .background(Palette.chrome)
         .navigationTitle("Calendar")
         .navigationBarTitleDisplayMode(.inline)
+        // Opaque from the first frame, so scrolled rows pass behind the title
+        // rather than through it.
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarBackground(Palette.chrome, for: .navigationBar)
         // The calendar is shared state a bot can change between visits, so
         // opening the screen re-reads it rather than trusting the launch fetch.
         // (refreshEvents re-reads the calendars and the instances too.)
@@ -108,7 +112,10 @@ private struct EventRow: View {
         HStack(alignment: .top, spacing: Metric.phoneRowGap) {
             time
             VStack(alignment: .leading, spacing: Metric.phoneTightGap) {
-                HStack(spacing: Metric.phoneTightGap) {
+                // Top-aligned, with the marks nudged onto the title's first
+                // line: a two-line title would otherwise park its dot and its
+                // repeat mark halfway down the row.
+                HStack(alignment: .top, spacing: Metric.phoneTightGap) {
                     // The calendar's color, right where the eye already is. A
                     // dot rather than a tint: six tinted rows would turn the
                     // list into a heat map, and a dot reads identically on the
@@ -116,11 +123,16 @@ private struct EventRow: View {
                     if let calendarColor {
                         Circle().fill(calendarColor)
                             .frame(width: Metric.calendarDot, height: Metric.calendarDot)
+                            .padding(.top, Metric.phoneFirstLineNudge)
                     }
+                    // Two lines, because a projected fact's title is its
+                    // project's name plus the fact's, and one line truncated
+                    // both away.
                     Text(instance.title)
                         .font(TypeScale.phoneRowTitle)
                         .foregroundStyle(Palette.primaryText)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                     // The firing affordances, right after the title where the
                     // row is read: repeat = this is one occurrence of a series,
                     // bolt = an automation fires while it is active.
@@ -128,22 +140,31 @@ private struct EventRow: View {
                         Image(systemName: "repeat")
                             .font(TypeScale.eventGlyph)
                             .foregroundStyle(Palette.secondaryText)
+                            .padding(.top, Metric.phoneFirstLineNudge)
                     }
                     if instance.firesAutomation {
                         Image(systemName: "bolt.fill")
                             .font(TypeScale.eventGlyph)
                             .foregroundStyle(Palette.attention)
+                            .padding(.top, Metric.phoneFirstLineNudge)
                     }
                 }
-                if instance.hasLocation {
-                    Label(instance.location ?? "", systemImage: "mappin.and.ellipse")
-                        .font(TypeScale.phoneRowMeta)
-                        .foregroundStyle(Palette.secondaryText)
-                        .lineLimit(1)
+                // The author rides on the meta line, not in a trailing column.
+                // The Mac can afford that column in a 680pt list; on a 393pt
+                // row it ate the title, and "Overnight flig…" beside a legible
+                // bot name is the wrong trade.
+                HStack(spacing: Metric.phoneTightGap) {
+                    author
+                    if instance.hasLocation {
+                        Text("·").foregroundStyle(Palette.secondaryText)
+                        Label(instance.location ?? "", systemImage: "mappin.and.ellipse")
+                            .font(TypeScale.phoneRowMeta)
+                            .foregroundStyle(Palette.secondaryText)
+                            .lineLimit(1)
+                    }
                 }
             }
-            Spacer(minLength: Metric.phoneTightGap)
-            author
+            Spacer(minLength: 0)
         }
         .padding(.vertical, Metric.phoneRowVPad)
         .frame(maxWidth: .infinity, alignment: .leading)

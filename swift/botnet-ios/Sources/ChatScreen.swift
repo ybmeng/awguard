@@ -37,6 +37,11 @@ struct ChatScreen: View {
         .background(Palette.chrome)
         .navigationTitle(bot?.displayName ?? "Bot")
         .navigationBarTitleDisplayMode(.inline)
+        // The bar is opaque from the first frame. A transcript opens pinned to
+        // its newest turn, so the "scrolled to top" transparent bar iOS starts
+        // with would leave a wall of text legible behind the title.
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarBackground(Palette.chrome, for: .navigationBar)
         // A bot's conversation can have moved on since the list was fetched,
         // and marking it read is the visit itself.
         .task(id: botID) {
@@ -49,7 +54,17 @@ struct ChatScreen: View {
         .onDisappear { saveDraft(draft) }
     }
 
+    // The composer is a SIBLING of the scroll view, not an inset on it: as an
+    // inset it covered the newest message's meta line, because the scroll's
+    // bottom anchor and the inset's height are resolved independently.
     private func conversation(with bot: Bot) -> some View {
+        VStack(spacing: 0) {
+            transcript
+            composer(for: bot)
+        }
+    }
+
+    private var transcript: some View {
         GeometryReader { geo in
             let content = max(0, geo.size.width - 2 * Metric.phoneHPad)
             let gutter = content * (1 - Metric.phoneBubbleWidthFraction)
@@ -65,6 +80,11 @@ struct ChatScreen: View {
                                 .padding(.top, turns.isEmpty ? 0 : Metric.turnGap)
                                 .id("pending")
                         }
+                        // Scrolling to the last BUBBLE anchors that bubble's
+                        // bottom to the viewport's, which parks the message's
+                        // own id line just below the fold. The end of the
+                        // content is the only honest target.
+                        Color.clear.frame(height: 1).id(Self.endAnchor)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, Metric.phoneHPad)
@@ -80,10 +100,7 @@ struct ChatScreen: View {
                 // changing the message count.
                 .onChange(of: messages.count) { scrollToNewest(proxy) }
                 .onChange(of: store.pendingBotIDs) { scrollToNewest(proxy) }
-                // The composer is an inset, not scroll content: it has to sit
-                // above the keyboard and clear of the home indicator, and the
-                // transcript has to scroll behind neither.
-                .safeAreaInset(edge: .bottom) { composer(for: bot) }
+                .scrollDismissesKeyboard(.interactively)
             }
         }
     }
@@ -91,10 +108,12 @@ struct ChatScreen: View {
     // Deferred one update: onChange fires before the LazyVStack lays out the
     // row it was told about, and scrollTo to an id with no laid-out row is a
     // no-op.
+    private static let endAnchor = "transcript-end"
+
     private func scrollToNewest(_ proxy: ScrollViewProxy) {
-        guard let target = pending ? "pending" : turns.last?.lastBubbleID else { return }
+        guard !turns.isEmpty || pending else { return }
         Task { @MainActor in
-            withAnimation { proxy.scrollTo(target, anchor: .bottom) }
+            withAnimation { proxy.scrollTo(Self.endAnchor, anchor: .bottom) }
         }
     }
 
@@ -129,6 +148,11 @@ struct ChatScreen: View {
         }
         .padding(Metric.composerPad)
         .background(Palette.chrome)
+        // The transcript stops here rather than fading into the composer, the
+        // same hairline the Mac draws under its header.
+        .overlay(alignment: .top) {
+            Rectangle().fill(Palette.hairline).frame(height: 1)
+        }
     }
 
     private func send(to bot: Bot) {
@@ -251,8 +275,10 @@ private struct MessageView: View {
             .buttonStyle(.plain)
             // Always present, since the id is the handle for everything that
             // will accumulate here. Held back at rest so a column of ids never
-            // competes with the conversation.
-            .opacity(expanded || message.didFail ? 1 : 0.45)
+            // competes with the conversation — but not as far back as the Mac
+            // holds it: there the pointer brightens the line on the way to it,
+            // and a phone has nothing that says the line can be tapped.
+            .opacity(expanded || message.didFail ? 1 : 0.7)
 
             if expanded, let status = message.status?.rawValue {
                 Text("status \(status)")
