@@ -41,6 +41,19 @@ extension Metric {
     /// text; beside a 16pt phone title it reads as a speck, and this is the
     /// row's one action. Its hit frame is phoneTapTarget regardless.
     static let phoneFactToggle: CGFloat = 20
+    /// How far one level of the project tree sits in from its parent. Smaller
+    /// than the Mac's sidebarIndent: a 393pt row loses its name to truncation
+    /// two levels down at 12pt a level, and the caret already says which rows
+    /// are children.
+    static let phoneTreeIndent: CGFloat = 14
+    /// The fixed caret column on a tree row, so every name at one depth starts
+    /// at one x whether or not its project has children.
+    static let phoneCaretWidth: CGFloat = 22
+    /// How far down a dot or a small glyph sits when it shares a top-aligned
+    /// row with phoneRowTitle text: half the difference between that line's
+    /// height and the mark's, so the mark reads as sitting ON the first line
+    /// even when the title wraps to a second.
+    static let phoneFirstLineNudge: CGFloat = 6
 }
 
 extension TypeScale {

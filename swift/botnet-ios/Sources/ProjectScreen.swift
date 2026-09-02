@@ -17,6 +17,8 @@ struct ProjectScreen: View {
     /// Opens the Add Fact sheet as the screen appears. Only a launch flag sets
     /// it (see LaunchScreen); nil in every ordinary push.
     var openAddFact = false
+    /// Which kind that sheet opens on, when a launch flag opened it.
+    var addFactKind: FactKind = .deadline
 
     @State private var addingFact = false
     /// The flag is honoured once. Without this, dismissing the sheet re-runs
@@ -38,6 +40,10 @@ struct ProjectScreen: View {
         .background(Palette.chrome)
         .navigationTitle(project?.name ?? "Project")
         .navigationBarTitleDisplayMode(.inline)
+        // Opaque from the first frame, so scrolled facts pass behind the title
+        // rather than through it.
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarBackground(Palette.chrome, for: .navigationBar)
         .toolbar {
             // No project resolved means it is gone from the server; there is
             // nothing to add a fact to.
@@ -59,7 +65,7 @@ struct ProjectScreen: View {
             addingFact = true
         }
         .sheet(isPresented: $addingFact) {
-            if let project { AddFactSheet(project: project) }
+            if let project { AddFactSheet(project: project, initialKind: addFactKind) }
         }
     }
 
@@ -73,6 +79,9 @@ struct ProjectScreen: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 healthBadge(project)
+                // Before the facts: a parent's rolled-up reading is often a
+                // child's, so the children are what explain the badge above.
+                childrenSection
                 factsSection
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -82,14 +91,16 @@ struct ProjectScreen: View {
         .refreshable { await store.loadProject(projectID) }
     }
 
-    // The same dot the list row wears, with its word next to it — a screen has
-    // room to say "due soon" where the row could only color it.
+    // The same dot the list row wears, with its reading next to it — a screen
+    // has room to say "S0 · overdue 13d" where the row could only color it. On
+    // a parent all three are ROLLED UP over the subtree: the severity a parent
+    // shows may be a child's, which is why the children strip sits under it.
     private func healthBadge(_ project: Project) -> some View {
         HStack(spacing: Metric.phoneTightGap) {
             Circle()
-                .fill(Palette.health(project.health))
+                .fill(Palette.projectDot(severity: project.severity, health: project.health))
                 .frame(width: Metric.healthDot, height: Metric.healthDot)
-            Text(badgeText(project))
+            Text(project.severityText)
                 .font(TypeScale.phoneRowMeta)
                 .foregroundStyle(Palette.secondaryText)
         }
@@ -98,13 +109,47 @@ struct ProjectScreen: View {
         .background(Palette.fieldFill, in: Capsule())
     }
 
-    /// "overdue 13d" / "due soon · in 18d" / "ok · in 193d" / "unknown". When
-    /// the relative reading already carries the health word it stands alone:
-    /// "overdue · overdue 13d" says the same thing twice.
-    private func badgeText(_ project: Project) -> String {
-        guard let due = project.nextDueText else { return project.healthLabel }
-        guard !due.hasPrefix(project.healthLabel) else { return due }
-        return "\(project.healthLabel) · \(due)"
+    /// The direct children, preferring the live list — a rename or a moved
+    /// child reaches an open screen that way — and falling back to the detail's
+    /// own `children` for a list this client hasn't refetched yet.
+    private var children: [Project] {
+        let fromList = ProjectTree(store.projects).children(of: projectID)
+        guard fromList.isEmpty else { return fromList }
+        return store.projectDetails[projectID]?.children ?? []
+    }
+
+    @ViewBuilder
+    private var childrenSection: some View {
+        if !children.isEmpty {
+            Text("Sub-projects")
+                .font(TypeScale.phoneDayHeader)
+                .foregroundStyle(Palette.secondaryText)
+            VStack(alignment: .leading, spacing: Metric.phoneTightGap) {
+                ForEach(children) { child in
+                    NavigationLink(value: Route.project(child.id)) {
+                        HStack(spacing: Metric.phoneRowGap) {
+                            Circle()
+                                .fill(Palette.projectDot(severity: child.severity,
+                                                         health: child.health))
+                                .frame(width: Metric.healthDot, height: Metric.healthDot)
+                            Text(child.name)
+                                .font(TypeScale.phoneRowTitle)
+                                .foregroundStyle(Palette.primaryText)
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                            Text(child.severityText)
+                                .font(TypeScale.phoneRowMeta)
+                                .foregroundStyle(Palette.secondaryText)
+                            Image(systemName: "chevron.right")
+                                .font(TypeScale.phoneRowMeta)
+                                .foregroundStyle(Palette.secondaryText)
+                        }
+                        .frame(minHeight: Metric.phoneTapTarget)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -270,15 +315,32 @@ struct NewProjectSheet: View {
 
     @State private var name = ""
     @State private var goal = ""
+    @State private var parentID = ""
     @State private var saving = false
 
     private var trimmedName: String { name.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    /// Every project is a candidate: a project being created is nobody's
+    /// ancestor yet, so no cycle is possible and nothing has to be excluded.
+    private var candidates: [ProjectTree.Row] {
+        let tree = ProjectTree(store.projects)
+        return tree.rows(expanded: Set(tree.all.map(\.id)))
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     TextField("Name", text: $name)
+                    Picker("Parent", selection: $parentID) {
+                        Text("None (top level)").tag("")
+                        ForEach(candidates) { row in
+                            // The depth is spelled in the label because a Picker
+                            // menu has no indent of its own.
+                            Text(String(repeating: "· ", count: row.depth) + row.project.name)
+                                .tag(row.project.id)
+                        }
+                    }
                 }
                 Section("Goal") {
                     TextField("What this project is for", text: $goal, axis: .vertical)
@@ -297,7 +359,7 @@ struct NewProjectSheet: View {
                         saving = true
                         Task {
                             let created = await store.createProject(
-                                name: trimmedName, goal: cleaned(goal))
+                                name: trimmedName, goal: cleaned(goal), parentID: parentID)
                             saving = false
                             // A failed create (duplicate name) keeps the sheet
                             // open with the draft; the shared alert explains.
@@ -325,8 +387,13 @@ struct AddFactSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     let project: Project
+    /// Which kind the sheet opens on. Deadline in the app, which is the kind a
+    /// project usually starts with; a launch flag names another so the field
+    /// table's effect on the form can be seen on a simulator, where the picker
+    /// cannot be tapped.
+    var initialKind: FactKind = .deadline
 
-    @State private var kind: FactKind = .deadline
+    @State private var kind: FactKind
     @State private var title = ""
     @State private var due = AddFactSheet.defaultDue()
     @State private var leadDays = 30
@@ -335,6 +402,12 @@ struct AddFactSheet: View {
     @State private var blocker = ""
     @State private var body_ = ""
     @State private var saving = false
+
+    init(project: Project, initialKind: FactKind = .deadline) {
+        self.project = project
+        self.initialKind = initialKind
+        _kind = State(initialValue: initialKind)
+    }
 
     private var trimmedTitle: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
 
@@ -370,24 +443,34 @@ struct AddFactSheet: View {
                         // Typed verbatim: the rule IS the spec, and the server
                         // parses its own subset. Paraphrasing it in a picker
                         // would hide what actually recurs.
-                        TextField("Repeat rule", text: $rrule,
-                                  prompt: Text("FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=30"))
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
+                        stacked("Repeat rule") {
+                            TextField("Repeat rule", text: $rrule,
+                                      prompt: Text("FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=30"))
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        }
                     }
                     if kind.fields.contains(.tz) {
-                        TextField("Time zone", text: $tz)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
+                        stacked("Time zone") {
+                            TextField("Time zone", text: $tz)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        }
                     }
                     if kind.fields.contains(.blocker) {
-                        TextField("Blocker", text: $blocker,
-                                  prompt: Text("who or what this waits on"))
+                        stacked("Blocker") {
+                            TextField("Blocker", text: $blocker,
+                                      prompt: Text("who or what this waits on"))
+                        }
                     }
                 }
                 if kind.fields.contains(.body) {
                     Section(kind == .note ? "Note" : "Details") {
-                        TextField("", text: $body_, axis: .vertical)
+                        TextField("",
+                                  text: $body_,
+                                  prompt: Text(kind == .note ? "what to remember"
+                                               : "anything worth knowing about this"),
+                                  axis: .vertical)
                             .lineLimit(3...8)
                     }
                 }
@@ -404,6 +487,21 @@ struct AddFactSheet: View {
                         .disabled(!canSave)
                 }
             }
+        }
+    }
+
+    /// A field whose label sits ABOVE it. iOS drops a TextField's label the
+    /// moment it carries a prompt, which left a raw RRULE and a bare
+    /// "Asia/Shanghai" sitting in the form with nothing saying what they were.
+    /// Stacked rather than leading, because a rule is far too long to share a
+    /// row with its name.
+    private func stacked<Field: View>(_ label: String,
+                                      @ViewBuilder field: () -> Field) -> some View {
+        VStack(alignment: .leading, spacing: Metric.phoneTightGap) {
+            Text(label)
+                .font(TypeScale.phoneRowMeta)
+                .foregroundStyle(Palette.secondaryText)
+            field().labelsHidden()
         }
     }
 
