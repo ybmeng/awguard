@@ -316,10 +316,16 @@ private struct FactRow: View {
     private var dueLine: some View {
         if let due = fact.due {
             HStack(spacing: Metric.phoneRowGap) {
-                if !fact.done, fact.leadDays > 0 {
-                    Text("\(fact.leadDays)d lead")
-                        .font(TypeScale.phoneRowMeta)
-                        .foregroundStyle(Palette.secondaryText)
+                if !fact.done {
+                    // Through FactLead, which both apps' fact rows read: the
+                    // number is the EFFECTIVE window, and the "(project)"
+                    // suffix says the fact inherits it — the part that decides
+                    // whether editing the fact or the project is the right move.
+                    if let lead = FactLead.rowLabel(for: fact) {
+                        Text(lead)
+                            .font(TypeScale.phoneRowMeta)
+                            .foregroundStyle(Palette.secondaryText)
+                    }
                 }
                 Text(due.formatted(.dateTime.year().month(.abbreviated).day()))
                     .font(TypeScale.phoneRowMeta)
@@ -338,10 +344,12 @@ private struct FactRow: View {
     private var relativeColor: Color {
         guard !fact.done, let due = fact.due else { return Palette.secondaryText }
         if due < Date() { return Palette.healthOverdue }
-        // The fact's own lead window is what the server calls due_soon, so the
-        // row colors on exactly the same boundary rather than a second rule.
-        if fact.leadDays > 0,
-           due < Date().addingTimeInterval(Double(fact.leadDays) * 86_400) {
+        // The EFFECTIVE lead is what the server computes due_soon from, so the
+        // row colors on exactly that boundary rather than a second rule. Off
+        // the authored `leadDays` this stayed grey on every fact that inherits
+        // its window, while the same response called the project due_soon.
+        if fact.effectiveLeadDays > 0,
+           due < Date().addingTimeInterval(Double(fact.effectiveLeadDays) * 86_400) {
             return Palette.healthDueSoon
         }
         return Palette.secondaryText
